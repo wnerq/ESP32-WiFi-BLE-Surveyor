@@ -1,8 +1,11 @@
-// WifiConnect13 - stabilize Wi-Fi summary and shared survey helpers
+// WifiConnect14 - manual BLE scanner and sortable BLE summary
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <esp_heap_caps.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 Preferences preferences;
 WebServer server(80);
@@ -82,6 +85,35 @@ struct NetworkSummary {
   bool connected;
   bool hidden;
 };
+
+
+// ============================================================
+// BLE survey data
+// ============================================================
+
+const size_t MAX_BLE_DEVICE_SUMMARIES = 150;
+const uint32_t BLE_SCAN_DURATION_SECONDS = 5;
+
+struct BLEDeviceSummary {
+  char name[48];
+  char address[18];
+
+  uint8_t addressType;
+  uint32_t advertisementCount;
+
+  SignalStats signal;
+
+  bool named;
+};
+
+BLEDeviceSummary bleDevices[MAX_BLE_DEVICE_SUMMARIES];
+size_t bleDeviceCount = 0;
+
+uint32_t bleScanCounter = 0;
+uint32_t lastBleScanUptimeMs = 0;
+
+bool bleInitialized = false;
+String bleStatusMessage = "";
 
 ScanRecord* scanHistory = nullptr;
 size_t scanHistoryCapacity = 0;
@@ -331,6 +363,162 @@ float averageSignal(const SignalStats& stats) {
   return
     (float)stats.rssiTotal /
     (float)stats.samples;
+}
+
+
+// ============================================================
+// BLE helpers
+// ============================================================
+
+String bleAddressTypeLabel(uint8_t addressType) {
+  switch (addressType) {
+    case 0:
+      return "Public";
+
+    case 1:
+      return "Random";
+
+    case 2:
+      return "Public ID";
+
+    case 3:
+      return "Random ID";
+
+    default:
+      return "Unknown";
+  }
+}
+
+int findBleDeviceByAddress(const String& address) {
+  for (size_t i = 0; i < bleDeviceCount; i++) {
+    if (
+      String(bleDevices[i].address)
+        .equalsIgnoreCase(address)
+    ) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+void initializeBLEScanner() {
+  if (bleInitialized) {
+    return;
+  }
+
+  BLEDevice::init("");
+
+  BLEScan* scan = BLEDevice::getScan();
+
+  // Active scan requests scan-response packets, which often contain
+  // human-readable names and other useful advertisement data.
+  scan->setActiveScan(true);
+
+  bleInitialized = true;
+}
+
+void updateBleSummary(
+  BLEAdvertisedDevice& device,
+  uint32_t scanUptimeMs
+) {
+  String address =
+      device.getAddress().toString();
+
+  int index =
+      findBleDeviceByAddress(address);
+
+  if (index < 0) {
+    if (bleDeviceCount >= MAX_BLE_DEVICE_SUMMARIES) {
+      return;
+    }
+
+    index = (int)bleDeviceCount;
+    bleDeviceCount++;
+
+    BLEDeviceSummary summary = {};
+
+    address.toCharArray(
+      summary.address,
+      sizeof(summary.address)
+    );
+
+    resetSignalStats(summary.signal);
+
+    bleDevices[index] = summary;
+  }
+
+  BLEDeviceSummary& summary =
+      bleDevices[index];
+
+  if (device.haveName()) {
+    String name = device.getName();
+
+    if (name.length() > 0) {
+      name.toCharArray(
+        summary.name,
+        sizeof(summary.name)
+      );
+
+      summary.named = true;
+    }
+  }
+
+  summary.addressType =
+      device.getAddressType();
+
+  summary.advertisementCount++;
+
+  addSignalObservation(
+    summary.signal,
+    device.getRSSI(),
+    scanUptimeMs
+  );
+}
+
+int performManualBLEScan() {
+  initializeBLEScanner();
+
+  BLEScan* scan = BLEDevice::getScan();
+
+  bleStatusMessage = "BLE scan in progress...";
+
+  BLEScanResults* results =
+      scan->start(
+        BLE_SCAN_DURATION_SECONDS,
+        false
+      );
+
+  bleScanCounter++;
+  lastBleScanUptimeMs = millis();
+
+  int resultCount =
+      results != nullptr
+        ? results->getCount()
+        : 0;
+
+  if (results != nullptr) {
+    for (int i = 0; i < resultCount; i++) {
+      BLEAdvertisedDevice device =
+          results->getDevice(i);
+
+      updateBleSummary(
+        device,
+        lastBleScanUptimeMs
+      );
+    }
+  }
+
+  scan->clearResults();
+
+  bleStatusMessage =
+      "BLE scan #" +
+      String(bleScanCounter) +
+      " complete: " +
+      String(resultCount) +
+      " device(s) observed.";
+
+  return resultCount;
 }
 
 const ScanRecord& historyRecord(size_t logicalIndex) {
@@ -1389,6 +1577,7 @@ void handleRoot() {
     <div class="buttons">
       <a class="button" href="/">Refresh Status</a>
       <a class="button" href="/scan-now">Scan Wi-Fi</a>
+      <a class="button" href="/ble">Bluetooth Survey</a>
       <a class="button" href="/ap">AP Settings</a>
     </div>
 
@@ -2217,6 +2406,7 @@ void handleWebScan() {
     "<a class=\"button\" href=\"/scan-now\">Scan Now</a>"
     "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
     "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
+    "<a class=\"button\" href=\"/ble\">Bluetooth Survey</a>"
     "<a class=\"button\" href=\"/\">Back to Status</a>"
     "<a class=\"button\" href=\"/scan\">Refresh Page</a>"
     "</div>"
@@ -2312,6 +2502,223 @@ void handleWebScan() {
   );
 
   server.sendContent("");
+}
+
+
+// ============================================================
+// BLE web survey
+// ============================================================
+
+void sendBleSummaryTable() {
+  if (bleDeviceCount == 0) {
+    server.sendContent(
+      "<p>No BLE devices have been observed yet.</p>"
+    );
+    return;
+  }
+
+  server.sendContent(
+    "<table id=\"ble-summary\">"
+    "<thead><tr>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',0,'text')\">Name</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',1,'text')\">Address</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',2,'text')\">Address Type</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',3,'number')\">Latest</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',4,'number')\">Min</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',5,'number')\">Max</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',6,'number')\">Avg</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',7,'number')\">Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',8,'number')\">Last Seen</th>"
+    "</tr></thead><tbody>"
+  );
+
+  for (size_t i = 0; i < bleDeviceCount; i++) {
+    const BLEDeviceSummary& summary =
+        bleDevices[i];
+
+    String displayName =
+        summary.named
+          ? String(summary.name)
+          : "(unnamed)";
+
+    float avgRssi =
+        averageSignal(summary.signal);
+
+    String row;
+    row.reserve(850);
+
+    row += "<tr>";
+
+    row += "<td>";
+    row += htmlEscape(displayName);
+    row += "</td>";
+
+    row += "<td>";
+    row += htmlEscape(String(summary.address));
+    row += "</td>";
+
+    row += "<td>";
+    row += htmlEscape(
+      bleAddressTypeLabel(summary.addressType)
+    );
+    row += "</td>";
+
+    row += "<td class=\"signal\" data-sort=\"";
+    row += String(summary.signal.latestRssi);
+    row += "\">";
+    row += String(summary.signal.latestRssi);
+    row += " dBm</td>";
+
+    row += "<td class=\"signal\" data-sort=\"";
+    row += String(summary.signal.minRssi);
+    row += "\">";
+    row += String(summary.signal.minRssi);
+    row += " dBm</td>";
+
+    row += "<td class=\"signal\" data-sort=\"";
+    row += String(summary.signal.maxRssi);
+    row += "\">";
+    row += String(summary.signal.maxRssi);
+    row += " dBm</td>";
+
+    row += "<td class=\"signal\" data-sort=\"";
+    row += String(avgRssi, 1);
+    row += "\">";
+    row += String(avgRssi, 1);
+    row += " dBm</td>";
+
+    row += "<td class=\"signal\" data-sort=\"";
+    row += String(summary.advertisementCount);
+    row += "\">";
+    row += String(summary.advertisementCount);
+    row += "</td>";
+
+    row += "<td data-sort=\"";
+    row += String(summary.signal.lastSeenMs);
+    row += "\">";
+    row += htmlEscape(
+      formatUptime(summary.signal.lastSeenMs)
+    );
+    row += "</td>";
+
+    row += "</tr>";
+
+    server.sendContent(row);
+  }
+
+  server.sendContent("</tbody></table>");
+}
+
+void handleBLESurvey() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  server.sendContent(
+    "<!DOCTYPE html><html><head>"
+    "<meta charset=\"UTF-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>ESP32 Bluetooth Survey</title>"
+  );
+
+  server.sendContent(pageStyles());
+
+  server.sendContent(
+    "</head><body><div class=\"container\">"
+    "<h1>Bluetooth Survey</h1>"
+    "<div class=\"card\">"
+    "<h2>BLE Scanner</h2>"
+  );
+
+  String status;
+  status.reserve(900);
+
+  status +=
+    "<div class=\"row\"><span class=\"label\">Scan Mode</span>"
+    "<span class=\"value\">Manual only</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Duration</span>"
+    "<span class=\"value\">";
+  status += String(BLE_SCAN_DURATION_SECONDS);
+  status +=
+    " seconds</span></div>"
+    "<div class=\"row\"><span class=\"label\">BLE Scans This Session</span>"
+    "<span class=\"value\">";
+  status += String(bleScanCounter);
+  status +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Unique BLE Addresses</span>"
+    "<span class=\"value\">";
+  status += String(bleDeviceCount);
+  status +=
+    " / ";
+  status += String(MAX_BLE_DEVICE_SUMMARIES);
+  status +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last BLE Scan</span>"
+    "<span class=\"value\">";
+
+  if (bleScanCounter == 0) {
+    status += "Never";
+  } else {
+    status += htmlEscape(
+      formatUptime(lastBleScanUptimeMs)
+    );
+    status += " uptime";
+  }
+
+  status += "</span></div>";
+
+  if (bleStatusMessage.length() > 0) {
+    status += "<div class=\"note\"><strong>";
+    status += htmlEscape(bleStatusMessage);
+    status += "</strong></div>";
+  }
+
+  status +=
+    "<div class=\"buttons\">"
+    "<a class=\"button\" href=\"/ble-scan\">Scan BLE Now</a>"
+    "<a class=\"button\" href=\"/ble\">Refresh Page</a>"
+    "<a class=\"button\" href=\"/scan\">Wi-Fi Survey</a>"
+    "<a class=\"button\" href=\"/\">Back to Status</a>"
+    "</div>"
+    "<div class=\"note\">"
+    "This first BLE revision intentionally uses manual scans only. "
+    "Wi-Fi AP+STA operation remains active while BLE scanning is tested "
+    "for coexistence and stability."
+    "</div>"
+    "</div>";
+
+  server.sendContent(status);
+
+  server.sendContent(
+    "<div class=\"card\"><h2>Observed BLE Devices</h2>"
+    "<div class=\"note\">"
+    "One row is retained per BLE address for this power cycle. "
+    "Repeated manual scans update RSSI statistics and the Seen count. "
+    "Click any column header to sort."
+    "</div>"
+  );
+
+  sendBleSummaryTable();
+
+  server.sendContent(
+    "</div>"
+    "<div class=\"footer\">ESP32 Web Interface</div>"
+  );
+
+  sendSortableTableScript();
+
+  server.sendContent(
+    "</div></body></html>"
+  );
+
+  server.sendContent("");
+}
+
+void handleBLEScanNow() {
+  performManualBLEScan();
+
+  server.sendHeader("Location", "/ble");
+  server.send(303, "text/plain", "");
 }
 
 
@@ -2524,6 +2931,8 @@ void startWebServer() {
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
+  server.on("/ble", HTTP_GET, handleBLESurvey);
+  server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
   server.on("/ap", HTTP_GET, handleAccessPointSettingsPage);
   server.on("/ap-save", HTTP_POST, handleSaveAccessPointSettings);
 
