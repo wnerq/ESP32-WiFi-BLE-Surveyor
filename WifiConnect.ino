@@ -1,3 +1,4 @@
+// WifiConnect4 - Wi-Fi survey/logger revision
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -9,6 +10,43 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
 
 bool webServerStarted = false;
+
+
+// ============================================================
+// Scan logger
+// ============================================================
+
+// Scan history is intentionally RAM-only. It is cleared on power cycle/reset.
+// The same SSID/BSSID may appear in many records with different scan numbers
+// and timestamps, which is useful for signal-strength trending.
+const size_t MAX_SCAN_RECORDS = 300;
+const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
+const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
+
+struct ScanRecord {
+  uint32_t scanNumber;
+  uint32_t uptimeMs;
+  char ssid[33];
+  char bssid[18];
+  int16_t rssi;
+  int16_t channel;
+  uint8_t authMode;
+  bool connected;
+  bool hidden;
+};
+
+ScanRecord scanHistory[MAX_SCAN_RECORDS];
+
+size_t historyStart = 0;
+size_t historyCount = 0;
+
+uint32_t scanCounter = 0;
+uint32_t lastScanUptimeMs = 0;
+
+bool autoScanEnabled = false;
+unsigned long scanIntervalSeconds = 10;
+unsigned long lastAutoScanMs = 0;
+
 
 
 // ============================================================
@@ -41,10 +79,106 @@ void ensureWiFiStationMode() {
 }
 
 String securityLabel(wifi_auth_mode_t authMode) {
-  if (authMode == WIFI_AUTH_OPEN) {
-    return "OPEN";
+  switch (authMode) {
+    case WIFI_AUTH_OPEN:
+      return "OPEN";
+
+    case WIFI_AUTH_WEP:
+      return "WEP";
+
+    case WIFI_AUTH_WPA_PSK:
+      return "WPA-PSK";
+
+    case WIFI_AUTH_WPA2_PSK:
+      return "WPA2-PSK";
+
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      return "WPA/WPA2-PSK";
+
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      return "WPA2-ENTERPRISE";
+
+    case WIFI_AUTH_WPA3_PSK:
+      return "WPA3-PSK";
+
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      return "WPA2/WPA3-PSK";
+
+    default:
+      return "UNKNOWN";
   }
-  return "SECURED";
+}
+
+void appendScanRecord(const ScanRecord& record) {
+  size_t writeIndex;
+
+  if (historyCount < MAX_SCAN_RECORDS) {
+    writeIndex = (historyStart + historyCount) % MAX_SCAN_RECORDS;
+    historyCount++;
+  } else {
+    // Ring buffer full: overwrite the oldest record.
+    writeIndex = historyStart;
+    historyStart = (historyStart + 1) % MAX_SCAN_RECORDS;
+  }
+
+  scanHistory[writeIndex] = record;
+}
+
+const ScanRecord& historyRecord(size_t logicalIndex) {
+  size_t physicalIndex =
+      (historyStart + logicalIndex) % MAX_SCAN_RECORDS;
+
+  return scanHistory[physicalIndex];
+}
+
+void clearScanHistory() {
+  historyStart = 0;
+  historyCount = 0;
+  scanCounter = 0;
+  lastScanUptimeMs = 0;
+}
+
+int performLoggedScan() {
+  ensureWiFiStationMode();
+
+  bool connectedNow = WiFi.status() == WL_CONNECTED;
+  String connectedBSSID = connectedNow ? WiFi.BSSIDstr() : "";
+
+  int networkCount = WiFi.scanNetworks();
+
+  scanCounter++;
+  lastScanUptimeMs = millis();
+
+  if (networkCount <= 0) {
+    return networkCount;
+  }
+
+  for (int i = 0; i < networkCount; i++) {
+    ScanRecord record = {};
+
+    record.scanNumber = scanCounter;
+    record.uptimeMs = lastScanUptimeMs;
+
+    String ssid = WiFi.SSID(i);
+    String bssid = WiFi.BSSIDstr(i);
+
+    ssid.toCharArray(record.ssid, sizeof(record.ssid));
+    bssid.toCharArray(record.bssid, sizeof(record.bssid));
+
+    record.rssi = WiFi.RSSI(i);
+    record.channel = WiFi.channel(i);
+    record.authMode = (uint8_t)WiFi.encryptionType(i);
+    record.connected =
+        connectedNow &&
+        connectedBSSID.length() > 0 &&
+        bssid.equalsIgnoreCase(connectedBSSID);
+
+    record.hidden = (ssid.length() == 0);
+
+    appendScanRecord(record);
+  }
+
+  return networkCount;
 }
 
 void printPadded(const String& value, int width) {
@@ -103,8 +237,8 @@ void eraseCredentials() {
 // Uptime
 // ============================================================
 
-String getUptimeString() {
-  unsigned long totalSeconds = millis() / 1000;
+String formatUptime(uint32_t uptimeMs) {
+  unsigned long totalSeconds = uptimeMs / 1000;
 
   unsigned long days = totalSeconds / 86400;
   totalSeconds %= 86400;
@@ -134,6 +268,10 @@ String getUptimeString() {
   result += "s";
 
   return result;
+}
+
+String getUptimeString() {
+  return formatUptime(millis());
 }
 
 
@@ -210,12 +348,9 @@ void scanNetworks() {
   Serial.println("Scanning for Wi-Fi networks...");
   Serial.println();
 
-  ensureWiFiStationMode();
+  int networkCount = performLoggedScan();
 
-  // Do NOT disconnect an active connection just to scan.
-  int networkCount = WiFi.scanNetworks();
-
-  if (networkCount == 0) {
+  if (networkCount <= 0) {
     Serial.println("No networks found.");
     WiFi.scanDelete();
     return;
@@ -225,20 +360,30 @@ void scanNetworks() {
   Serial.println(" network(s) found:");
   Serial.println();
 
-  Serial.println("SSID                              SIGNAL      SECURITY");
-  Serial.println("--------------------------------  ----------  --------");
+  Serial.println("SSID                              SIGNAL      CH   SECURITY");
+  Serial.println("--------------------------------  ----------  ---  ----------------");
 
   for (int i = 0; i < networkCount; i++) {
     String ssid = WiFi.SSID(i);
     String signal = String(WiFi.RSSI(i)) + " dBm";
+    String channel = String(WiFi.channel(i));
     String security = securityLabel(WiFi.encryptionType(i));
 
     printPadded(ssid, 34);
     printPadded(signal, 12);
+    printPadded(channel, 5);
     Serial.println(security);
   }
 
   Serial.println();
+  Serial.print("Logged as scan #");
+  Serial.print(scanCounter);
+  Serial.print(". History: ");
+  Serial.print(historyCount);
+  Serial.print(" / ");
+  Serial.print(MAX_SCAN_RECORDS);
+  Serial.println(" records.");
+
   Serial.println("Scan complete.");
   Serial.println("Use '3' or 'wifi' to configure a network.");
 
@@ -256,9 +401,7 @@ void configureWiFi() {
     Serial.println("Scanning for Wi-Fi networks...");
     Serial.println();
 
-    ensureWiFiStationMode();
-
-    int networkCount = WiFi.scanNetworks();
+    int networkCount = performLoggedScan();
 
     if (networkCount == 0) {
       Serial.println("No Wi-Fi networks found.");
@@ -280,18 +423,20 @@ void configureWiFi() {
       continue;
     }
 
-    Serial.println("#   SSID                              SIGNAL      SECURITY");
-    Serial.println("--  --------------------------------  ----------  --------");
+    Serial.println("#   SSID                              SIGNAL      CH   SECURITY");
+    Serial.println("--  --------------------------------  ----------  ---  ----------------");
 
     for (int i = 0; i < networkCount; i++) {
       String number = String(i + 1);
       String ssid = WiFi.SSID(i);
       String signal = String(WiFi.RSSI(i)) + " dBm";
+      String channel = String(WiFi.channel(i));
       String security = securityLabel(WiFi.encryptionType(i));
 
       printPadded(number, 4);
       printPadded(ssid, 34);
       printPadded(signal, 12);
+      printPadded(channel, 5);
       Serial.println(security);
     }
 
@@ -530,6 +675,40 @@ String pageStyles() {
     margin-top: 14px;
   }
 
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 12px;
+    margin-top: 12px;
+  }
+
+  .control {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  input[type="number"] {
+    width: 100px;
+    padding: 9px;
+    border: 1px solid #bbb;
+    border-radius: 5px;
+  }
+
+  button {
+    padding: 10px 16px;
+    border: 0;
+    border-radius: 6px;
+    background: #333;
+    color: white;
+    cursor: pointer;
+  }
+
+  .danger {
+    background: #7a2d2d;
+  }
+
   .footer {
     text-align: center;
     font-size: 0.8em;
@@ -657,7 +836,7 @@ void handleRoot() {
 
     <div class="buttons">
       <a class="button" href="/">Refresh Status</a>
-      <a class="button" href="/scan">Scan Wi-Fi</a>
+      <a class="button" href="/scan-now">Scan Wi-Fi</a>
     </div>
 
     <div class="footer">
@@ -684,22 +863,107 @@ void handleRoot() {
 
 
 // ============================================================
-// Web Wi-Fi scan page
+// Web Wi-Fi scan page and logger controls
 // ============================================================
+
+String csvEscape(const String& input) {
+  String output = input;
+  output.replace("\"", "\"\"");
+  return "\"" + output + "\"";
+}
+
+void redirectToScanPage() {
+  server.sendHeader("Location", "/scan");
+  server.send(303, "text/plain", "");
+}
+
+void handleWebScanNow() {
+  performLoggedScan();
+  WiFi.scanDelete();
+  redirectToScanPage();
+}
+
+void handleScanSettings() {
+  if (server.hasArg("interval")) {
+    long requested = server.arg("interval").toInt();
+
+    if (requested < (long)MIN_SCAN_INTERVAL_SECONDS) {
+      requested = MIN_SCAN_INTERVAL_SECONDS;
+    }
+
+    if (requested > (long)MAX_SCAN_INTERVAL_SECONDS) {
+      requested = MAX_SCAN_INTERVAL_SECONDS;
+    }
+
+    scanIntervalSeconds = (unsigned long)requested;
+  }
+
+  autoScanEnabled = server.hasArg("auto");
+  lastAutoScanMs = millis();
+
+  redirectToScanPage();
+}
+
+void handleClearScanHistory() {
+  clearScanHistory();
+  redirectToScanPage();
+}
+
+void handleScanCsv() {
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=\"wifi_scan_log.csv\""
+  );
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+
+  server.sendContent(
+    "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n"
+  );
+
+  for (size_t i = 0; i < historyCount; i++) {
+    const ScanRecord& record = historyRecord(i);
+
+    String line;
+
+    line.reserve(180);
+
+    line += String(record.scanNumber);
+    line += ",";
+    line += String(record.uptimeMs);
+    line += ",";
+    line += csvEscape(formatUptime(record.uptimeMs));
+    line += ",";
+    line += csvEscape(String(record.ssid));
+    line += ",";
+    line += csvEscape(String(record.bssid));
+    line += ",";
+    line += String(record.channel);
+    line += ",";
+    line += String(record.rssi);
+    line += ",";
+    line += csvEscape(
+      securityLabel((wifi_auth_mode_t)record.authMode)
+    );
+    line += ",";
+    line += record.connected ? "YES" : "NO";
+    line += ",";
+    line += record.hidden ? "YES" : "NO";
+    line += "\r\n";
+
+    server.sendContent(line);
+  }
+
+  server.sendContent("");
+}
 
 void handleWebScan() {
   ensureWiFiStationMode();
 
-  String connectedSSID = "";
-  int connectedRSSI = 0;
   bool connected = WiFi.status() == WL_CONNECTED;
-
-  if (connected) {
-    connectedSSID = WiFi.SSID();
-    connectedRSSI = WiFi.RSSI();
-  }
-
-  int networkCount = WiFi.scanNetworks();
+  String connectedSSID = connected ? WiFi.SSID() : "";
+  int connectedRSSI = connected ? WiFi.RSSI() : 0;
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -708,7 +972,7 @@ void handleWebScan() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Wi-Fi Scan</title>
+  <title>ESP32 Wi-Fi Survey</title>
 )rawliteral";
 
   html += pageStyles();
@@ -719,7 +983,7 @@ void handleWebScan() {
 <body>
   <div class="container">
 
-    <h1>Wi-Fi Scan</h1>
+    <h1>Wi-Fi Survey</h1>
 )rawliteral";
 
   if (connected) {
@@ -744,12 +1008,107 @@ void handleWebScan() {
 
   html += R"rawliteral(
     <div class="card">
-      <h2>Nearby Networks</h2>
+      <h2>Scan Logging</h2>
+
+      <div class="row">
+        <span class="label">Automatic Scanning</span>
+        <span class="value">)rawliteral";
+  html += autoScanEnabled ? "ON" : "OFF";
+  html += R"rawliteral(</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Scan Interval</span>
+        <span class="value">)rawliteral";
+  html += String(scanIntervalSeconds);
+  html += R"rawliteral( seconds</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Scans This Session</span>
+        <span class="value">)rawliteral";
+  html += String(scanCounter);
+  html += R"rawliteral(</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Stored Records</span>
+        <span class="value">)rawliteral";
+  html += String(historyCount);
+  html += " / ";
+  html += String(MAX_SCAN_RECORDS);
+  html += R"rawliteral(</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Last Scan</span>
+        <span class="value">)rawliteral";
+
+  if (scanCounter == 0) {
+    html += "Never";
+  } else {
+    html += htmlEscape(formatUptime(lastScanUptimeMs));
+    html += " uptime";
+  }
+
+  html += R"rawliteral(</span>
+      </div>
+
+      <form class="controls" action="/scan-settings" method="get">
+        <div class="control">
+          <label for="interval">Interval (seconds)</label>
+          <input
+            id="interval"
+            name="interval"
+            type="number"
+            min="5"
+            max="3600"
+            value=")rawliteral";
+  html += String(scanIntervalSeconds);
+  html += R"rawliteral("
+          >
+        </div>
+
+        <div class="control">
+          <label>
+            <input
+              type="checkbox"
+              name="auto"
+              value="1"
 )rawliteral";
 
-  if (networkCount <= 0) {
+  if (autoScanEnabled) {
+    html += " checked";
+  }
+
+  html += R"rawliteral(
+            >
+            Automatic scanning
+          </label>
+        </div>
+
+        <button type="submit">Apply</button>
+      </form>
+
+      <div class="buttons">
+        <a class="button" href="/scan-now">Scan Now</a>
+        <a class="button" href="/scanlog.csv">Download CSV</a>
+        <a class="button" href="/scan-clear">Clear History</a>
+      </div>
+
+      <div class="note">
+        Scan history is kept in RAM only and is cleared by reset or power cycle.
+        When the record buffer fills, the oldest records are overwritten.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Latest Scan</h2>
+)rawliteral";
+
+  if (scanCounter == 0 || historyCount == 0) {
     html += R"rawliteral(
-      <p>No Wi-Fi networks found.</p>
+      <p>No scan has been logged yet.</p>
 )rawliteral";
   } else {
     html += R"rawliteral(
@@ -757,6 +1116,8 @@ void handleWebScan() {
         <thead>
           <tr>
             <th>SSID</th>
+            <th>BSSID</th>
+            <th class="signal">CH</th>
             <th class="signal">Signal</th>
             <th class="security">Security</th>
           </tr>
@@ -764,35 +1125,47 @@ void handleWebScan() {
         <tbody>
 )rawliteral";
 
-    // Arduino-ESP32 scan results are generally already strongest-first.
-    for (int i = 0; i < networkCount; i++) {
-      String ssid = WiFi.SSID(i);
-      int rssi = WiFi.RSSI(i);
-      String security = securityLabel(WiFi.encryptionType(i));
+    for (size_t i = 0; i < historyCount; i++) {
+      const ScanRecord& record = historyRecord(i);
 
-      bool isCurrent = connected && (ssid == connectedSSID);
+      if (record.scanNumber != scanCounter) {
+        continue;
+      }
 
-      if (isCurrent) {
+      if (record.connected) {
         html += "<tr class=\"current\">";
       } else {
         html += "<tr>";
       }
 
-      html += "<td>";
-      html += htmlEscape(ssid);
+      String displaySSID =
+          record.hidden ? "(hidden)" : String(record.ssid);
 
-      if (isCurrent) {
+      html += "<td>";
+      html += htmlEscape(displaySSID);
+
+      if (record.connected) {
         html += " (connected)";
       }
 
       html += "</td>";
 
+      html += "<td>";
+      html += htmlEscape(String(record.bssid));
+      html += "</td>";
+
       html += "<td class=\"signal\">";
-      html += String(rssi);
+      html += String(record.channel);
+      html += "</td>";
+
+      html += "<td class=\"signal\">";
+      html += String(record.rssi);
       html += " dBm</td>";
 
       html += "<td class=\"security\">";
-      html += security;
+      html += htmlEscape(
+        securityLabel((wifi_auth_mode_t)record.authMode)
+      );
       html += "</td>";
 
       html += "</tr>";
@@ -806,13 +1179,14 @@ void handleWebScan() {
 
   html += R"rawliteral(
       <div class="note">
-        Signal values closer to 0 dBm are stronger. For example, -45 dBm is stronger than -75 dBm.
+        Signal values closer to 0 dBm are stronger. BSSID identifies an
+        individual access point/radio, so the same SSID can appear more than once.
       </div>
     </div>
 
     <div class="buttons">
-      <a class="button" href="/scan">Scan Again</a>
       <a class="button" href="/">Back to Status</a>
+      <a class="button" href="/scan">Refresh Page</a>
     </div>
 
     <div class="footer">
@@ -823,8 +1197,6 @@ void handleWebScan() {
 </body>
 </html>
 )rawliteral";
-
-  WiFi.scanDelete();
 
   server.send(200, "text/html", html);
 }
@@ -841,6 +1213,10 @@ void startWebServer() {
 
   server.on("/", handleRoot);
   server.on("/scan", handleWebScan);
+  server.on("/scan-now", handleWebScanNow);
+  server.on("/scan-settings", handleScanSettings);
+  server.on("/scan-clear", handleClearScanHistory);
+  server.on("/scanlog.csv", handleScanCsv);
 
   server.onNotFound([]() {
     server.send(
@@ -1055,6 +1431,28 @@ void setup() {
 
 
 // ============================================================
+// Automatic scan service
+// ============================================================
+
+void serviceAutomaticScan() {
+  if (!autoScanEnabled) {
+    return;
+  }
+
+  unsigned long intervalMs = scanIntervalSeconds * 1000UL;
+
+  if (millis() - lastAutoScanMs < intervalMs) {
+    return;
+  }
+
+  lastAutoScanMs = millis();
+
+  performLoggedScan();
+  WiFi.scanDelete();
+}
+
+
+// ============================================================
 // Main loop
 // ============================================================
 
@@ -1063,6 +1461,7 @@ void loop() {
     server.handleClient();
   }
 
+  serviceAutomaticScan();
   handleSerialCommand();
 
   delay(5);
