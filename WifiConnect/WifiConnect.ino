@@ -1,4 +1,4 @@
-// WifiConnect5 - Wi-Fi scan history and RSSI plot revision
+// WifiConnect6 - configurable dynamic scan history revision
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -19,7 +19,10 @@ bool webServerStarted = false;
 // Scan history is intentionally RAM-only. It is cleared on power cycle/reset.
 // The same SSID/BSSID may appear in many records with different scan numbers
 // and timestamps, which is useful for signal-strength trending.
-const size_t MAX_SCAN_RECORDS = 300;
+const size_t DEFAULT_SCAN_HISTORY_RECORDS = 300;
+const size_t MIN_SCAN_HISTORY_RECORDS = 50;
+const size_t MAX_SCAN_HISTORY_RECORDS = 2000;
+
 const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
 const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
 
@@ -35,10 +38,13 @@ struct ScanRecord {
   bool hidden;
 };
 
-ScanRecord scanHistory[MAX_SCAN_RECORDS];
+ScanRecord* scanHistory = nullptr;
+size_t scanHistoryCapacity = 0;
 
 size_t historyStart = 0;
 size_t historyCount = 0;
+
+String historyResizeMessage = "";
 
 uint32_t scanCounter = 0;
 uint32_t lastScanUptimeMs = 0;
@@ -109,26 +115,123 @@ String securityLabel(wifi_auth_mode_t authMode) {
   }
 }
 
+const ScanRecord& historyRecord(size_t logicalIndex) {
+  size_t physicalIndex =
+      (historyStart + logicalIndex) % scanHistoryCapacity;
+
+  return scanHistory[physicalIndex];
+}
+
+size_t countRetainedScanGroups() {
+  if (historyCount == 0 || scanHistory == nullptr) {
+    return 0;
+  }
+
+  size_t groups = 0;
+  uint32_t previousScan = 0;
+  bool havePrevious = false;
+
+  for (size_t i = 0; i < historyCount; i++) {
+    uint32_t currentScan = historyRecord(i).scanNumber;
+
+    if (!havePrevious || currentScan != previousScan) {
+      groups++;
+      previousScan = currentScan;
+      havePrevious = true;
+    }
+  }
+
+  return groups;
+}
+
+bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
+  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS) {
+    requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
+  }
+
+  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS) {
+    requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
+  }
+
+  if (scanHistory != nullptr && requestedCapacity == scanHistoryCapacity) {
+    historyResizeMessage =
+      "History limit unchanged at " +
+      String(scanHistoryCapacity) +
+      " records.";
+    return true;
+  }
+
+  ScanRecord* newHistory =
+      (ScanRecord*)malloc(requestedCapacity * sizeof(ScanRecord));
+
+  if (newHistory == nullptr) {
+    historyResizeMessage =
+      "Unable to allocate " +
+      String(requestedCapacity) +
+      " records; previous limit retained.";
+    return false;
+  }
+
+  size_t recordsToKeep = 0;
+
+  if (preserveRecords && scanHistory != nullptr && historyCount > 0) {
+    recordsToKeep =
+      historyCount < requestedCapacity ? historyCount : requestedCapacity;
+
+    size_t firstLogicalRecord = historyCount - recordsToKeep;
+
+    for (size_t i = 0; i < recordsToKeep; i++) {
+      newHistory[i] = historyRecord(firstLogicalRecord + i);
+    }
+  }
+
+  if (scanHistory != nullptr) {
+    free(scanHistory);
+  }
+
+  scanHistory = newHistory;
+  scanHistoryCapacity = requestedCapacity;
+  historyStart = 0;
+  historyCount = recordsToKeep;
+
+  historyResizeMessage =
+    "History limit set to " +
+    String(scanHistoryCapacity) +
+    " records.";
+
+  return true;
+}
+
+void initializeScanHistory() {
+  if (scanHistory != nullptr) {
+    return;
+  }
+
+  if (!resizeScanHistory(DEFAULT_SCAN_HISTORY_RECORDS, false)) {
+    resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
+  }
+
+  historyResizeMessage = "";
+}
+
 void appendScanRecord(const ScanRecord& record) {
+  if (scanHistory == nullptr || scanHistoryCapacity == 0) {
+    return;
+  }
+
   size_t writeIndex;
 
-  if (historyCount < MAX_SCAN_RECORDS) {
-    writeIndex = (historyStart + historyCount) % MAX_SCAN_RECORDS;
+  if (historyCount < scanHistoryCapacity) {
+    writeIndex =
+      (historyStart + historyCount) % scanHistoryCapacity;
     historyCount++;
   } else {
-    // Ring buffer full: overwrite the oldest record.
     writeIndex = historyStart;
-    historyStart = (historyStart + 1) % MAX_SCAN_RECORDS;
+    historyStart =
+      (historyStart + 1) % scanHistoryCapacity;
   }
 
   scanHistory[writeIndex] = record;
-}
-
-const ScanRecord& historyRecord(size_t logicalIndex) {
-  size_t physicalIndex =
-      (historyStart + logicalIndex) % MAX_SCAN_RECORDS;
-
-  return scanHistory[physicalIndex];
 }
 
 void clearScanHistory() {
@@ -381,7 +484,7 @@ void scanNetworks() {
   Serial.print(". History: ");
   Serial.print(historyCount);
   Serial.print(" / ");
-  Serial.print(MAX_SCAN_RECORDS);
+  Serial.print(scanHistoryCapacity);
   Serial.println(" records.");
 
   Serial.println("Scan complete.");
@@ -918,6 +1021,20 @@ void handleScanSettings() {
     scanIntervalSeconds = (unsigned long)requested;
   }
 
+  if (server.hasArg("history")) {
+    long requestedHistory = server.arg("history").toInt();
+
+    if (requestedHistory < (long)MIN_SCAN_HISTORY_RECORDS) {
+      requestedHistory = MIN_SCAN_HISTORY_RECORDS;
+    }
+
+    if (requestedHistory > (long)MAX_SCAN_HISTORY_RECORDS) {
+      requestedHistory = MAX_SCAN_HISTORY_RECORDS;
+    }
+
+    resizeScanHistory((size_t)requestedHistory, true);
+  }
+
   autoScanEnabled = server.hasArg("auto");
   lastAutoScanMs = millis();
 
@@ -1390,9 +1507,27 @@ void handleWebScan() {
     "<span class=\"value\">";
   loggingCard += String(historyCount);
   loggingCard += " / ";
-  loggingCard += String(MAX_SCAN_RECORDS);
+  loggingCard += String(scanHistoryCapacity);
   loggingCard +=
     "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span>"
+    "<span class=\"value\">";
+  loggingCard += String(countRetainedScanGroups());
+  loggingCard +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">History RAM</span>"
+    "<span class=\"value\">";
+  loggingCard += String(
+    (scanHistoryCapacity * sizeof(ScanRecord)) / 1024.0,
+    1
+  );
+  loggingCard +=
+    " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Free Heap</span>"
+    "<span class=\"value\">";
+  loggingCard += String(ESP.getFreeHeap() / 1024.0, 1);
+  loggingCard +=
+    " KB</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Scan</span>"
     "<span class=\"value\">";
 
@@ -1413,6 +1548,13 @@ void handleWebScan() {
   loggingCard += String(scanIntervalSeconds);
   loggingCard +=
     "\"></div>"
+    "<div class=\"control\">"
+    "<label for=\"history\">History limit (records)</label>"
+    "<input id=\"history\" name=\"history\" type=\"number\" "
+    "min=\"50\" max=\"2000\" value=\"";
+  loggingCard += String(scanHistoryCapacity);
+  loggingCard +=
+    "\"></div>"
     "<div class=\"control\"><label>"
     "<input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
@@ -1430,8 +1572,18 @@ void handleWebScan() {
     "</div>"
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
-    "When the record buffer fills, the oldest records are overwritten."
-    "</div></div>";
+    "The limit can be changed from 50 to 2000 network observations. "
+    "Changing the limit preserves the newest records when possible. "
+    "When full, the oldest records are overwritten."
+    "</div>";
+
+  if (historyResizeMessage.length() > 0) {
+    loggingCard += "<div class=\"note\"><strong>";
+    loggingCard += htmlEscape(historyResizeMessage);
+    loggingCard += "</strong></div>";
+  }
+
+  loggingCard += "</div>";
 
   server.sendContent(loggingCard);
 
@@ -1684,6 +1836,9 @@ void setup() {
   Serial.println(" ESP32 Starting");
   Serial.println("================================");
   Serial.println();
+
+  // Allocate the RAM-only scan history buffer.
+  initializeScanHistory();
 
   // Initialize STA mode immediately so MAC and hostname are valid
   // even before the board has connected to a network.
