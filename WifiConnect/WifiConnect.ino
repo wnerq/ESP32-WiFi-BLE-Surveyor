@@ -1,4 +1,4 @@
-// WifiConnect7 - automatic scanning enabled by default
+// WifiConnect8 - move scan-page navigation controls to top
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -1569,6 +1569,8 @@ void handleWebScan() {
     "<a class=\"button\" href=\"/scan-now\">Scan Now</a>"
     "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
     "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
+    "<a class=\"button\" href=\"/\">Back to Status</a>"
+    "<a class=\"button\" href=\"/scan\">Refresh Page</a>"
     "</div>"
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
@@ -1620,10 +1622,6 @@ void handleWebScan() {
   server.sendContent("</div>");
 
   server.sendContent(
-    "<div class=\"buttons\">"
-    "<a class=\"button\" href=\"/\">Back to Status</a>"
-    "<a class=\"button\" href=\"/scan\">Refresh Page</a>"
-    "</div>"
     "<div class=\"footer\">ESP32 Web Interface</div>"
     "</div></body></html>"
   );
