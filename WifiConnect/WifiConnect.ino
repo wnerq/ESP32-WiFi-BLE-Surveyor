@@ -1,4 +1,4 @@
-// WifiConnect8 - move scan-page navigation controls to top
+// WifiConnect9 - configurable AP + STA mode
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -10,6 +10,18 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
 
 bool webServerStarted = false;
+
+
+// ============================================================
+// Access point configuration
+// ============================================================
+
+bool apEnabled = true;
+bool apRunning = false;
+
+String apSSID = "";
+String apPassword = "";
+String apStatusMessage = "";
 
 
 // ============================================================
@@ -77,11 +89,128 @@ String readSerialLine() {
 // Wi-Fi helpers
 // ============================================================
 
-void ensureWiFiStationMode() {
-  if (WiFi.getMode() == WIFI_OFF) {
-    WiFi.mode(WIFI_STA);
-    delay(WIFI_STARTUP_SETTLE_MS);
+String macSuffix() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+
+  if (mac.length() >= 6) {
+    return mac.substring(mac.length() - 6);
   }
+
+  return "ESP32";
+}
+
+String defaultApSSID() {
+  return "ESP32-Surveyor-" + macSuffix();
+}
+
+String defaultApPassword() {
+  return "survey-" + macSuffix();
+}
+
+void loadAccessPointSettings() {
+  preferences.begin("ap", true);
+
+  bool hasEnabled = preferences.isKey("enabled");
+  bool hasSSID = preferences.isKey("ssid");
+  bool hasPassword = preferences.isKey("password");
+
+  apEnabled =
+      hasEnabled
+        ? preferences.getBool("enabled", true)
+        : true;
+
+  apSSID =
+      hasSSID
+        ? preferences.getString("ssid", "")
+        : "";
+
+  apPassword =
+      hasPassword
+        ? preferences.getString("password", "")
+        : "";
+
+  preferences.end();
+
+  if (apSSID.length() == 0) {
+    apSSID = defaultApSSID();
+  }
+
+  if (apPassword.length() < 8) {
+    apPassword = defaultApPassword();
+  }
+}
+
+void saveAccessPointSettings(
+  bool enabled,
+  const String& ssid,
+  const String& password
+) {
+  preferences.begin("ap", false);
+
+  preferences.putBool("enabled", enabled);
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+
+  preferences.end();
+}
+
+void ensureWiFiStationMode() {
+  wifi_mode_t currentMode = WiFi.getMode();
+
+  if (apRunning || apEnabled) {
+    if (currentMode != WIFI_AP_STA) {
+      WiFi.mode(WIFI_AP_STA);
+      delay(WIFI_STARTUP_SETTLE_MS);
+    }
+  } else {
+    if (currentMode != WIFI_STA) {
+      WiFi.mode(WIFI_STA);
+      delay(WIFI_STARTUP_SETTLE_MS);
+    }
+  }
+}
+
+bool startAccessPoint() {
+  if (!apEnabled) {
+    apRunning = false;
+    return false;
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  delay(WIFI_STARTUP_SETTLE_MS);
+
+  bool started =
+      WiFi.softAP(
+        apSSID.c_str(),
+        apPassword.c_str()
+      );
+
+  apRunning = started;
+
+  Serial.println();
+
+  if (started) {
+    Serial.println("Access point started.");
+
+    Serial.print("AP SSID:     ");
+    Serial.println(apSSID);
+
+    Serial.print("AP Password: ");
+    Serial.println(apPassword);
+
+    Serial.print("AP IP:       ");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.println(
+      "Connect directly to the AP to use the web interface "
+      "without infrastructure Wi-Fi."
+    );
+  } else {
+    Serial.println("Failed to start access point.");
+  }
+
+  return started;
 }
 
 String securityLabel(wifi_auth_mode_t authMode) {
@@ -653,6 +782,23 @@ void printWiFiStatus() {
   }
 
   Serial.println();
+  Serial.println("Access Point:");
+
+  Serial.print("Status:    ");
+  Serial.println(apRunning ? "Running" : "Disabled");
+
+  if (apRunning) {
+    Serial.print("SSID:      ");
+    Serial.println(apSSID);
+
+    Serial.print("IP:        ");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.print("Clients:   ");
+    Serial.println(WiFi.softAPgetStationNum());
+  }
+
+  Serial.println();
 }
 
 void printMacAddress() {
@@ -872,6 +1018,11 @@ void handleRoot() {
   String gatewayText = WiFi.gatewayIP().toString();
   String subnetText = WiFi.subnetMask().toString();
 
+  String apStatusText = apRunning ? "Running" : "Disabled";
+  String apIpText = apRunning ? WiFi.softAPIP().toString() : "-";
+  String apClientsText =
+      apRunning ? String(WiFi.softAPgetStationNum()) : "0";
+
   if (connected) {
     statusText = "Connected";
     ssidText = WiFi.SSID();
@@ -957,9 +1108,36 @@ void handleRoot() {
 
     </div>
 
+    <div class="card">
+
+      <h2>Access Point</h2>
+
+      <div class="row">
+        <span class="label">AP Status</span>
+        <span class="value">%AP_STATUS%</span>
+      </div>
+
+      <div class="row">
+        <span class="label">AP SSID</span>
+        <span class="value">%AP_SSID%</span>
+      </div>
+
+      <div class="row">
+        <span class="label">AP IP Address</span>
+        <span class="value">%AP_IP%</span>
+      </div>
+
+      <div class="row">
+        <span class="label">AP Clients</span>
+        <span class="value">%AP_CLIENTS%</span>
+      </div>
+
+    </div>
+
     <div class="buttons">
       <a class="button" href="/">Refresh Status</a>
       <a class="button" href="/scan-now">Scan Wi-Fi</a>
+      <a class="button" href="/ap">AP Settings</a>
     </div>
 
     <div class="footer">
@@ -980,6 +1158,10 @@ void handleRoot() {
   html.replace("%SUBNET%", htmlEscape(subnetText));
   html.replace("%RSSI%", htmlEscape(rssiText));
   html.replace("%UPTIME%", htmlEscape(getUptimeString()));
+  html.replace("%AP_STATUS%", htmlEscape(apStatusText));
+  html.replace("%AP_SSID%", htmlEscape(apSSID));
+  html.replace("%AP_IP%", htmlEscape(apIpText));
+  html.replace("%AP_CLIENTS%", htmlEscape(apClientsText));
 
   server.send(200, "text/html", html);
 }
@@ -1631,6 +1813,200 @@ void handleWebScan() {
 
 
 // ============================================================
+// Access point web configuration
+// ============================================================
+
+void handleAccessPointSettingsPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Access Point Settings</title>
+)rawliteral";
+
+  html += pageStyles();
+
+  html += R"rawliteral(
+</head>
+
+<body>
+  <div class="container">
+
+    <h1>Access Point Settings</h1>
+
+    <div class="card">
+
+      <div class="row">
+        <span class="label">Current Status</span>
+        <span class="value">%AP_STATUS%</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Current AP IP</span>
+        <span class="value">%AP_IP%</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Connected Clients</span>
+        <span class="value">%AP_CLIENTS%</span>
+      </div>
+
+      <form class="controls" action="/ap-save" method="post">
+
+        <div class="control">
+          <label>
+            <input
+              type="checkbox"
+              name="enabled"
+              value="1"
+              %AP_CHECKED%
+            >
+            Enable access point
+          </label>
+        </div>
+
+        <div class="control">
+          <label for="apssid">AP SSID</label>
+          <input
+            id="apssid"
+            name="ssid"
+            type="text"
+            maxlength="32"
+            value="%AP_SSID%"
+          >
+        </div>
+
+        <div class="control">
+          <label for="appassword">New AP password</label>
+          <input
+            id="appassword"
+            name="password"
+            type="password"
+            minlength="8"
+            maxlength="63"
+            placeholder="Leave blank to keep current"
+          >
+        </div>
+
+        <button type="submit">Save AP Settings &amp; Restart</button>
+
+      </form>
+
+      <div class="note">
+        The AP password must be 8 to 63 characters.
+        Leaving the password field blank keeps the current password.
+        Changes are saved in NVS and applied after the ESP32 restarts.
+        Disabling the AP may make this page unreachable unless the ESP32
+        is also connected to an infrastructure Wi-Fi network.
+      </div>
+
+    </div>
+
+    <div class="buttons">
+      <a class="button" href="/">Back to Status</a>
+      <a class="button" href="/scan">Wi-Fi Survey</a>
+    </div>
+
+    <div class="footer">
+      ESP32 Web Interface
+    </div>
+
+  </div>
+</body>
+</html>
+)rawliteral";
+
+  html.replace(
+    "%AP_STATUS%",
+    apRunning ? "Running" : "Disabled"
+  );
+
+  html.replace(
+    "%AP_IP%",
+    apRunning ? WiFi.softAPIP().toString() : "-"
+  );
+
+  html.replace(
+    "%AP_CLIENTS%",
+    apRunning ? String(WiFi.softAPgetStationNum()) : "0"
+  );
+
+  html.replace("%AP_SSID%", htmlEscape(apSSID));
+
+  html.replace(
+    "%AP_CHECKED%",
+    apEnabled ? "checked" : ""
+  );
+
+  server.send(200, "text/html", html);
+}
+
+void handleSaveAccessPointSettings() {
+  bool requestedEnabled = server.hasArg("enabled");
+
+  String requestedSSID =
+      server.hasArg("ssid")
+        ? server.arg("ssid")
+        : apSSID;
+
+  requestedSSID.trim();
+
+  if (requestedSSID.length() == 0) {
+    requestedSSID = defaultApSSID();
+  }
+
+  if (requestedSSID.length() > 32) {
+    requestedSSID = requestedSSID.substring(0, 32);
+  }
+
+  String requestedPassword = apPassword;
+
+  if (
+    server.hasArg("password") &&
+    server.arg("password").length() > 0
+  ) {
+    requestedPassword = server.arg("password");
+
+    if (
+      requestedPassword.length() < 8 ||
+      requestedPassword.length() > 63
+    ) {
+      server.send(
+        400,
+        "text/plain",
+        "AP password must be 8 to 63 characters."
+      );
+      return;
+    }
+  }
+
+  saveAccessPointSettings(
+    requestedEnabled,
+    requestedSSID,
+    requestedPassword
+  );
+
+  server.send(
+    200,
+    "text/html",
+    "<!DOCTYPE html><html><head>"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>AP Settings Saved</title></head><body>"
+    "<h2>Access point settings saved.</h2>"
+    "<p>The ESP32 is restarting now.</p>"
+    "<p>If the AP SSID or password changed, reconnect using the new settings.</p>"
+    "</body></html>"
+  );
+
+  delay(750);
+  ESP.restart();
+}
+
+
+// ============================================================
 // Web server
 // ============================================================
 
@@ -1645,6 +2021,8 @@ void startWebServer() {
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
+  server.on("/ap", HTTP_GET, handleAccessPointSettingsPage);
+  server.on("/ap-save", HTTP_POST, handleSaveAccessPointSettings);
 
   server.onNotFound([]() {
     server.send(
@@ -1661,8 +2039,14 @@ void startWebServer() {
   Serial.println("Web server started.");
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Open: http://");
+    Serial.print("LAN web UI: http://");
     Serial.print(WiFi.localIP());
+    Serial.println("/");
+  }
+
+  if (apRunning) {
+    Serial.print("AP web UI:  http://");
+    Serial.print(WiFi.softAPIP());
     Serial.println("/");
   }
 }
@@ -1686,6 +2070,15 @@ void printMenu() {
     Serial.println(WiFi.localIP());
   } else {
     Serial.println("Wi-Fi: Not connected");
+  }
+
+  if (apRunning) {
+    Serial.print("AP:    ");
+    Serial.print(apSSID);
+    Serial.print(" @ ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("AP:    Disabled");
   }
 
   Serial.println();
@@ -1770,7 +2163,8 @@ void handleSerialCommand() {
     if (confirmation.equalsIgnoreCase("YES")) {
       eraseCredentials();
 
-      WiFi.disconnect(true);
+      // Disconnect only the station interface; keep the survey AP running.
+      WiFi.disconnect(false);
       delay(100);
 
       Serial.println();
@@ -1838,22 +2232,39 @@ void setup() {
   // Allocate the RAM-only scan history buffer.
   initializeScanHistory();
 
-  // Initialize STA mode immediately so MAC and hostname are valid
-  // even before the board has connected to a network.
+  // Start the station interface first so the hardware MAC is available
+  // for unique default AP credentials.
   WiFi.mode(WIFI_STA);
   delay(WIFI_STARTUP_SETTLE_MS);
+
+  loadAccessPointSettings();
+
+  if (apEnabled) {
+    startAccessPoint();
+  }
 
   bool connected = connectUsingSavedCredentials();
 
   if (!connected) {
     Serial.println();
-    Serial.println("Wi-Fi is not configured.");
-    Serial.println(
-      "Use menu option 3 to configure Wi-Fi."
-    );
+    Serial.println("Infrastructure Wi-Fi is not configured or unavailable.");
+
+    if (apRunning) {
+      Serial.println(
+        "The ESP32 access point remains available for surveying "
+        "and web configuration."
+      );
+    } else {
+      Serial.println(
+        "Use serial menu option 3 to configure Wi-Fi."
+      );
+    }
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (
+    WiFi.status() == WL_CONNECTED ||
+    apRunning
+  ) {
     startWebServer();
   }
 
