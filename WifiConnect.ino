@@ -1,4 +1,4 @@
-// WifiConnect4 - Wi-Fi survey/logger revision
+// WifiConnect5 - Wi-Fi scan history and RSSI plot revision
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -675,6 +675,26 @@ String pageStyles() {
     margin-top: 14px;
   }
 
+  .scan-group {
+    margin-top: 26px;
+  }
+
+  .scan-heading {
+    font-weight: bold;
+    margin: 0 0 8px 0;
+  }
+
+  .plot-wrap {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .plot-wrap svg {
+    width: 100%;
+    min-width: 520px;
+    height: auto;
+  }
+
   .controls {
     display: flex;
     flex-wrap: wrap;
@@ -958,247 +978,505 @@ void handleScanCsv() {
   server.sendContent("");
 }
 
+void sendRssiHistoryPlot(const String& currentBssid) {
+  const int SVG_WIDTH = 720;
+  const int SVG_HEIGHT = 280;
+
+  const int LEFT = 58;
+  const int RIGHT = 20;
+  const int TOP = 20;
+  const int BOTTOM = 45;
+
+  const int plotWidth = SVG_WIDTH - LEFT - RIGHT;
+  const int plotHeight = SVG_HEIGHT - TOP - BOTTOM;
+
+  // Fixed RSSI range keeps plots comparable between locations.
+  const int RSSI_TOP = -30;
+  const int RSSI_BOTTOM = -100;
+
+  uint32_t firstMs = 0;
+  uint32_t lastMs = 0;
+  size_t pointCount = 0;
+
+  for (size_t i = 0; i < historyCount; i++) {
+    const ScanRecord& record = historyRecord(i);
+
+    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+      continue;
+    }
+
+    if (pointCount == 0) {
+      firstMs = record.uptimeMs;
+    }
+
+    lastMs = record.uptimeMs;
+    pointCount++;
+  }
+
+  if (pointCount == 0) {
+    server.sendContent(
+      "<p>No logged RSSI samples are available yet for the currently connected BSSID.</p>"
+    );
+    return;
+  }
+
+  if (lastMs <= firstMs) {
+    lastMs = firstMs + 1;
+  }
+
+  server.sendContent(
+    "<div class=\"plot-wrap\">"
+    "<svg viewBox=\"0 0 720 280\" role=\"img\" "
+    "aria-label=\"RSSI history for the currently connected access point\">"
+  );
+
+  // Background and horizontal grid lines.
+  server.sendContent(
+    "<rect x=\"58\" y=\"20\" width=\"642\" height=\"215\" "
+    "fill=\"white\" stroke=\"#bbb\"/>"
+  );
+
+  for (int rssi = -100; rssi <= -30; rssi += 10) {
+    int y = TOP +
+      ((RSSI_TOP - rssi) * plotHeight) /
+      (RSSI_TOP - RSSI_BOTTOM);
+
+    String grid;
+    grid.reserve(180);
+
+    grid += "<line x1=\"";
+    grid += String(LEFT);
+    grid += "\" y1=\"";
+    grid += String(y);
+    grid += "\" x2=\"";
+    grid += String(SVG_WIDTH - RIGHT);
+    grid += "\" y2=\"";
+    grid += String(y);
+    grid += "\" stroke=\"#ddd\" stroke-width=\"1\"/>";
+
+    grid += "<text x=\"";
+    grid += String(LEFT - 8);
+    grid += "\" y=\"";
+    grid += String(y + 4);
+    grid += "\" text-anchor=\"end\" font-size=\"11\">";
+    grid += String(rssi);
+    grid += "</text>";
+
+    server.sendContent(grid);
+  }
+
+  // Polyline points.
+  String points;
+  points.reserve(pointCount * 14);
+
+  for (size_t i = 0; i < historyCount; i++) {
+    const ScanRecord& record = historyRecord(i);
+
+    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+      continue;
+    }
+
+    int x = LEFT +
+      (uint64_t)(record.uptimeMs - firstMs) * plotWidth /
+      (lastMs - firstMs);
+
+    int clippedRssi = record.rssi;
+
+    if (clippedRssi > RSSI_TOP) {
+      clippedRssi = RSSI_TOP;
+    }
+
+    if (clippedRssi < RSSI_BOTTOM) {
+      clippedRssi = RSSI_BOTTOM;
+    }
+
+    int y = TOP +
+      ((RSSI_TOP - clippedRssi) * plotHeight) /
+      (RSSI_TOP - RSSI_BOTTOM);
+
+    if (points.length() > 0) {
+      points += " ";
+    }
+
+    points += String(x);
+    points += ",";
+    points += String(y);
+  }
+
+  String polyline;
+  polyline.reserve(points.length() + 120);
+  polyline =
+    "<polyline fill=\"none\" stroke=\"#333\" stroke-width=\"2\" points=\"";
+  polyline += points;
+  polyline += "\"/>";
+
+  server.sendContent(polyline);
+
+  // Individual samples.
+  for (size_t i = 0; i < historyCount; i++) {
+    const ScanRecord& record = historyRecord(i);
+
+    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+      continue;
+    }
+
+    int x = LEFT +
+      (uint64_t)(record.uptimeMs - firstMs) * plotWidth /
+      (lastMs - firstMs);
+
+    int clippedRssi = record.rssi;
+
+    if (clippedRssi > RSSI_TOP) {
+      clippedRssi = RSSI_TOP;
+    }
+
+    if (clippedRssi < RSSI_BOTTOM) {
+      clippedRssi = RSSI_BOTTOM;
+    }
+
+    int y = TOP +
+      ((RSSI_TOP - clippedRssi) * plotHeight) /
+      (RSSI_TOP - RSSI_BOTTOM);
+
+    String dot;
+    dot.reserve(220);
+
+    dot += "<circle cx=\"";
+    dot += String(x);
+    dot += "\" cy=\"";
+    dot += String(y);
+    dot += "\" r=\"4\" fill=\"#333\">";
+    dot += "<title>Scan #";
+    dot += String(record.scanNumber);
+    dot += " | ";
+    dot += htmlEscape(formatUptime(record.uptimeMs));
+    dot += " | ";
+    dot += String(record.rssi);
+    dot += " dBm</title></circle>";
+
+    server.sendContent(dot);
+  }
+
+  String labels;
+  labels.reserve(400);
+
+  labels += "<text x=\"";
+  labels += String(LEFT);
+  labels += "\" y=\"";
+  labels += String(SVG_HEIGHT - 18);
+  labels += "\" text-anchor=\"start\" font-size=\"11\">";
+  labels += htmlEscape(formatUptime(firstMs));
+  labels += "</text>";
+
+  labels += "<text x=\"";
+  labels += String(SVG_WIDTH - RIGHT);
+  labels += "\" y=\"";
+  labels += String(SVG_HEIGHT - 18);
+  labels += "\" text-anchor=\"end\" font-size=\"11\">";
+  labels += htmlEscape(formatUptime(lastMs));
+  labels += "</text>";
+
+  labels +=
+    "<text x=\"15\" y=\"128\" transform=\"rotate(-90 15 128)\" "
+    "text-anchor=\"middle\" font-size=\"12\">RSSI (dBm)</text>";
+
+  server.sendContent(labels);
+  server.sendContent("</svg></div>");
+}
+
+bool scanNumberIsRetained(uint32_t scanNumber) {
+  for (size_t i = 0; i < historyCount; i++) {
+    if (historyRecord(i).scanNumber == scanNumber) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+size_t retainedRecordCountForScan(uint32_t scanNumber) {
+  size_t count = 0;
+
+  for (size_t i = 0; i < historyCount; i++) {
+    if (historyRecord(i).scanNumber == scanNumber) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+uint32_t retainedUptimeForScan(uint32_t scanNumber) {
+  for (size_t i = 0; i < historyCount; i++) {
+    if (historyRecord(i).scanNumber == scanNumber) {
+      return historyRecord(i).uptimeMs;
+    }
+  }
+
+  return 0;
+}
+
+void sendScanHistoryTables() {
+  if (historyCount == 0) {
+    server.sendContent("<p>No scans have been logged yet.</p>");
+    return;
+  }
+
+  // Newest scan first.
+  for (uint32_t scanNumber = scanCounter; scanNumber > 0; scanNumber--) {
+    if (!scanNumberIsRetained(scanNumber)) {
+      continue;
+    }
+
+    size_t recordCount = retainedRecordCountForScan(scanNumber);
+    uint32_t scanUptime = retainedUptimeForScan(scanNumber);
+
+    String heading;
+    heading.reserve(220);
+
+    heading += "<div class=\"scan-group\">";
+    heading += "<div class=\"scan-heading\">Scan #";
+    heading += String(scanNumber);
+    heading += " &mdash; ";
+    heading += htmlEscape(formatUptime(scanUptime));
+    heading += " uptime &mdash; ";
+    heading += String(recordCount);
+    heading += " network";
+
+    if (recordCount != 1) {
+      heading += "s";
+    }
+
+    heading += "</div>";
+
+    heading +=
+      "<table><thead><tr>"
+      "<th>SSID</th>"
+      "<th>BSSID</th>"
+      "<th class=\"signal\">CH</th>"
+      "<th class=\"signal\">Signal</th>"
+      "<th class=\"security\">Security</th>"
+      "</tr></thead><tbody>";
+
+    server.sendContent(heading);
+
+    for (size_t i = 0; i < historyCount; i++) {
+      const ScanRecord& record = historyRecord(i);
+
+      if (record.scanNumber != scanNumber) {
+        continue;
+      }
+
+      String row;
+      row.reserve(420);
+
+      if (record.connected) {
+        row += "<tr class=\"current\">";
+      } else {
+        row += "<tr>";
+      }
+
+      String displaySSID =
+        record.hidden ? "(hidden)" : String(record.ssid);
+
+      row += "<td>";
+      row += htmlEscape(displaySSID);
+
+      if (record.connected) {
+        row += " (connected)";
+      }
+
+      row += "</td>";
+
+      row += "<td>";
+      row += htmlEscape(String(record.bssid));
+      row += "</td>";
+
+      row += "<td class=\"signal\">";
+      row += String(record.channel);
+      row += "</td>";
+
+      row += "<td class=\"signal\">";
+      row += String(record.rssi);
+      row += " dBm</td>";
+
+      row += "<td class=\"security\">";
+      row += htmlEscape(
+        securityLabel((wifi_auth_mode_t)record.authMode)
+      );
+      row += "</td>";
+
+      row += "</tr>";
+
+      server.sendContent(row);
+    }
+
+    server.sendContent("</tbody></table></div>");
+  }
+}
+
 void handleWebScan() {
   ensureWiFiStationMode();
 
   bool connected = WiFi.status() == WL_CONNECTED;
   String connectedSSID = connected ? WiFi.SSID() : "";
+  String connectedBSSID = connected ? WiFi.BSSIDstr() : "";
   int connectedRSSI = connected ? WiFi.RSSI() : 0;
 
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
 
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Wi-Fi Survey</title>
-)rawliteral";
+  server.sendContent(
+    "<!DOCTYPE html><html><head>"
+    "<meta charset=\"UTF-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>ESP32 Wi-Fi Survey</title>"
+  );
 
-  html += pageStyles();
+  server.sendContent(pageStyles());
 
-  html += R"rawliteral(
-</head>
-
-<body>
-  <div class="container">
-
-    <h1>Wi-Fi Survey</h1>
-)rawliteral";
+  server.sendContent(
+    "</head><body><div class=\"container\">"
+    "<h1>Wi-Fi Survey</h1>"
+  );
 
   if (connected) {
-    html += R"rawliteral(
-    <div class="card">
-      <div class="row">
-        <span class="label">Connected SSID</span>
-        <span class="value">)rawliteral";
-    html += htmlEscape(connectedSSID);
-    html += R"rawliteral(</span>
-      </div>
+    String connectedCard;
+    connectedCard.reserve(550);
 
-      <div class="row">
-        <span class="label">Current Signal</span>
-        <span class="value">)rawliteral";
-    html += String(connectedRSSI);
-    html += R"rawliteral( dBm</span>
-      </div>
-    </div>
-)rawliteral";
+    connectedCard +=
+      "<div class=\"card\">"
+      "<div class=\"row\"><span class=\"label\">Connected SSID</span>"
+      "<span class=\"value\">";
+    connectedCard += htmlEscape(connectedSSID);
+    connectedCard +=
+      "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Connected BSSID</span>"
+      "<span class=\"value\">";
+    connectedCard += htmlEscape(connectedBSSID);
+    connectedCard +=
+      "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Current Signal</span>"
+      "<span class=\"value\">";
+    connectedCard += String(connectedRSSI);
+    connectedCard +=
+      " dBm</span></div>"
+      "</div>";
+
+    server.sendContent(connectedCard);
   }
 
-  html += R"rawliteral(
-    <div class="card">
-      <h2>Scan Logging</h2>
+  String loggingCard;
+  loggingCard.reserve(2200);
 
-      <div class="row">
-        <span class="label">Automatic Scanning</span>
-        <span class="value">)rawliteral";
-  html += autoScanEnabled ? "ON" : "OFF";
-  html += R"rawliteral(</span>
-      </div>
-
-      <div class="row">
-        <span class="label">Scan Interval</span>
-        <span class="value">)rawliteral";
-  html += String(scanIntervalSeconds);
-  html += R"rawliteral( seconds</span>
-      </div>
-
-      <div class="row">
-        <span class="label">Scans This Session</span>
-        <span class="value">)rawliteral";
-  html += String(scanCounter);
-  html += R"rawliteral(</span>
-      </div>
-
-      <div class="row">
-        <span class="label">Stored Records</span>
-        <span class="value">)rawliteral";
-  html += String(historyCount);
-  html += " / ";
-  html += String(MAX_SCAN_RECORDS);
-  html += R"rawliteral(</span>
-      </div>
-
-      <div class="row">
-        <span class="label">Last Scan</span>
-        <span class="value">)rawliteral";
+  loggingCard +=
+    "<div class=\"card\"><h2>Scan Logging</h2>"
+    "<div class=\"row\"><span class=\"label\">Automatic Scanning</span>"
+    "<span class=\"value\">";
+  loggingCard += autoScanEnabled ? "ON" : "OFF";
+  loggingCard +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Interval</span>"
+    "<span class=\"value\">";
+  loggingCard += String(scanIntervalSeconds);
+  loggingCard +=
+    " seconds</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scans This Session</span>"
+    "<span class=\"value\">";
+  loggingCard += String(scanCounter);
+  loggingCard +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Stored Records</span>"
+    "<span class=\"value\">";
+  loggingCard += String(historyCount);
+  loggingCard += " / ";
+  loggingCard += String(MAX_SCAN_RECORDS);
+  loggingCard +=
+    "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Scan</span>"
+    "<span class=\"value\">";
 
   if (scanCounter == 0) {
-    html += "Never";
+    loggingCard += "Never";
   } else {
-    html += htmlEscape(formatUptime(lastScanUptimeMs));
-    html += " uptime";
+    loggingCard += htmlEscape(formatUptime(lastScanUptimeMs));
+    loggingCard += " uptime";
   }
 
-  html += R"rawliteral(</span>
-      </div>
-
-      <form class="controls" action="/scan-settings" method="get">
-        <div class="control">
-          <label for="interval">Interval (seconds)</label>
-          <input
-            id="interval"
-            name="interval"
-            type="number"
-            min="5"
-            max="3600"
-            value=")rawliteral";
-  html += String(scanIntervalSeconds);
-  html += R"rawliteral("
-          >
-        </div>
-
-        <div class="control">
-          <label>
-            <input
-              type="checkbox"
-              name="auto"
-              value="1"
-)rawliteral";
+  loggingCard +=
+    "</span></div>"
+    "<form class=\"controls\" action=\"/scan-settings\" method=\"get\">"
+    "<div class=\"control\">"
+    "<label for=\"interval\">Interval (seconds)</label>"
+    "<input id=\"interval\" name=\"interval\" type=\"number\" "
+    "min=\"5\" max=\"3600\" value=\"";
+  loggingCard += String(scanIntervalSeconds);
+  loggingCard +=
+    "\"></div>"
+    "<div class=\"control\"><label>"
+    "<input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
   if (autoScanEnabled) {
-    html += " checked";
+    loggingCard += " checked";
   }
 
-  html += R"rawliteral(
-            >
-            Automatic scanning
-          </label>
-        </div>
+  loggingCard +=
+    "> Automatic scanning</label></div>"
+    "<button type=\"submit\">Apply</button></form>"
+    "<div class=\"buttons\">"
+    "<a class=\"button\" href=\"/scan-now\">Scan Now</a>"
+    "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
+    "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
+    "</div>"
+    "<div class=\"note\">"
+    "Scan history is kept in RAM only and is cleared by reset or power cycle. "
+    "When the record buffer fills, the oldest records are overwritten."
+    "</div></div>";
 
-        <button type="submit">Apply</button>
-      </form>
+  server.sendContent(loggingCard);
 
-      <div class="buttons">
-        <a class="button" href="/scan-now">Scan Now</a>
-        <a class="button" href="/scanlog.csv">Download CSV</a>
-        <a class="button" href="/scan-clear">Clear History</a>
-      </div>
+  server.sendContent(
+    "<div class=\"card\"><h2>Connected AP RSSI History</h2>"
+  );
 
-      <div class="note">
-        Scan history is kept in RAM only and is cleared by reset or power cycle.
-        When the record buffer fills, the oldest records are overwritten.
-      </div>
-    </div>
+  if (connected) {
+    sendRssiHistoryPlot(connectedBSSID);
 
-    <div class="card">
-      <h2>Latest Scan</h2>
-)rawliteral";
-
-  if (scanCounter == 0 || historyCount == 0) {
-    html += R"rawliteral(
-      <p>No scan has been logged yet.</p>
-)rawliteral";
+    server.sendContent(
+      "<div class=\"note\">"
+      "This plot follows the BSSID of the access point currently serving the ESP32. "
+      "Each point is one logged scan observation. Hover a point for scan number, "
+      "uptime, and RSSI."
+      "</div>"
+    );
   } else {
-    html += R"rawliteral(
-      <table>
-        <thead>
-          <tr>
-            <th>SSID</th>
-            <th>BSSID</th>
-            <th class="signal">CH</th>
-            <th class="signal">Signal</th>
-            <th class="security">Security</th>
-          </tr>
-        </thead>
-        <tbody>
-)rawliteral";
-
-    for (size_t i = 0; i < historyCount; i++) {
-      const ScanRecord& record = historyRecord(i);
-
-      if (record.scanNumber != scanCounter) {
-        continue;
-      }
-
-      if (record.connected) {
-        html += "<tr class=\"current\">";
-      } else {
-        html += "<tr>";
-      }
-
-      String displaySSID =
-          record.hidden ? "(hidden)" : String(record.ssid);
-
-      html += "<td>";
-      html += htmlEscape(displaySSID);
-
-      if (record.connected) {
-        html += " (connected)";
-      }
-
-      html += "</td>";
-
-      html += "<td>";
-      html += htmlEscape(String(record.bssid));
-      html += "</td>";
-
-      html += "<td class=\"signal\">";
-      html += String(record.channel);
-      html += "</td>";
-
-      html += "<td class=\"signal\">";
-      html += String(record.rssi);
-      html += " dBm</td>";
-
-      html += "<td class=\"security\">";
-      html += htmlEscape(
-        securityLabel((wifi_auth_mode_t)record.authMode)
-      );
-      html += "</td>";
-
-      html += "</tr>";
-    }
-
-    html += R"rawliteral(
-        </tbody>
-      </table>
-)rawliteral";
+    server.sendContent(
+      "<p>The ESP32 is not currently connected to an access point.</p>"
+    );
   }
 
-  html += R"rawliteral(
-      <div class="note">
-        Signal values closer to 0 dBm are stronger. BSSID identifies an
-        individual access point/radio, so the same SSID can appear more than once.
-      </div>
-    </div>
+  server.sendContent("</div>");
 
-    <div class="buttons">
-      <a class="button" href="/">Back to Status</a>
-      <a class="button" href="/scan">Refresh Page</a>
-    </div>
+  server.sendContent(
+    "<div class=\"card\"><h2>Scan History</h2>"
+    "<div class=\"note\">Newest scans are shown first. "
+    "Each section is one complete logged scan.</div>"
+  );
 
-    <div class="footer">
-      ESP32 Web Interface
-    </div>
+  sendScanHistoryTables();
 
-  </div>
-</body>
-</html>
-)rawliteral";
+  server.sendContent("</div>");
 
-  server.send(200, "text/html", html);
+  server.sendContent(
+    "<div class=\"buttons\">"
+    "<a class=\"button\" href=\"/\">Back to Status</a>"
+    "<a class=\"button\" href=\"/scan\">Refresh Page</a>"
+    "</div>"
+    "<div class=\"footer\">ESP32 Web Interface</div>"
+    "</div></body></html>"
+  );
+
+  server.sendContent("");
 }
 
 
