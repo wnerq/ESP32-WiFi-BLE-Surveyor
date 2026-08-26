@@ -1,4 +1,4 @@
-// WifiConnect6 - configurable dynamic scan history revision
+// WifiConnect7 - automatic scanning enabled by default
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -49,8 +49,8 @@ String historyResizeMessage = "";
 uint32_t scanCounter = 0;
 uint32_t lastScanUptimeMs = 0;
 
-bool autoScanEnabled = false;
-unsigned long scanIntervalSeconds = 10;
+bool autoScanEnabled = true;
+unsigned long scanIntervalSeconds = 300;
 unsigned long lastAutoScanMs = 0;
 
 
