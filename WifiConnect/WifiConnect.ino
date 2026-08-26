@@ -1,7 +1,8 @@
-// WifiConnect10 - selectable RSSI history plot
+// WifiConnect11 - optional clear-before-resize and heap diagnostics
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 
 Preferences preferences;
 WebServer server(80);
@@ -330,6 +331,100 @@ bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
 
   return true;
 }
+
+bool clearAndResizeScanHistory(size_t requestedCapacity) {
+  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS) {
+    requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
+  }
+
+  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS) {
+    requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
+  }
+
+  size_t previousCapacity = scanHistoryCapacity;
+
+  // The user explicitly requested that existing history be discarded
+  // before allocating the new buffer. This frees the largest possible
+  // contiguous block for the resize attempt.
+  if (scanHistory != nullptr) {
+    free(scanHistory);
+    scanHistory = nullptr;
+  }
+
+  scanHistoryCapacity = 0;
+  historyStart = 0;
+  historyCount = 0;
+  scanCounter = 0;
+  lastScanUptimeMs = 0;
+
+  ScanRecord* newHistory =
+      (ScanRecord*)malloc(
+        requestedCapacity * sizeof(ScanRecord)
+      );
+
+  if (newHistory != nullptr) {
+    scanHistory = newHistory;
+    scanHistoryCapacity = requestedCapacity;
+
+    historyResizeMessage =
+      "History cleared; limit set to " +
+      String(scanHistoryCapacity) +
+      " records.";
+
+    return true;
+  }
+
+  // The requested allocation still failed. Try to restore an empty
+  // buffer at the previous capacity so logging can continue.
+  size_t fallbackCapacity =
+      previousCapacity > 0
+        ? previousCapacity
+        : DEFAULT_SCAN_HISTORY_RECORDS;
+
+  newHistory =
+      (ScanRecord*)malloc(
+        fallbackCapacity * sizeof(ScanRecord)
+      );
+
+  if (newHistory != nullptr) {
+    scanHistory = newHistory;
+    scanHistoryCapacity = fallbackCapacity;
+
+    historyResizeMessage =
+      "History was cleared, but allocation of " +
+      String(requestedCapacity) +
+      " records failed. Restored an empty " +
+      String(scanHistoryCapacity) +
+      "-record buffer.";
+
+    return false;
+  }
+
+  // Last-resort minimal buffer.
+  newHistory =
+      (ScanRecord*)malloc(
+        MIN_SCAN_HISTORY_RECORDS * sizeof(ScanRecord)
+      );
+
+  if (newHistory != nullptr) {
+    scanHistory = newHistory;
+    scanHistoryCapacity = MIN_SCAN_HISTORY_RECORDS;
+
+    historyResizeMessage =
+      "History was cleared and the requested resize failed. "
+      "Recovered with a minimal " +
+      String(scanHistoryCapacity) +
+      "-record buffer.";
+
+    return false;
+  }
+
+  historyResizeMessage =
+    "History was cleared, but no scan-history buffer could be allocated.";
+
+  return false;
+}
+
 
 void initializeScanHistory() {
   if (scanHistory != nullptr) {
@@ -1274,7 +1369,22 @@ void handleScanSettings() {
       requestedHistory = MAX_SCAN_HISTORY_RECORDS;
     }
 
-    resizeScanHistory((size_t)requestedHistory, true);
+    bool clearBeforeResize =
+        server.hasArg("clear_resize");
+
+    if (
+      clearBeforeResize &&
+      (size_t)requestedHistory != scanHistoryCapacity
+    ) {
+      clearAndResizeScanHistory(
+        (size_t)requestedHistory
+      );
+    } else {
+      resizeScanHistory(
+        (size_t)requestedHistory,
+        true
+      );
+    }
   }
 
   autoScanEnabled = server.hasArg("auto");
@@ -1812,6 +1922,19 @@ void handleWebScan() {
   loggingCard += String(ESP.getFreeHeap() / 1024.0, 1);
   loggingCard +=
     " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Largest Free Block</span>"
+    "<span class=\"value\">";
+  loggingCard += String(
+    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0,
+    1
+  );
+  loggingCard +=
+    " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Record Size</span>"
+    "<span class=\"value\">";
+  loggingCard += String(sizeof(ScanRecord));
+  loggingCard +=
+    " bytes</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Scan</span>"
     "<span class=\"value\">";
 
@@ -1840,6 +1963,10 @@ void handleWebScan() {
   loggingCard +=
     "\"></div>"
     "<div class=\"control\"><label>"
+    "<input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> "
+    "Clear history before resizing"
+    "</label></div>"
+    "<div class=\"control\"><label>"
     "<input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
   if (autoScanEnabled) {
@@ -1859,7 +1986,9 @@ void handleWebScan() {
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
     "The limit can be changed from 50 to 2000 network observations. "
-    "Changing the limit preserves the newest records when possible. "
+    "By default, resizing preserves the newest records, which requires the old "
+    "and new buffers to coexist temporarily. Check 'Clear history before resizing' "
+    "to free the old buffer first and maximize the contiguous memory available. "
     "When full, the oldest records are overwritten."
     "</div>";
 
