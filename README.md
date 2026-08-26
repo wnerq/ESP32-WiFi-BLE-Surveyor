@@ -400,7 +400,5 @@ stable filename.
 
 ## License
 
-No license has been selected yet.
-
-If the repository is intended for public reuse, add an appropriate
-open-source license such as MIT, BSD-3-Clause, or Apache-2.0.
+This project is licensed under the MIT License. See the LICENSE file
+for details.
