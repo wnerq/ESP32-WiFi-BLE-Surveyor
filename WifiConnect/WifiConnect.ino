@@ -1,4 +1,4 @@
-// WifiConnect9 - configurable AP + STA mode
+// WifiConnect10 - selectable RSSI history plot
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -825,6 +825,66 @@ String htmlEscape(const String& input) {
   return output;
 }
 
+String urlEncode(const String& input) {
+  const char* hex = "0123456789ABCDEF";
+  String output;
+
+  output.reserve(input.length() * 3);
+
+  for (size_t i = 0; i < input.length(); i++) {
+    unsigned char c = input.charAt(i);
+
+    if (
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '-' ||
+      c == '_' ||
+      c == '.' ||
+      c == '~'
+    ) {
+      output += (char)c;
+    } else {
+      output += '%';
+      output += hex[(c >> 4) & 0x0F];
+      output += hex[c & 0x0F];
+    }
+  }
+
+  return output;
+}
+
+String latestSSIDForBSSID(const String& bssid) {
+  for (size_t offset = 0; offset < historyCount; offset++) {
+    size_t logicalIndex = historyCount - 1 - offset;
+    const ScanRecord& record = historyRecord(logicalIndex);
+
+    if (String(record.bssid).equalsIgnoreCase(bssid)) {
+      if (record.hidden) {
+        return "(hidden)";
+      }
+
+      return String(record.ssid);
+    }
+  }
+
+  return "";
+}
+
+bool historyContainsBSSID(const String& bssid) {
+  if (bssid.length() == 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < historyCount; i++) {
+    if (String(historyRecord(i).bssid).equalsIgnoreCase(bssid)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 String pageStyles() {
   return R"rawliteral(
 <style>
@@ -1277,7 +1337,7 @@ void handleScanCsv() {
   server.sendContent("");
 }
 
-void sendRssiHistoryPlot(const String& currentBssid) {
+void sendRssiHistoryPlot(const String& selectedBssid) {
   const int SVG_WIDTH = 720;
   const int SVG_HEIGHT = 280;
 
@@ -1300,7 +1360,7 @@ void sendRssiHistoryPlot(const String& currentBssid) {
   for (size_t i = 0; i < historyCount; i++) {
     const ScanRecord& record = historyRecord(i);
 
-    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
       continue;
     }
 
@@ -1314,7 +1374,7 @@ void sendRssiHistoryPlot(const String& currentBssid) {
 
   if (pointCount == 0) {
     server.sendContent(
-      "<p>No logged RSSI samples are available yet for the currently connected BSSID.</p>"
+      "<p>No logged RSSI samples are available for the selected BSSID.</p>"
     );
     return;
   }
@@ -1326,7 +1386,7 @@ void sendRssiHistoryPlot(const String& currentBssid) {
   server.sendContent(
     "<div class=\"plot-wrap\">"
     "<svg viewBox=\"0 0 720 280\" role=\"img\" "
-    "aria-label=\"RSSI history for the currently connected access point\">"
+    "aria-label=\"RSSI history for selected access point\">"
   );
 
   // Background and horizontal grid lines.
@@ -1371,7 +1431,7 @@ void sendRssiHistoryPlot(const String& currentBssid) {
   for (size_t i = 0; i < historyCount; i++) {
     const ScanRecord& record = historyRecord(i);
 
-    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
       continue;
     }
 
@@ -1415,7 +1475,7 @@ void sendRssiHistoryPlot(const String& currentBssid) {
   for (size_t i = 0; i < historyCount; i++) {
     const ScanRecord& record = historyRecord(i);
 
-    if (!String(record.bssid).equalsIgnoreCase(currentBssid)) {
+    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
       continue;
     }
 
@@ -1578,18 +1638,26 @@ void sendScanHistoryTables() {
       String displaySSID =
         record.hidden ? "(hidden)" : String(record.ssid);
 
-      row += "<td>";
+      String plotUrl =
+          "/scan?plot=" +
+          urlEncode(String(record.bssid));
+
+      row += "<td><a href=\"";
+      row += plotUrl;
+      row += "#rssi-plot\">";
       row += htmlEscape(displaySSID);
 
       if (record.connected) {
         row += " (connected)";
       }
 
-      row += "</td>";
+      row += "</a></td>";
 
-      row += "<td>";
+      row += "<td><a href=\"";
+      row += plotUrl;
+      row += "#rssi-plot\">";
       row += htmlEscape(String(record.bssid));
-      row += "</td>";
+      row += "</a></td>";
 
       row += "<td class=\"signal\">";
       row += String(record.channel);
@@ -1621,6 +1689,40 @@ void handleWebScan() {
   String connectedSSID = connected ? WiFi.SSID() : "";
   String connectedBSSID = connected ? WiFi.BSSIDstr() : "";
   int connectedRSSI = connected ? WiFi.RSSI() : 0;
+
+  String selectedBSSID = "";
+
+  if (server.hasArg("plot")) {
+    String requestedBSSID = server.arg("plot");
+    requestedBSSID.trim();
+
+    if (historyContainsBSSID(requestedBSSID)) {
+      selectedBSSID = requestedBSSID;
+    }
+  }
+
+  // Default to the currently connected infrastructure AP when its BSSID
+  // is present in scan history.
+  if (
+    selectedBSSID.length() == 0 &&
+    connected &&
+    historyContainsBSSID(connectedBSSID)
+  ) {
+    selectedBSSID = connectedBSSID;
+  }
+
+  // In AP-only operation, or before the connected AP has appeared in a
+  // logged scan, default to the newest retained network observation.
+  if (
+    selectedBSSID.length() == 0 &&
+    historyCount > 0
+  ) {
+    selectedBSSID =
+        String(historyRecord(historyCount - 1).bssid);
+  }
+
+  String selectedSSID =
+      latestSSIDForBSSID(selectedBSSID);
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
@@ -1772,22 +1874,49 @@ void handleWebScan() {
   server.sendContent(loggingCard);
 
   server.sendContent(
-    "<div class=\"card\"><h2>Connected AP RSSI History</h2>"
+    "<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2>"
   );
 
-  if (connected) {
-    sendRssiHistoryPlot(connectedBSSID);
+  if (selectedBSSID.length() > 0) {
+    String plotInfo;
+    plotInfo.reserve(500);
+
+    plotInfo +=
+      "<div class=\"row\"><span class=\"label\">Selected Network</span>"
+      "<span class=\"value\">";
+    plotInfo += htmlEscape(selectedSSID);
+    plotInfo +=
+      "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Selected BSSID</span>"
+      "<span class=\"value\">";
+    plotInfo += htmlEscape(selectedBSSID);
+    plotInfo += "</span></div>";
+
+    if (
+      connected &&
+      selectedBSSID.equalsIgnoreCase(connectedBSSID)
+    ) {
+      plotInfo +=
+        "<div class=\"row\"><span class=\"label\">Current Connection</span>"
+        "<span class=\"value\">Yes</span></div>";
+    }
+
+    server.sendContent(plotInfo);
+
+    sendRssiHistoryPlot(selectedBSSID);
 
     server.sendContent(
       "<div class=\"note\">"
-      "This plot follows the BSSID of the access point currently serving the ESP32. "
-      "Each point is one logged scan observation. Hover a point for scan number, "
-      "uptime, and RSSI."
+      "Click any SSID or BSSID in the scan-history tables below to redraw "
+      "this plot using that access point's logged data. The default selection "
+      "is the currently connected infrastructure AP when available. "
+      "Each point is one logged scan observation; hover a point for scan "
+      "number, uptime, and RSSI."
       "</div>"
     );
   } else {
     server.sendContent(
-      "<p>The ESP32 is not currently connected to an access point.</p>"
+      "<p>No logged networks are available to plot yet.</p>"
     );
   }
 
@@ -1796,7 +1925,8 @@ void handleWebScan() {
   server.sendContent(
     "<div class=\"card\"><h2>Scan History</h2>"
     "<div class=\"note\">Newest scans are shown first. "
-    "Each section is one complete logged scan.</div>"
+    "Each section is one complete logged scan. "
+    "Click an SSID or BSSID to plot that access point's RSSI history.</div>"
   );
 
   sendScanHistoryTables();
