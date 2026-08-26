@@ -40,6 +40,31 @@ void ensureWiFiStationMode() {
   }
 }
 
+String securityLabel(wifi_auth_mode_t authMode) {
+  if (authMode == WIFI_AUTH_OPEN) {
+    return "OPEN";
+  }
+  return "SECURED";
+}
+
+void printPadded(const String& value, int width) {
+  String output = value;
+
+  if (output.length() > width) {
+    if (width > 3) {
+      output = output.substring(0, width - 3) + "...";
+    } else {
+      output = output.substring(0, width);
+    }
+  }
+
+  Serial.print(output);
+
+  for (int i = output.length(); i < width; i++) {
+    Serial.print(' ');
+  }
+}
+
 
 // ============================================================
 // Wi-Fi credential storage
@@ -124,7 +149,6 @@ bool connectToWiFi(const String& ssid, const String& password) {
 
   ensureWiFiStationMode();
 
-  // We are intentionally changing networks here, so disconnect first.
   WiFi.disconnect();
   delay(100);
 
@@ -201,22 +225,17 @@ void scanNetworks() {
   Serial.println(" network(s) found:");
   Serial.println();
 
-  // Intentionally not numbered. This command is informational only.
+  Serial.println("SSID                              SIGNAL      SECURITY");
+  Serial.println("--------------------------------  ----------  --------");
+
   for (int i = 0; i < networkCount; i++) {
-    Serial.print("  ");
-    Serial.print(WiFi.SSID(i));
+    String ssid = WiFi.SSID(i);
+    String signal = String(WiFi.RSSI(i)) + " dBm";
+    String security = securityLabel(WiFi.encryptionType(i));
 
-    Serial.print("  [");
-    Serial.print(WiFi.RSSI(i));
-    Serial.print(" dBm]");
-
-    if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
-      Serial.print("  OPEN");
-    } else {
-      Serial.print("  SECURED");
-    }
-
-    Serial.println();
+    printPadded(ssid, 34);
+    printPadded(signal, 12);
+    Serial.println(security);
   }
 
   Serial.println();
@@ -261,22 +280,19 @@ void configureWiFi() {
       continue;
     }
 
+    Serial.println("#   SSID                              SIGNAL      SECURITY");
+    Serial.println("--  --------------------------------  ----------  --------");
+
     for (int i = 0; i < networkCount; i++) {
-      Serial.print(i + 1);
-      Serial.print(" - ");
-      Serial.print(WiFi.SSID(i));
+      String number = String(i + 1);
+      String ssid = WiFi.SSID(i);
+      String signal = String(WiFi.RSSI(i)) + " dBm";
+      String security = securityLabel(WiFi.encryptionType(i));
 
-      Serial.print("  [");
-      Serial.print(WiFi.RSSI(i));
-      Serial.print(" dBm]");
-
-      if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
-        Serial.print("  OPEN");
-      } else {
-        Serial.print("  SECURED");
-      }
-
-      Serial.println();
+      printPadded(number, 4);
+      printPadded(ssid, 34);
+      printPadded(signal, 12);
+      Serial.println(security);
     }
 
     Serial.println();
@@ -348,7 +364,6 @@ void printWiFiStatus() {
   Serial.println(" Wi-Fi Status");
   Serial.println("================================");
 
-  // Match the web page field order as closely as possible.
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Status:    Connected");
 
@@ -403,7 +418,141 @@ void printMacAddress() {
 
 
 // ============================================================
-// Web page
+// HTML helpers
+// ============================================================
+
+String htmlEscape(const String& input) {
+  String output = input;
+  output.replace("&", "&amp;");
+  output.replace("<", "&lt;");
+  output.replace(">", "&gt;");
+  output.replace("\"", "&quot;");
+  output.replace("'", "&#39;");
+  return output;
+}
+
+String pageStyles() {
+  return R"rawliteral(
+<style>
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f4f4f4;
+    margin: 0;
+    padding: 20px;
+  }
+
+  .container {
+    max-width: 760px;
+    margin: auto;
+  }
+
+  h1, h2 {
+    text-align: center;
+  }
+
+  .card {
+    background: white;
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px solid #ddd;
+    padding: 12px 0;
+    gap: 16px;
+  }
+
+  .row:last-child {
+    border-bottom: none;
+  }
+
+  .label {
+    font-weight: bold;
+  }
+
+  .value {
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+
+  .button {
+    display: inline-block;
+    margin: 20px 6px 0 6px;
+    padding: 12px 20px;
+    background: #333;
+    color: white;
+    text-decoration: none;
+    border-radius: 6px;
+  }
+
+  .buttons {
+    text-align: center;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+  }
+
+  th, td {
+    padding: 10px 8px;
+    border-bottom: 1px solid #ddd;
+    text-align: left;
+  }
+
+  th {
+    background: #f7f7f7;
+  }
+
+  td.signal, th.signal {
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  td.security, th.security {
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  tr.current {
+    font-weight: bold;
+    background: #eef7ee;
+  }
+
+  .note {
+    color: #666;
+    font-size: 0.9em;
+    margin-top: 14px;
+  }
+
+  .footer {
+    text-align: center;
+    font-size: 0.8em;
+    margin-top: 25px;
+    color: #777;
+  }
+
+  @media (max-width: 600px) {
+    table {
+      font-size: 0.9em;
+    }
+
+    th, td {
+      padding: 8px 5px;
+    }
+  }
+</style>
+)rawliteral";
+}
+
+
+// ============================================================
+// Web status page
 // ============================================================
 
 void handleRoot() {
@@ -444,76 +593,15 @@ void handleRoot() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-
   <title>ESP32 Status</title>
+)rawliteral";
 
-  <style>
-    body {
-      font-family: Arial, Helvetica, sans-serif;
-      background: #f4f4f4;
-      margin: 0;
-      padding: 20px;
-    }
+  html += pageStyles();
 
-    .container {
-      max-width: 600px;
-      margin: auto;
-    }
-
-    h1 {
-      text-align: center;
-    }
-
-    .card {
-      background: white;
-      border-radius: 10px;
-      padding: 20px;
-      margin-top: 20px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-    }
-
-    .row {
-      display: flex;
-      justify-content: space-between;
-      border-bottom: 1px solid #ddd;
-      padding: 12px 0;
-      gap: 16px;
-    }
-
-    .row:last-child {
-      border-bottom: none;
-    }
-
-    .label {
-      font-weight: bold;
-    }
-
-    .value {
-      text-align: right;
-      overflow-wrap: anywhere;
-    }
-
-    .button {
-      display: inline-block;
-      margin-top: 20px;
-      padding: 12px 20px;
-      background: #333;
-      color: white;
-      text-decoration: none;
-      border-radius: 6px;
-    }
-
-    .footer {
-      text-align: center;
-      font-size: 0.8em;
-      margin-top: 25px;
-      color: #777;
-    }
-  </style>
+  html += R"rawliteral(
 </head>
 
 <body>
-
   <div class="container">
 
     <h1>ESP32 Status</h1>
@@ -567,8 +655,9 @@ void handleRoot() {
 
     </div>
 
-    <div style="text-align:center">
-      <a class="button" href="/">Refresh</a>
+    <div class="buttons">
+      <a class="button" href="/">Refresh Status</a>
+      <a class="button" href="/scan">Scan Wi-Fi</a>
     </div>
 
     <div class="footer">
@@ -576,21 +665,166 @@ void handleRoot() {
     </div>
 
   </div>
-
 </body>
-
 </html>
 )rawliteral";
 
-  html.replace("%STATUS%", statusText);
-  html.replace("%SSID%", ssidText);
-  html.replace("%IP%", ipText);
-  html.replace("%MAC%", macText);
-  html.replace("%HOSTNAME%", hostnameText);
-  html.replace("%GATEWAY%", gatewayText);
-  html.replace("%SUBNET%", subnetText);
-  html.replace("%RSSI%", rssiText);
-  html.replace("%UPTIME%", getUptimeString());
+  html.replace("%STATUS%", htmlEscape(statusText));
+  html.replace("%SSID%", htmlEscape(ssidText));
+  html.replace("%IP%", htmlEscape(ipText));
+  html.replace("%MAC%", htmlEscape(macText));
+  html.replace("%HOSTNAME%", htmlEscape(hostnameText));
+  html.replace("%GATEWAY%", htmlEscape(gatewayText));
+  html.replace("%SUBNET%", htmlEscape(subnetText));
+  html.replace("%RSSI%", htmlEscape(rssiText));
+  html.replace("%UPTIME%", htmlEscape(getUptimeString()));
+
+  server.send(200, "text/html", html);
+}
+
+
+// ============================================================
+// Web Wi-Fi scan page
+// ============================================================
+
+void handleWebScan() {
+  ensureWiFiStationMode();
+
+  String connectedSSID = "";
+  int connectedRSSI = 0;
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    connectedSSID = WiFi.SSID();
+    connectedRSSI = WiFi.RSSI();
+  }
+
+  int networkCount = WiFi.scanNetworks();
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Wi-Fi Scan</title>
+)rawliteral";
+
+  html += pageStyles();
+
+  html += R"rawliteral(
+</head>
+
+<body>
+  <div class="container">
+
+    <h1>Wi-Fi Scan</h1>
+)rawliteral";
+
+  if (connected) {
+    html += R"rawliteral(
+    <div class="card">
+      <div class="row">
+        <span class="label">Connected SSID</span>
+        <span class="value">)rawliteral";
+    html += htmlEscape(connectedSSID);
+    html += R"rawliteral(</span>
+      </div>
+
+      <div class="row">
+        <span class="label">Current Signal</span>
+        <span class="value">)rawliteral";
+    html += String(connectedRSSI);
+    html += R"rawliteral( dBm</span>
+      </div>
+    </div>
+)rawliteral";
+  }
+
+  html += R"rawliteral(
+    <div class="card">
+      <h2>Nearby Networks</h2>
+)rawliteral";
+
+  if (networkCount <= 0) {
+    html += R"rawliteral(
+      <p>No Wi-Fi networks found.</p>
+)rawliteral";
+  } else {
+    html += R"rawliteral(
+      <table>
+        <thead>
+          <tr>
+            <th>SSID</th>
+            <th class="signal">Signal</th>
+            <th class="security">Security</th>
+          </tr>
+        </thead>
+        <tbody>
+)rawliteral";
+
+    // Arduino-ESP32 scan results are generally already strongest-first.
+    for (int i = 0; i < networkCount; i++) {
+      String ssid = WiFi.SSID(i);
+      int rssi = WiFi.RSSI(i);
+      String security = securityLabel(WiFi.encryptionType(i));
+
+      bool isCurrent = connected && (ssid == connectedSSID);
+
+      if (isCurrent) {
+        html += "<tr class=\"current\">";
+      } else {
+        html += "<tr>";
+      }
+
+      html += "<td>";
+      html += htmlEscape(ssid);
+
+      if (isCurrent) {
+        html += " (connected)";
+      }
+
+      html += "</td>";
+
+      html += "<td class=\"signal\">";
+      html += String(rssi);
+      html += " dBm</td>";
+
+      html += "<td class=\"security\">";
+      html += security;
+      html += "</td>";
+
+      html += "</tr>";
+    }
+
+    html += R"rawliteral(
+        </tbody>
+      </table>
+)rawliteral";
+  }
+
+  html += R"rawliteral(
+      <div class="note">
+        Signal values closer to 0 dBm are stronger. For example, -45 dBm is stronger than -75 dBm.
+      </div>
+    </div>
+
+    <div class="buttons">
+      <a class="button" href="/scan">Scan Again</a>
+      <a class="button" href="/">Back to Status</a>
+    </div>
+
+    <div class="footer">
+      ESP32 Web Interface
+    </div>
+
+  </div>
+</body>
+</html>
+)rawliteral";
+
+  WiFi.scanDelete();
 
   server.send(200, "text/html", html);
 }
@@ -606,6 +840,7 @@ void startWebServer() {
   }
 
   server.on("/", handleRoot);
+  server.on("/scan", handleWebScan);
 
   server.onNotFound([]() {
     server.send(
