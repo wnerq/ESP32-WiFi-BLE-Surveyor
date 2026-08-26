@@ -1,4 +1,4 @@
-// WifiConnect12 - sortable network summary table (Arduino prototype fix)
+// WifiConnect13 - stabilize Wi-Fi summary and shared survey helpers
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -52,16 +52,14 @@ struct ScanRecord {
 };
 
 
-// Keep this type near the top of the sketch. Arduino IDE 1.x generates
+// Keep custom types near the top of the sketch. Arduino IDE 1.x generates
 // function prototypes before later type declarations, so helper functions
-// using NetworkSummary must see this definition first.
-struct NetworkSummary {
-  char ssid[33];
-  char bssid[18];
-  int16_t channel;
-  uint8_t authMode;
-
-  uint16_t samples;
+// using these types must see the definitions first.
+//
+// SignalStats is intentionally radio-agnostic. It can be reused later for
+// BLE RSSI history/summary work without coupling BLE to Wi-Fi structures.
+struct SignalStats {
+  uint32_t samples;
 
   int16_t latestRssi;
   int16_t minRssi;
@@ -70,6 +68,16 @@ struct NetworkSummary {
 
   uint32_t firstSeenMs;
   uint32_t lastSeenMs;
+};
+
+struct NetworkSummary {
+  char ssid[33];
+  char bssid[18];
+
+  int16_t channel;
+  uint8_t authMode;
+
+  SignalStats signal;
 
   bool connected;
   bool hidden;
@@ -267,6 +275,62 @@ String securityLabel(wifi_auth_mode_t authMode) {
     default:
       return "UNKNOWN";
   }
+}
+
+
+// ============================================================
+// Shared survey/statistics helpers
+// ============================================================
+
+void resetSignalStats(SignalStats& stats) {
+  stats.samples = 0;
+  stats.latestRssi = 0;
+  stats.minRssi = 0;
+  stats.maxRssi = 0;
+  stats.rssiTotal = 0;
+  stats.firstSeenMs = 0;
+  stats.lastSeenMs = 0;
+}
+
+void addSignalObservation(
+  SignalStats& stats,
+  int16_t rssi,
+  uint32_t uptimeMs
+) {
+  if (stats.samples == 0) {
+    stats.samples = 1;
+    stats.latestRssi = rssi;
+    stats.minRssi = rssi;
+    stats.maxRssi = rssi;
+    stats.rssiTotal = rssi;
+    stats.firstSeenMs = uptimeMs;
+    stats.lastSeenMs = uptimeMs;
+    return;
+  }
+
+  stats.samples++;
+  stats.latestRssi = rssi;
+
+  if (rssi < stats.minRssi) {
+    stats.minRssi = rssi;
+  }
+
+  if (rssi > stats.maxRssi) {
+    stats.maxRssi = rssi;
+  }
+
+  stats.rssiTotal += rssi;
+  stats.lastSeenMs = uptimeMs;
+}
+
+float averageSignal(const SignalStats& stats) {
+  if (stats.samples == 0) {
+    return 0.0f;
+  }
+
+  return
+    (float)stats.rssiTotal /
+    (float)stats.samples;
 }
 
 const ScanRecord& historyRecord(size_t logicalIndex) {
@@ -1687,21 +1751,97 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 }
 
 
-int findSummaryByBSSID(
-  NetworkSummary* summaries,
-  size_t summaryCount,
+bool hasNewerObservationForBSSID(
+  size_t logicalIndex,
   const String& bssid
 ) {
-  for (size_t i = 0; i < summaryCount; i++) {
+  for (
+    size_t i = logicalIndex + 1;
+    i < historyCount;
+    i++
+  ) {
     if (
-      String(summaries[i].bssid)
+      String(historyRecord(i).bssid)
         .equalsIgnoreCase(bssid)
     ) {
-      return (int)i;
+      return true;
     }
   }
 
-  return -1;
+  return false;
+}
+
+bool buildNetworkSummary(
+  const String& bssid,
+  NetworkSummary& summary
+) {
+  summary = {};
+  resetSignalStats(summary.signal);
+
+  bool found = false;
+  String newestKnownSSID = "";
+
+  // Walk oldest -> newest so SignalStats.latestRssi and lastSeenMs naturally
+  // become the newest retained values.
+  for (size_t i = 0; i < historyCount; i++) {
+    const ScanRecord& record = historyRecord(i);
+
+    if (
+      !String(record.bssid)
+        .equalsIgnoreCase(bssid)
+    ) {
+      continue;
+    }
+
+    found = true;
+
+    addSignalObservation(
+      summary.signal,
+      record.rssi,
+      record.uptimeMs
+    );
+
+    // Channel and security use the newest retained observation.
+    summary.channel = record.channel;
+    summary.authMode = record.authMode;
+
+    // Preserve the newest known non-hidden SSID for this BSSID.
+    if (
+      !record.hidden &&
+      String(record.ssid).length() > 0
+    ) {
+      newestKnownSSID = String(record.ssid);
+    }
+  }
+
+  if (!found) {
+    return false;
+  }
+
+  bssid.toCharArray(
+    summary.bssid,
+    sizeof(summary.bssid)
+  );
+
+  if (newestKnownSSID.length() > 0) {
+    newestKnownSSID.toCharArray(
+      summary.ssid,
+      sizeof(summary.ssid)
+    );
+
+    summary.hidden = false;
+  } else {
+    summary.ssid[0] = '\0';
+    summary.hidden = true;
+  }
+
+  // "Connected" is a live state, not a historical property. This avoids
+  // highlighting an AP simply because it was connected during an older scan.
+  summary.connected =
+      WiFi.status() == WL_CONNECTED &&
+      WiFi.BSSIDstr().equalsIgnoreCase(bssid);
+
+  return true;
 }
 
 void sendNetworkSummaryTable() {
@@ -1712,116 +1852,53 @@ void sendNetworkSummaryTable() {
     return;
   }
 
-  // At most one summary per retained record is needed. In practice this
-  // is usually much smaller because repeated BSSIDs collapse together.
-  NetworkSummary* summaries =
-      (NetworkSummary*)malloc(
-        historyCount * sizeof(NetworkSummary)
-      );
-
-  if (summaries == nullptr) {
-    server.sendContent(
-      "<p>Unable to allocate temporary memory for the network summary.</p>"
-    );
-    return;
-  }
-
-  size_t summaryCount = 0;
-
-  for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& record = historyRecord(i);
-
-    String bssid = String(record.bssid);
-
-    int summaryIndex =
-        findSummaryByBSSID(
-          summaries,
-          summaryCount,
-          bssid
-        );
-
-    if (summaryIndex < 0) {
-      NetworkSummary summary = {};
-
-      String(record.ssid).toCharArray(
-        summary.ssid,
-        sizeof(summary.ssid)
-      );
-
-      bssid.toCharArray(
-        summary.bssid,
-        sizeof(summary.bssid)
-      );
-
-      summary.channel = record.channel;
-      summary.authMode = record.authMode;
-      summary.samples = 1;
-
-      summary.latestRssi = record.rssi;
-      summary.minRssi = record.rssi;
-      summary.maxRssi = record.rssi;
-      summary.rssiTotal = record.rssi;
-
-      summary.firstSeenMs = record.uptimeMs;
-      summary.lastSeenMs = record.uptimeMs;
-
-      summary.connected = record.connected;
-      summary.hidden = record.hidden;
-
-      summaries[summaryCount] = summary;
-      summaryCount++;
-    } else {
-      NetworkSummary& summary =
-          summaries[summaryIndex];
-
-      summary.samples++;
-
-      summary.latestRssi = record.rssi;
-
-      if (record.rssi < summary.minRssi) {
-        summary.minRssi = record.rssi;
-      }
-
-      if (record.rssi > summary.maxRssi) {
-        summary.maxRssi = record.rssi;
-      }
-
-      summary.rssiTotal += record.rssi;
-
-      summary.lastSeenMs = record.uptimeMs;
-      summary.channel = record.channel;
-      summary.authMode = record.authMode;
-      summary.connected = record.connected;
-      summary.hidden = record.hidden;
-
-      // Keep the newest non-hidden SSID associated with this BSSID.
-      if (!record.hidden && String(record.ssid).length() > 0) {
-        String(record.ssid).toCharArray(
-          summary.ssid,
-          sizeof(summary.ssid)
-        );
-      }
-    }
-  }
-
   server.sendContent(
     "<table id=\"network-summary\">"
     "<thead><tr>"
-    "<th class=\"sortable\" onclick=\"sortNetworkTable(0,'text')\">SSID</th>"
-    "<th class=\"sortable\" onclick=\"sortNetworkTable(1,'text')\">BSSID</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(2,'number')\">CH</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(3,'number')\">Latest</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(4,'number')\">Min</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(5,'number')\">Max</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(6,'number')\">Avg</th>"
-    "<th class=\"sortable signal\" onclick=\"sortNetworkTable(7,'number')\">Samples</th>"
-    "<th class=\"sortable\" onclick=\"sortNetworkTable(8,'text')\">Security</th>"
-    "<th class=\"sortable\" onclick=\"sortNetworkTable(9,'number')\">Last Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',0,'text')\">SSID</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',1,'text')\">BSSID</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',2,'number')\">CH</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',3,'number')\">Latest</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',4,'number')\">Min</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',5,'number')\">Max</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',6,'number')\">Avg</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',7,'number')\">Samples</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',8,'text')\">Security</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',9,'number')\">Last Seen</th>"
     "</tr></thead><tbody>"
   );
 
-  for (size_t i = 0; i < summaryCount; i++) {
-    NetworkSummary& summary = summaries[i];
+  // Iterate newest -> oldest. Only the newest retained observation for each
+  // BSSID emits a row. This eliminates the large temporary NetworkSummary
+  // array used previously and keeps page generation memory-bounded.
+  for (
+    size_t offset = 0;
+    offset < historyCount;
+    offset++
+  ) {
+    size_t logicalIndex =
+        historyCount - 1 - offset;
+
+    const ScanRecord& latestRecord =
+        historyRecord(logicalIndex);
+
+    String bssid =
+        String(latestRecord.bssid);
+
+    if (
+      hasNewerObservationForBSSID(
+        logicalIndex,
+        bssid
+      )
+    ) {
+      continue;
+    }
+
+    NetworkSummary summary = {};
+
+    if (!buildNetworkSummary(bssid, summary)) {
+      continue;
+    }
 
     String plotUrl =
         "/scan?plot=" +
@@ -1834,8 +1911,7 @@ void sendNetworkSummaryTable() {
           : String(summary.ssid);
 
     float avgRssi =
-        (float)summary.rssiTotal /
-        (float)summary.samples;
+        averageSignal(summary.signal);
 
     String row;
     row.reserve(900);
@@ -1870,21 +1946,21 @@ void sendNetworkSummaryTable() {
     row += "</td>";
 
     row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.latestRssi);
+    row += String(summary.signal.latestRssi);
     row += "\">";
-    row += String(summary.latestRssi);
+    row += String(summary.signal.latestRssi);
     row += " dBm</td>";
 
     row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.minRssi);
+    row += String(summary.signal.minRssi);
     row += "\">";
-    row += String(summary.minRssi);
+    row += String(summary.signal.minRssi);
     row += " dBm</td>";
 
     row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.maxRssi);
+    row += String(summary.signal.maxRssi);
     row += "\">";
-    row += String(summary.maxRssi);
+    row += String(summary.signal.maxRssi);
     row += " dBm</td>";
 
     row += "<td class=\"signal\" data-sort=\"";
@@ -1894,9 +1970,9 @@ void sendNetworkSummaryTable() {
     row += " dBm</td>";
 
     row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.samples);
+    row += String(summary.signal.samples);
     row += "\">";
-    row += String(summary.samples);
+    row += String(summary.signal.samples);
     row += "</td>";
 
     row += "<td>";
@@ -1908,10 +1984,10 @@ void sendNetworkSummaryTable() {
     row += "</td>";
 
     row += "<td data-sort=\"";
-    row += String(summary.lastSeenMs);
+    row += String(summary.signal.lastSeenMs);
     row += "\">";
     row += htmlEscape(
-      formatUptime(summary.lastSeenMs)
+      formatUptime(summary.signal.lastSeenMs)
     );
     row += "</td>";
 
@@ -1921,8 +1997,36 @@ void sendNetworkSummaryTable() {
   }
 
   server.sendContent("</tbody></table>");
+}
 
-  free(summaries);
+void sendSortableTableScript() {
+  server.sendContent(
+    "<script>"
+    "const tableSortState={};"
+    "function sortTable(tableId,column,type){"
+      "const table=document.getElementById(tableId);"
+      "if(!table)return;"
+      "const body=table.tBodies[0];"
+      "const rows=Array.from(body.rows);"
+      "const previous=tableSortState[tableId]||{column:-1,ascending:true};"
+      "const ascending=(previous.column===column)?!previous.ascending:true;"
+      "rows.sort((a,b)=>{"
+        "let av=a.cells[column].dataset.sort??a.cells[column].innerText.trim();"
+        "let bv=b.cells[column].dataset.sort??b.cells[column].innerText.trim();"
+        "if(type==='number'){"
+          "av=parseFloat(av);bv=parseFloat(bv);"
+          "if(Number.isNaN(av))av=0;"
+          "if(Number.isNaN(bv))bv=0;"
+          "return ascending?av-bv:bv-av;"
+        "}"
+        "av=av.toLowerCase();bv=bv.toLowerCase();"
+        "return ascending?av.localeCompare(bv):bv.localeCompare(av);"
+      "});"
+      "rows.forEach(row=>body.appendChild(row));"
+      "tableSortState[tableId]={column:column,ascending:ascending};"
+    "}"
+    "</script>"
+  );
 }
 
 void handleWebScan() {
@@ -2199,28 +2303,11 @@ void handleWebScan() {
 
   server.sendContent(
     "<div class=\"footer\">ESP32 Web Interface</div>"
-    "<script>"
-    "let sortState={column:-1,ascending:true};"
-    "function sortNetworkTable(column,type){"
-      "const table=document.getElementById('network-summary');"
-      "if(!table)return;"
-      "const body=table.tBodies[0];"
-      "const rows=Array.from(body.rows);"
-      "const ascending=(sortState.column===column)?!sortState.ascending:true;"
-      "rows.sort((a,b)=>{"
-        "let av=a.cells[column].dataset.sort??a.cells[column].innerText.trim();"
-        "let bv=b.cells[column].dataset.sort??b.cells[column].innerText.trim();"
-        "if(type==='number'){av=parseFloat(av);bv=parseFloat(bv);"
-          "if(Number.isNaN(av))av=0;if(Number.isNaN(bv))bv=0;"
-          "return ascending?av-bv:bv-av;"
-        "}"
-        "av=av.toLowerCase();bv=bv.toLowerCase();"
-        "return ascending?av.localeCompare(bv):bv.localeCompare(av);"
-      "});"
-      "rows.forEach(row=>body.appendChild(row));"
-      "sortState={column:column,ascending:ascending};"
-    "}"
-    "</script>"
+  );
+
+  sendSortableTableScript();
+
+  server.sendContent(
     "</div></body></html>"
   );
 
