@@ -1,4 +1,6 @@
 # ESP32 WiFi Surveyor
+<img width="992" height="1206" alt="image" src="https://github.com/user-attachments/assets/303d0fc1-9f07-4738-af28-b74c603815f3" />
+<img width="1010" height="829" alt="image" src="https://github.com/user-attachments/assets/867f52a0-d0e9-49ea-9e70-00f9e0e68207" />
 
 An ESP32 Wi-Fi configuration, monitoring, and site-survey tool with a
 serial interface, web UI, BSSID/RSSI/channel logging, automatic scans,
