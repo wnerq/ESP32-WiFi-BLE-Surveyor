@@ -1,4 +1,4 @@
-// WifiConnect15 - Wi-Fi/BLE automatic logging, history plots, resources, firmware ID
+// WifiConnect16 - responsive tables and light/dark/system themes
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -11,8 +11,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect15_wifi_ble_history_resources.ino";
-const char* FIRMWARE_VERSION = "15";
+const char* FIRMWARE_FILE = "WifiConnect16_responsive_theme.ino";
+const char* FIRMWARE_VERSION = "16";
 
 
 Preferences preferences;
@@ -1384,9 +1384,48 @@ bool historyContainsBSSID(const String& bssid) {
 String pageStyles() {
   return R"rawliteral(
 <style>
+  :root {
+    color-scheme: light;
+    --page-bg: #f4f4f4;
+    --card-bg: #ffffff;
+    --text: #111111;
+    --muted: #666666;
+    --border: #dddddd;
+    --header-bg: #f7f7f7;
+    --button-bg: #333333;
+    --button-text: #ffffff;
+    --input-bg: #ffffff;
+    --input-border: #bbbbbb;
+    --link: #0000ee;
+    --current-row: #eef7ee;
+    --shadow: rgba(0,0,0,0.15);
+  }
+
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --page-bg: #151515;
+    --card-bg: #242424;
+    --text: #eeeeee;
+    --muted: #b7b7b7;
+    --border: #4a4a4a;
+    --header-bg: #303030;
+    --button-bg: #4a4a4a;
+    --button-text: #ffffff;
+    --input-bg: #2b2b2b;
+    --input-border: #666666;
+    --link: #8ab4f8;
+    --current-row: #263b2b;
+    --shadow: rgba(0,0,0,0.35);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
   body {
     font-family: Arial, Helvetica, sans-serif;
-    background: #f4f4f4;
+    background: var(--page-bg);
+    color: var(--text);
     margin: 0;
     padding: 20px;
   }
@@ -1401,17 +1440,17 @@ String pageStyles() {
   }
 
   .card {
-    background: white;
+    background: var(--card-bg);
     border-radius: 10px;
     padding: 20px;
     margin-top: 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    box-shadow: 0 2px 8px var(--shadow);
   }
 
   .row {
     display: flex;
     justify-content: space-between;
-    border-bottom: 1px solid #ddd;
+    border-bottom: 1px solid var(--border);
     padding: 12px 0;
     gap: 16px;
   }
@@ -1433,14 +1472,26 @@ String pageStyles() {
     display: inline-block;
     margin: 20px 6px 0 6px;
     padding: 12px 20px;
-    background: #333;
-    color: white;
+    background: var(--button-bg);
+    color: var(--button-text);
     text-decoration: none;
     border-radius: 6px;
   }
 
   .buttons {
     text-align: center;
+  }
+
+  .table-scroll {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .table-scroll table {
+    width: 100%;
+    min-width: 820px;
   }
 
   table {
@@ -1451,12 +1502,17 @@ String pageStyles() {
 
   th, td {
     padding: 10px 8px;
-    border-bottom: 1px solid #ddd;
+    border-bottom: 1px solid var(--border);
     text-align: left;
   }
 
   th {
-    background: #f7f7f7;
+    background: var(--header-bg);
+    white-space: nowrap;
+  }
+
+  td.address {
+    white-space: nowrap;
   }
 
   td.signal, th.signal {
@@ -1471,11 +1527,11 @@ String pageStyles() {
 
   tr.current {
     font-weight: bold;
-    background: #eef7ee;
+    background: var(--current-row);
   }
 
   .note {
-    color: #666;
+    color: var(--muted);
     font-size: 0.9em;
     margin-top: 14px;
   }
@@ -1546,7 +1602,7 @@ String pageStyles() {
   input[type="number"] {
     width: 100px;
     padding: 9px;
-    border: 1px solid #bbb;
+    border: 1px solid var(--input-border);
     border-radius: 5px;
   }
 
@@ -1554,13 +1610,32 @@ String pageStyles() {
     padding: 10px 16px;
     border: 0;
     border-radius: 6px;
-    background: #333;
-    color: white;
+    background: var(--button-bg);
+    color: var(--button-text);
     cursor: pointer;
   }
 
   .danger {
     background: #7a2d2d;
+  }
+
+  .theme-control {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    color: var(--muted);
+    font-size: 0.9em;
+  }
+
+  .theme-control select {
+    min-width: 110px;
+    padding: 7px;
+    border: 1px solid var(--input-border);
+    border-radius: 5px;
+    background: var(--input-bg);
+    color: var(--text);
   }
 
   .footer {
@@ -1641,6 +1716,15 @@ void handleRoot() {
 
 <body>
   <div class="container">
+
+    <div class="theme-control">
+      <label for="theme-select">Theme</label>
+      <select id="theme-select" class="theme-select" onchange="setTheme(this.value)">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </div>
 
     <h1>ESP32 Status</h1>
 
@@ -1753,6 +1837,27 @@ void handleRoot() {
     </div>
 
   </div>
+    <script>
+      function applyTheme(v) {
+        const r = document.documentElement;
+        if (v === 'system') {
+          const d = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          r.dataset.theme = d ? 'dark' : 'light';
+        } else {
+          r.dataset.theme = v;
+        }
+      }
+      function setTheme(v) {
+        localStorage.setItem('esp32-theme', v);
+        applyTheme(v);
+        document.querySelectorAll('.theme-select').forEach(s => s.value = v);
+      }
+      document.addEventListener('DOMContentLoaded', () => {
+        const v = localStorage.getItem('esp32-theme') || 'system';
+        applyTheme(v);
+        document.querySelectorAll('.theme-select').forEach(s => s.value = v);
+      });
+    </script>
 </body>
 </html>
 )rawliteral";
@@ -2219,7 +2324,7 @@ void sendNetworkSummaryTable() {
   }
 
   server.sendContent(
-    "<table id=\"network-summary\">"
+    "<div class=\"table-scroll\"><table id=\"network-summary\">"
     "<thead><tr>"
     "<th class=\"sortable\" onclick=\"sortTable('network-summary',0,'text')\">SSID</th>"
     "<th class=\"sortable\" onclick=\"sortTable('network-summary',1,'text')\">BSSID</th>"
@@ -2288,7 +2393,7 @@ void sendNetworkSummaryTable() {
       row += "<tr>";
     }
 
-    row += "<td><a href=\"";
+    row += "<td class=\"address\"><a href=\"";
     row += plotUrl;
     row += "\">";
     row += htmlEscape(displaySSID);
@@ -2362,7 +2467,43 @@ void sendNetworkSummaryTable() {
     server.sendContent(row);
   }
 
-  server.sendContent("</tbody></table>");
+  server.sendContent("</tbody></table></div>");
+}
+
+void sendThemeControl() {
+  server.sendContent(
+    "<div class=\"theme-control\">"
+    "<label for=\"theme-select\">Theme</label>"
+    "<select id=\"theme-select\" class=\"theme-select\" onchange=\"setTheme(this.value)\">"
+    "<option value=\"system\">System</option>"
+    "<option value=\"light\">Light</option>"
+    "<option value=\"dark\">Dark</option>"
+    "</select></div>"
+  );
+}
+
+void sendThemeScript() {
+  server.sendContent(
+    "<script>"
+    "function applyTheme(v){"
+      "const r=document.documentElement;"
+      "if(v==='system'){"
+        "const d=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;"
+        "r.dataset.theme=d?'dark':'light';"
+      "}else{r.dataset.theme=v;}"
+    "}"
+    "function setTheme(v){"
+      "localStorage.setItem('esp32-theme',v);"
+      "applyTheme(v);"
+      "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
+    "}"
+    "document.addEventListener('DOMContentLoaded',()=>{"
+      "const v=localStorage.getItem('esp32-theme')||'system';"
+      "applyTheme(v);"
+      "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
+    "});"
+    "</script>"
+  );
 }
 
 void sendSortableTableScript() {
@@ -2451,6 +2592,11 @@ void handleWebScan() {
 
   server.sendContent(
     "</head><body><div class=\"container\">"
+  );
+
+  sendThemeControl();
+
+  server.sendContent(
     "<h1>Wi-Fi Survey</h1>"
   );
 
@@ -2662,6 +2808,7 @@ void handleWebScan() {
   );
 
   sendSortableTableScript();
+  sendThemeScript();
 
   server.sendContent(
     "</div></body></html>"
@@ -2818,7 +2965,7 @@ void sendBleSummaryTable() {
     return;
   }
 
-  server.sendContent("<table id=\"ble-summary\"><thead><tr>"
+  server.sendContent("<div class=\"table-scroll\"><table id=\"ble-summary\"><thead><tr>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',0,'text')\">Name</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',1,'text')\">Address</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',2,'text')\">Address Type</th>"
@@ -2848,7 +2995,7 @@ void sendBleSummaryTable() {
     row.reserve(850);
     row += "<tr>";
     row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(displayName) + "</a></td>";
-    row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(address) + "</a></td>";
+    row += "<td class=\"address\"><a href=\"" + plotUrl + "\">" + htmlEscape(address) + "</a></td>";
     row += "<td>" + htmlEscape(bleAddressTypeLabel(summary.addressType)) + "</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
@@ -2860,7 +3007,7 @@ void sendBleSummaryTable() {
     server.sendContent(row);
   }
 
-  server.sendContent("</tbody></table>");
+  server.sendContent("</tbody></table></div>");
 }
 
 void handleBLESurvey() {
@@ -2881,7 +3028,9 @@ void handleBLESurvey() {
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
     "<title>ESP32 Bluetooth Survey</title>");
   server.sendContent(pageStyles());
-  server.sendContent("</head><body><div class=\"container\"><h1>Bluetooth Survey</h1>"
+  server.sendContent("</head><body><div class=\"container\">");
+  sendThemeControl();
+  server.sendContent("<h1>Bluetooth Survey</h1>"
     "<div class=\"card\"><h2>Scan Logging</h2>");
 
   String status;
@@ -2947,6 +3096,7 @@ void handleBLESurvey() {
   sendBleSummaryTable();
   server.sendContent("</div><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
+  sendThemeScript();
   server.sendContent("</div></body></html>");
   server.sendContent("");
 }
@@ -2980,6 +3130,15 @@ void handleAccessPointSettingsPage() {
 
 <body>
   <div class="container">
+
+    <div class="theme-control">
+      <label for="theme-select">Theme</label>
+      <select id="theme-select" class="theme-select" onchange="setTheme(this.value)">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </div>
 
     <h1>Access Point Settings</h1>
 
@@ -3061,6 +3220,27 @@ void handleAccessPointSettingsPage() {
     </div>
 
   </div>
+    <script>
+      function applyTheme(v) {
+        const r = document.documentElement;
+        if (v === 'system') {
+          const d = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          r.dataset.theme = d ? 'dark' : 'light';
+        } else {
+          r.dataset.theme = v;
+        }
+      }
+      function setTheme(v) {
+        localStorage.setItem('esp32-theme', v);
+        applyTheme(v);
+        document.querySelectorAll('.theme-select').forEach(s => s.value = v);
+      }
+      document.addEventListener('DOMContentLoaded', () => {
+        const v = localStorage.getItem('esp32-theme') || 'system';
+        applyTheme(v);
+        document.querySelectorAll('.theme-select').forEach(s => s.value = v);
+      });
+    </script>
 </body>
 </html>
 )rawliteral";
