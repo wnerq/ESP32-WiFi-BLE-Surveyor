@@ -1,15 +1,8 @@
-# ESP32 WiFi Surveyor
+# ESP32 Wireless Surveyor
 
-An ESP32 Wi-Fi configuration, monitoring, and site-survey tool with a
-serial interface, self-hosted web UI, AP+STA operation,
-BSSID/RSSI/channel logging, automatic scans, selectable RSSI history
-plotting, and CSV export.
+An ESP32 Wi-Fi and Bluetooth wireless-survey/logger with a serial interface, self-hosted web UI, AP+STA operation, automatic Wi-Fi and BLE scanning, RSSI history plotting, configurable in-memory history, and CSV export.
 
-The project began as a simple way to configure Wi-Fi credentials through
-the Arduino Serial Monitor and has evolved into a portable Wi-Fi survey
-and logging utility. The ESP32 can now host its own access point, so the
-survey interface can be used even when the device is not connected to an
-existing Wi-Fi network.
+The project began as a simple way to configure Wi-Fi credentials through the Arduino Serial Monitor and has evolved into a portable wireless survey and logging utility. The ESP32 can host its own access point, so the survey interface can be used even when the device is not connected to an existing Wi-Fi network. Wi-Fi and BLE survey data can be collected and reviewed from a phone or PC.
 
 ## Features
 
@@ -102,6 +95,14 @@ The web interface provides:
 
 Navigation controls are kept at the top of the survey page so normal
 actions do not require scrolling through accumulated scan history.
+
+Recent revisions also add responsive table containers for narrow/mobile displays and a lightweight **System / Light / Dark** theme selector stored in browser `localStorage`. RSSI plots are theme-aware so their canvas, grid, labels, lines, and markers remain readable in dark mode.
+
+## Bluetooth Low Energy survey
+
+The firmware also includes a BLE survey/logger using the ESP32 Bluetooth radio. BLE observations are retained in a dynamically allocated history buffer, can be scanned manually or automatically, and can be reviewed in a sortable summary table. Individual devices can be selected for RSSI-history plotting, paralleling the Wi-Fi workflow.
+
+BLE automatic scanning is intended to operate independently of browser interaction. The long-term design goal is that simply powering the device starts data collection; connecting to the web UI is for configuration, inspection, and export rather than for starting the survey.
 
 ## Wi-Fi survey data
 
@@ -201,9 +202,9 @@ The history uses a dynamically allocated ring buffer. The retention
 limit is configurable from the survey page:
 
 ``` text
-Minimum: 50 network observations
-Default: 300 network observations
-Maximum: 2000 network observations
+Minimum: firmware-defined safety floor
+Default: allocated automatically/configured by the current firmware
+Maximum: constrained by available heap and the firmware safety limit
 ```
 
 A network observation is one network detected during one scan. A scan
@@ -220,8 +221,7 @@ The survey page reports:
 -   RAM allocated to scan history.
 -   Current free heap.
 
-The configured history capacity is currently session-only and returns to
-the 300-record default after reset.
+History is currently RAM-backed and therefore session-only. Current firmware revisions report history allocation and heap/resource information in the web interface.
 
 Wi-Fi station credentials and AP configuration are different: those are
 stored persistently in NVS.
@@ -298,6 +298,7 @@ The project has been developed with:
 -   `WiFi.h`
 -   `WebServer.h`
 -   `Preferences.h`
+-   ESP32 BLE library
 
 Tested board selection:
 
@@ -533,6 +534,12 @@ acceptable.
 -   Automatic bootloader entry can be intermittent on some DEVKITV1
     boards.
 
+## Current firmware state
+
+The current working revision at the time of this README update is **V17**, `WifiConnect17_theme_aware_plots.ino`. It includes Wi-Fi and BLE survey pages, automatic scan/history controls, selectable RSSI plots, responsive tables, AP+STA operation, firmware identification, resource reporting, and light/dark/system themes.
+
+The firmware has grown beyond the original 1.2 MB application partition. Development therefore moved to a larger application partition; recent builds have been approximately 1.7 MB. The exact Arduino partition selection should be checked before flashing. This matters for future persistent logging and OTA design.
+
 ## Project evolution
 
 The project was developed incrementally:
@@ -556,18 +563,111 @@ The project was developed incrementally:
 Git history can preserve these iterations while the sketch keeps a
 single stable filename in the repository.
 
-## Possible future improvements
+## Planned next revision / architecture
 
--   Filter scan history by SSID/BSSID.
--   Add channel-utilization visualization.
--   Add minimum/maximum/average RSSI statistics.
--   Add manually entered location/survey-point labels.
--   Persist selected survey sessions to LittleFS, SPIFFS, or SD card.
--   Persist optional scan settings such as interval/history capacity.
--   Add mDNS hostname access.
--   Improve mobile layout.
--   Add OTA firmware updates.
--   Add authentication or a more secure provisioning model.
+The next revision is intended to reorganize the web application around the survey/logger use case rather than the original status-page use case.
+
+### Site layout
+
+Use a common page shell and persistent navigation:
+
+- **Wi-Fi** — default `/` page and primary survey workspace.
+- **Bluetooth** — parallel BLE survey workspace.
+- **System** — device status, diagnostics, resources, firmware information, and self-test results.
+- **Settings** — infrastructure Wi-Fi/AP configuration and device-wide UI/configuration options.
+
+The current `Back to Status` navigation model should be removed. Page terminology should be standardized to **Wi-Fi Survey** and **Bluetooth Survey**, with contextual action buttons simply labeled **Scan Now**. Shared header/navigation/theme/footer generation should replace duplicated page-shell HTML.
+
+### Headless logger requirement
+
+A core design requirement is unattended operation from a USB power bank:
+
+1. Power is applied.
+2. Configuration is loaded.
+3. Wi-Fi and BLE subsystems initialize.
+4. An initial Wi-Fi and BLE scan occurs shortly after boot.
+5. Automatic scans continue at their defaults without a browser, serial terminal, or infrastructure Wi-Fi connection.
+6. Saved infrastructure Wi-Fi may be joined when available, but connection failure must not prevent surveying.
+7. The ESP32 AP remains the local method for connecting later to inspect/download data.
+
+V18 should explicitly verify this behavior rather than assume the current automatic-scan paths satisfy it. A useful acceptance test is to power the ESP32 with no serial terminal and no known infrastructure network, leave it untouched for at least 20 minutes, then connect to its AP and confirm that multiple Wi-Fi and BLE scans were logged automatically.
+
+### Wi-Fi channel analysis
+
+Add advisory 2.4 GHz channel analysis based on observed scan data. The ESP32 cannot measure true airtime utilization or non-Wi-Fi interference, so the UI should not claim to measure actual channel utilization. Instead it can estimate congestion from:
+
+- AP count by channel.
+- Strongest observed interferer.
+- RSSI-weighted interference.
+- Co-channel interference.
+- Adjacent-channel overlap.
+- Comparison of the commonly preferred non-overlapping US 2.4 GHz channels 1, 6, and 11.
+
+The UI should report a **Suggested channel**, with a concise reason, rather than claiming a definitive "best" channel.
+
+### Expanded System Status and diagnostics
+
+Planned System Status fields include:
+
+- Firmware filename and version.
+- Arduino ESP32 core and ESP-IDF versions.
+- Uptime and last reset reason.
+- ESP32 chip model, silicon revision, CPU frequency, and core count.
+- Flash size, sketch size, application-partition/free-app-space information.
+- Free heap, minimum free heap, largest free block, and useful fragmentation/resource indicators.
+- STA/AP MAC addresses, Wi-Fi mode/channel/RSSI, and other radio information where reliable.
+- Wi-Fi and BLE history usage/allocation.
+
+Possible software self-tests/status checks include:
+
+- Wi-Fi subsystem initialized.
+- BLE subsystem initialized.
+- Wi-Fi history buffer allocated and sane.
+- BLE history buffer allocated and sane.
+- Configuration values within valid ranges.
+- Adequate heap reserve / allocation health.
+- Flash/application-space sanity.
+- Filesystem availability once persistent logging is implemented.
+- Boot/reset diagnostic status.
+
+Nonfatal conditions should normally be reported as **WARN** rather than turning the overall device state into a failure.
+
+## Longer-term roadmap
+
+### Persistent survey logging
+
+Current scan history is volatile RAM. Persistent logging is now considered more valuable than browser-based OTA updates if the 4 MB flash budget forces a choice. A future revision should evaluate a LittleFS-style append log rather than using NVS/`Preferences` as a scan database.
+
+The preferred concept is:
+
+- Continue using NVS for small configuration values.
+- Buffer active observations in RAM.
+- Periodically append new observations to flash instead of rewriting the entire dataset.
+- Use a configurable checkpoint interval (roughly 10-15 minutes is a reasonable starting point).
+- On reboot, detect and offer the previous session for download/recovery.
+- Keep CSV as the user-facing export format even if a different internal representation is eventually chosen.
+
+This trades some flash write activity for resilience against a dead/disconnected power bank. Flash partitioning must be reviewed before implementation because application size, filesystem capacity, and OTA slots compete for the same 4 MB device flash.
+
+### Hardware expansion
+
+Longer-term possibilities include:
+
+- Small local display.
+- D-pad/button navigation, preferred over requiring a touchscreen.
+- GPS/GNSS module for location, UTC time, and geotagged observations.
+- External INA219/INA226-style monitor for actual supply voltage, board current, power, and energy measurements. The ESP32 alone cannot accurately report total board current/power.
+- Boards with more flash and/or PSRAM if persistent logging, GPS, richer UI, or other features outgrow the current classic 4 MB ESP32.
+
+### Other possible improvements
+
+- Filter observations by SSID/BSSID/device.
+- Minimum/maximum/average RSSI statistics.
+- Manually entered location/survey-point labels before GPS support.
+- Persist optional scan settings such as interval/history capacity.
+- mDNS hostname access.
+- Authentication or a more secure provisioning model.
+- OTA firmware updates only if flash budget and usefulness justify it. Browser OTA would require uploading a **compiled firmware binary**, not a raw `.ino` source file.
 
 ## License
 
