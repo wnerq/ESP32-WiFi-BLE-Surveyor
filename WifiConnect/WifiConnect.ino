@@ -1737,6 +1737,19 @@ void handleRoot() {
 <html>
 
 <head>
+<script>
+  const theme = localStorage.getItem('esp32-theme') || 'system';
+
+  if (theme === 'dark') {
+    document.documentElement.dataset.theme = 'dark';
+  } else if (theme === 'light') {
+    document.documentElement.dataset.theme = 'light';
+  } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.documentElement.dataset.theme = 'dark';
+  } else {
+    document.documentElement.dataset.theme = 'light';
+  }
+</script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ESP32 Status</title>
