@@ -1,4 +1,4 @@
-// WifiConnect16 - responsive tables and light/dark/system themes
+// WifiConnect17 - theme-aware RSSI plots
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -11,8 +11,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect16_responsive_theme.ino";
-const char* FIRMWARE_VERSION = "16";
+const char* FIRMWARE_FILE = "WifiConnect17_theme_aware_plots.ino";
+const char* FIRMWARE_VERSION = "17";
 
 
 Preferences preferences;
@@ -1399,6 +1399,11 @@ String pageStyles() {
     --link: #0000ee;
     --current-row: #eef7ee;
     --shadow: rgba(0,0,0,0.15);
+    --plot-bg: #ffffff;
+    --plot-grid: #dddddd;
+    --plot-border: #bbbbbb;
+    --plot-line: #333333;
+    --plot-text: #222222;
   }
 
   html[data-theme="dark"] {
@@ -1416,6 +1421,11 @@ String pageStyles() {
     --link: #8ab4f8;
     --current-row: #263b2b;
     --shadow: rgba(0,0,0,0.35);
+    --plot-bg: #1d1d1d;
+    --plot-grid: #444444;
+    --plot-border: #666666;
+    --plot-line: #8ab4f8;
+    --plot-text: #dddddd;
   }
 
   * {
@@ -1563,6 +1573,29 @@ String pageStyles() {
     width: 100%;
     min-width: 520px;
     height: auto;
+  }
+
+  .plot-bg {
+    fill: var(--plot-bg);
+    stroke: var(--plot-border);
+  }
+
+  .plot-grid {
+    stroke: var(--plot-grid);
+  }
+
+  .plot-line {
+    fill: none;
+    stroke: var(--plot-line);
+    stroke-width: 2;
+  }
+
+  .plot-point {
+    fill: var(--plot-line);
+  }
+
+  .plot-text {
+    fill: var(--plot-text);
   }
 
   .controls {
@@ -2069,8 +2102,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 
   // Background and horizontal grid lines.
   server.sendContent(
-    "<rect x=\"58\" y=\"20\" width=\"642\" height=\"215\" "
-    "fill=\"white\" stroke=\"#bbb\"/>"
+    "<rect class=\"plot-bg\" x=\"58\" y=\"20\" width=\"642\" height=\"215\"/>"
   );
 
   for (int rssi = -100; rssi <= -30; rssi += 10) {
@@ -2089,13 +2121,13 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
     grid += String(SVG_WIDTH - RIGHT);
     grid += "\" y2=\"";
     grid += String(y);
-    grid += "\" stroke=\"#ddd\" stroke-width=\"1\"/>";
+    grid += "\" class=\"plot-grid\" stroke-width=\"1\"/>";
 
     grid += "<text x=\"";
     grid += String(LEFT - 8);
     grid += "\" y=\"";
     grid += String(y + 4);
-    grid += "\" text-anchor=\"end\" font-size=\"11\">";
+    grid += "\" class=\"plot-text\" text-anchor=\"end\" font-size=\"11\">";
     grid += String(rssi);
     grid += "</text>";
 
@@ -2143,7 +2175,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
   String polyline;
   polyline.reserve(points.length() + 120);
   polyline =
-    "<polyline fill=\"none\" stroke=\"#333\" stroke-width=\"2\" points=\"";
+    "<polyline class=\"plot-line\" points=\"";
   polyline += points;
   polyline += "\"/>";
 
@@ -2182,7 +2214,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
     dot += String(x);
     dot += "\" cy=\"";
     dot += String(y);
-    dot += "\" r=\"4\" fill=\"#333\">";
+    dot += "\" r=\"4\" class=\"plot-point\">";
     dot += "<title>Scan #";
     dot += String(record.scanNumber);
     dot += " | ";
@@ -2201,7 +2233,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
   labels += String(LEFT);
   labels += "\" y=\"";
   labels += String(SVG_HEIGHT - 18);
-  labels += "\" text-anchor=\"start\" font-size=\"11\">";
+  labels += "\" class=\"plot-text\" text-anchor=\"start\" font-size=\"11\">";
   labels += htmlEscape(formatUptime(firstMs));
   labels += "</text>";
 
@@ -2209,7 +2241,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
   labels += String(SVG_WIDTH - RIGHT);
   labels += "\" y=\"";
   labels += String(SVG_HEIGHT - 18);
-  labels += "\" text-anchor=\"end\" font-size=\"11\">";
+  labels += "\" class=\"plot-text\" text-anchor=\"end\" font-size=\"11\">";
   labels += htmlEscape(formatUptime(lastMs));
   labels += "</text>";
 
@@ -2908,14 +2940,14 @@ void sendBleRssiHistoryPlot(const String& selectedAddress) {
   if (lastMs <= firstMs) lastMs = firstMs + 1;
 
   server.sendContent("<div class=\"plot-wrap\"><svg viewBox=\"0 0 720 280\" role=\"img\">"
-    "<rect x=\"58\" y=\"20\" width=\"642\" height=\"215\" fill=\"white\" stroke=\"#bbb\"/>");
+    "<rect class=\"plot-bg\" x=\"58\" y=\"20\" width=\"642\" height=\"215\"/>");
 
   for (int rssi = -100; rssi <= -30; rssi += 10) {
     int y = TOP + ((RSSI_TOP - rssi) * plotHeight) / (RSSI_TOP - RSSI_BOTTOM);
     String grid = "<line x1=\"" + String(LEFT) + "\" y1=\"" + String(y) +
       "\" x2=\"" + String(SVG_WIDTH - RIGHT) + "\" y2=\"" + String(y) +
-      "\" stroke=\"#ddd\"/><text x=\"" + String(LEFT - 8) + "\" y=\"" +
-      String(y + 4) + "\" text-anchor=\"end\" font-size=\"11\">" +
+      "\" class=\"plot-grid\"/><text class=\"plot-text\" x=\"" + String(LEFT - 8) + "\" y=\"" +
+      String(y + 4) + "\" class=\"plot-text\" text-anchor=\"end\" font-size=\"11\">" +
       String(rssi) + "</text>";
     server.sendContent(grid);
   }
@@ -2937,7 +2969,7 @@ void sendBleRssiHistoryPlot(const String& selectedAddress) {
     points += String(x) + "," + String(y);
   }
 
-  server.sendContent("<polyline fill=\"none\" stroke=\"#333\" stroke-width=\"2\" points=\"" + points + "\"/>");
+  server.sendContent("<polyline class=\"plot-line\" points=\"" + points + "\"/>");
 
   for (size_t i = 0; i < bleHistoryCount; i++) {
     const BleScanRecord& record = bleHistoryRecord(i);
@@ -2950,7 +2982,7 @@ void sendBleRssiHistoryPlot(const String& selectedAddress) {
     int y = TOP + ((RSSI_TOP - clipped) * plotHeight) / (RSSI_TOP - RSSI_BOTTOM);
 
     String dot = "<circle cx=\"" + String(x) + "\" cy=\"" + String(y) +
-      "\" r=\"4\" fill=\"#333\"><title>Scan #" + String(record.scanNumber) +
+      "\" r=\"4\" class=\"plot-point\"><title>Scan #" + String(record.scanNumber) +
       " | " + htmlEscape(formatUptime(record.uptimeMs)) + " | " +
       String(record.rssi) + " dBm</title></circle>";
     server.sendContent(dot);
