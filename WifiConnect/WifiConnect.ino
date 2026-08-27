@@ -1,4 +1,4 @@
-// WifiConnect14 - manual BLE scanner and sortable BLE summary
+// WifiConnect15 - Wi-Fi/BLE automatic logging, history plots, resources, firmware ID
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -6,6 +6,14 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+
+// ============================================================
+// Firmware identity
+// ============================================================
+
+const char* FIRMWARE_FILE = "WifiConnect15_wifi_ble_history_resources.ino";
+const char* FIRMWARE_VERSION = "15";
+
 
 Preferences preferences;
 WebServer server(80);
@@ -35,12 +43,16 @@ String apStatusMessage = "";
 // Scan history is intentionally RAM-only. It is cleared on power cycle/reset.
 // The same SSID/BSSID may appear in many records with different scan numbers
 // and timestamps, which is useful for signal-strength trending.
-const size_t DEFAULT_SCAN_HISTORY_RECORDS = 300;
 const size_t MIN_SCAN_HISTORY_RECORDS = 50;
 const size_t MAX_SCAN_HISTORY_RECORDS = 2000;
+const size_t MIN_BLE_HISTORY_RECORDS = 50;
+const size_t MAX_BLE_HISTORY_RECORDS = 2000;
+
+const size_t HISTORY_HEAP_RESERVE_BYTES = 96 * 1024;
 
 const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
 const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
+const uint32_t BLE_SCAN_DURATION_SECONDS = 5;
 
 struct ScanRecord {
   uint32_t scanNumber;
@@ -54,21 +66,22 @@ struct ScanRecord {
   bool hidden;
 };
 
+struct BleScanRecord {
+  uint32_t scanNumber;
+  uint32_t uptimeMs;
+  char name[48];
+  char address[18];
+  int16_t rssi;
+  uint8_t addressType;
+  bool named;
+};
 
-// Keep custom types near the top of the sketch. Arduino IDE 1.x generates
-// function prototypes before later type declarations, so helper functions
-// using these types must see the definitions first.
-//
-// SignalStats is intentionally radio-agnostic. It can be reused later for
-// BLE RSSI history/summary work without coupling BLE to Wi-Fi structures.
 struct SignalStats {
   uint32_t samples;
-
   int16_t latestRssi;
   int16_t minRssi;
   int16_t maxRssi;
   int32_t rssiTotal;
-
   uint32_t firstSeenMs;
   uint32_t lastSeenMs;
 };
@@ -76,59 +89,47 @@ struct SignalStats {
 struct NetworkSummary {
   char ssid[33];
   char bssid[18];
-
   int16_t channel;
   uint8_t authMode;
-
   SignalStats signal;
-
   bool connected;
   bool hidden;
 };
 
-
-// ============================================================
-// BLE survey data
-// ============================================================
-
-const size_t MAX_BLE_DEVICE_SUMMARIES = 150;
-const uint32_t BLE_SCAN_DURATION_SECONDS = 5;
-
 struct BLEDeviceSummary {
   char name[48];
   char address[18];
-
   uint8_t addressType;
-  uint32_t advertisementCount;
-
   SignalStats signal;
-
   bool named;
 };
 
-BLEDeviceSummary bleDevices[MAX_BLE_DEVICE_SUMMARIES];
-size_t bleDeviceCount = 0;
-
-uint32_t bleScanCounter = 0;
-uint32_t lastBleScanUptimeMs = 0;
-
-bool bleInitialized = false;
-String bleStatusMessage = "";
-
 ScanRecord* scanHistory = nullptr;
 size_t scanHistoryCapacity = 0;
-
 size_t historyStart = 0;
 size_t historyCount = 0;
-
 String historyResizeMessage = "";
-
 uint32_t scanCounter = 0;
 uint32_t lastScanUptimeMs = 0;
-
 bool autoScanEnabled = true;
 unsigned long scanIntervalSeconds = 300;
 unsigned long lastAutoScanMs = 0;
+
+BleScanRecord* bleHistory = nullptr;
+size_t bleHistoryCapacity = 0;
+size_t bleHistoryStart = 0;
+size_t bleHistoryCount = 0;
+String bleHistoryResizeMessage = "";
+String bleStatusMessage = "";
+uint32_t bleScanCounter = 0;
+uint32_t lastBleScanUptimeMs = 0;
+bool autoBleScanEnabled = true;
+unsigned long bleScanIntervalSeconds = 300;
+unsigned long lastAutoBleScanMs = 0;
+bool bleInitialized = false;
+
+size_t bootWifiHistoryCapacity = 0;
+size_t bootBleHistoryCapacity = 0;
 
 
 
@@ -372,166 +373,36 @@ float averageSignal(const SignalStats& stats) {
 
 String bleAddressTypeLabel(uint8_t addressType) {
   switch (addressType) {
-    case 0:
-      return "Public";
-
-    case 1:
-      return "Random";
-
-    case 2:
-      return "Public ID";
-
-    case 3:
-      return "Random ID";
-
-    default:
-      return "Unknown";
+    case 0: return "Public";
+    case 1: return "Random";
+    case 2: return "Public ID";
+    case 3: return "Random ID";
+    default: return "Unknown";
   }
-}
-
-int findBleDeviceByAddress(const String& address) {
-  for (size_t i = 0; i < bleDeviceCount; i++) {
-    if (
-      String(bleDevices[i].address)
-        .equalsIgnoreCase(address)
-    ) {
-      return (int)i;
-    }
-  }
-
-  return -1;
 }
 
 void initializeBLEScanner() {
-  if (bleInitialized) {
-    return;
-  }
+  if (bleInitialized) return;
 
   BLEDevice::init("");
-
   BLEScan* scan = BLEDevice::getScan();
-
-  // Active scan requests scan-response packets, which often contain
-  // human-readable names and other useful advertisement data.
   scan->setActiveScan(true);
-
   bleInitialized = true;
 }
 
-void updateBleSummary(
-  BLEAdvertisedDevice& device,
-  uint32_t scanUptimeMs
-) {
-  String address =
-      device.getAddress().toString();
 
-  int index =
-      findBleDeviceByAddress(address);
-
-  if (index < 0) {
-    if (bleDeviceCount >= MAX_BLE_DEVICE_SUMMARIES) {
-      return;
-    }
-
-    index = (int)bleDeviceCount;
-    bleDeviceCount++;
-
-    BLEDeviceSummary summary = {};
-
-    address.toCharArray(
-      summary.address,
-      sizeof(summary.address)
-    );
-
-    resetSignalStats(summary.signal);
-
-    bleDevices[index] = summary;
-  }
-
-  BLEDeviceSummary& summary =
-      bleDevices[index];
-
-  if (device.haveName()) {
-    String name = device.getName();
-
-    if (name.length() > 0) {
-      name.toCharArray(
-        summary.name,
-        sizeof(summary.name)
-      );
-
-      summary.named = true;
-    }
-  }
-
-  summary.addressType =
-      device.getAddressType();
-
-  summary.advertisementCount++;
-
-  addSignalObservation(
-    summary.signal,
-    device.getRSSI(),
-    scanUptimeMs
-  );
-}
-
-int performManualBLEScan() {
-  initializeBLEScanner();
-
-  BLEScan* scan = BLEDevice::getScan();
-
-  bleStatusMessage = "BLE scan in progress...";
-
-  BLEScanResults* results =
-      scan->start(
-        BLE_SCAN_DURATION_SECONDS,
-        false
-      );
-
-  bleScanCounter++;
-  lastBleScanUptimeMs = millis();
-
-  int resultCount =
-      results != nullptr
-        ? results->getCount()
-        : 0;
-
-  if (results != nullptr) {
-    for (int i = 0; i < resultCount; i++) {
-      BLEAdvertisedDevice device =
-          results->getDevice(i);
-
-      updateBleSummary(
-        device,
-        lastBleScanUptimeMs
-      );
-    }
-  }
-
-  scan->clearResults();
-
-  bleStatusMessage =
-      "BLE scan #" +
-      String(bleScanCounter) +
-      " complete: " +
-      String(resultCount) +
-      " device(s) observed.";
-
-  return resultCount;
-}
+// ============================================================
+// Wi-Fi history
+// ============================================================
 
 const ScanRecord& historyRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (historyStart + logicalIndex) % scanHistoryCapacity;
-
   return scanHistory[physicalIndex];
 }
 
 size_t countRetainedScanGroups() {
-  if (historyCount == 0 || scanHistory == nullptr) {
-    return 0;
-  }
+  if (historyCount == 0 || scanHistory == nullptr) return 0;
 
   size_t groups = 0;
   uint32_t previousScan = 0;
@@ -546,24 +417,19 @@ size_t countRetainedScanGroups() {
       havePrevious = true;
     }
   }
-
   return groups;
 }
 
 bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
-  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS) {
+  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS)
     requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
-  }
-
-  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS) {
+  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS)
     requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
-  }
 
   if (scanHistory != nullptr && requestedCapacity == scanHistoryCapacity) {
     historyResizeMessage =
       "History limit unchanged at " +
-      String(scanHistoryCapacity) +
-      " records.";
+      String(scanHistoryCapacity) + " records.";
     return true;
   }
 
@@ -583,17 +449,13 @@ bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
   if (preserveRecords && scanHistory != nullptr && historyCount > 0) {
     recordsToKeep =
       historyCount < requestedCapacity ? historyCount : requestedCapacity;
+    size_t first = historyCount - recordsToKeep;
 
-    size_t firstLogicalRecord = historyCount - recordsToKeep;
-
-    for (size_t i = 0; i < recordsToKeep; i++) {
-      newHistory[i] = historyRecord(firstLogicalRecord + i);
-    }
+    for (size_t i = 0; i < recordsToKeep; i++)
+      newHistory[i] = historyRecord(first + i);
   }
 
-  if (scanHistory != nullptr) {
-    free(scanHistory);
-  }
+  if (scanHistory != nullptr) free(scanHistory);
 
   scanHistory = newHistory;
   scanHistoryCapacity = requestedCapacity;
@@ -602,26 +464,19 @@ bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
 
   historyResizeMessage =
     "History limit set to " +
-    String(scanHistoryCapacity) +
-    " records.";
+    String(scanHistoryCapacity) + " records.";
 
   return true;
 }
 
 bool clearAndResizeScanHistory(size_t requestedCapacity) {
-  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS) {
+  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS)
     requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
-  }
-
-  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS) {
+  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS)
     requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
-  }
 
   size_t previousCapacity = scanHistoryCapacity;
 
-  // The user explicitly requested that existing history be discarded
-  // before allocating the new buffer. This frees the largest possible
-  // contiguous block for the resize attempt.
   if (scanHistory != nullptr) {
     free(scanHistory);
     scanHistory = nullptr;
@@ -634,90 +489,39 @@ bool clearAndResizeScanHistory(size_t requestedCapacity) {
   lastScanUptimeMs = 0;
 
   ScanRecord* newHistory =
-      (ScanRecord*)malloc(
-        requestedCapacity * sizeof(ScanRecord)
-      );
+      (ScanRecord*)malloc(requestedCapacity * sizeof(ScanRecord));
 
   if (newHistory != nullptr) {
     scanHistory = newHistory;
     scanHistoryCapacity = requestedCapacity;
-
     historyResizeMessage =
       "History cleared; limit set to " +
-      String(scanHistoryCapacity) +
-      " records.";
-
+      String(scanHistoryCapacity) + " records.";
     return true;
   }
 
-  // The requested allocation still failed. Try to restore an empty
-  // buffer at the previous capacity so logging can continue.
-  size_t fallbackCapacity =
-      previousCapacity > 0
-        ? previousCapacity
-        : DEFAULT_SCAN_HISTORY_RECORDS;
+  size_t fallback =
+      previousCapacity > 0 ? previousCapacity : MIN_SCAN_HISTORY_RECORDS;
 
   newHistory =
-      (ScanRecord*)malloc(
-        fallbackCapacity * sizeof(ScanRecord)
-      );
+      (ScanRecord*)malloc(fallback * sizeof(ScanRecord));
 
   if (newHistory != nullptr) {
     scanHistory = newHistory;
-    scanHistoryCapacity = fallbackCapacity;
-
+    scanHistoryCapacity = fallback;
     historyResizeMessage =
-      "History was cleared, but allocation of " +
-      String(requestedCapacity) +
-      " records failed. Restored an empty " +
-      String(scanHistoryCapacity) +
-      "-record buffer.";
-
-    return false;
-  }
-
-  // Last-resort minimal buffer.
-  newHistory =
-      (ScanRecord*)malloc(
-        MIN_SCAN_HISTORY_RECORDS * sizeof(ScanRecord)
-      );
-
-  if (newHistory != nullptr) {
-    scanHistory = newHistory;
-    scanHistoryCapacity = MIN_SCAN_HISTORY_RECORDS;
-
-    historyResizeMessage =
-      "History was cleared and the requested resize failed. "
-      "Recovered with a minimal " +
-      String(scanHistoryCapacity) +
-      "-record buffer.";
-
+      "History cleared, requested resize failed; restored empty " +
+      String(scanHistoryCapacity) + "-record buffer.";
     return false;
   }
 
   historyResizeMessage =
-    "History was cleared, but no scan-history buffer could be allocated.";
-
+    "History cleared, but no Wi-Fi history buffer could be allocated.";
   return false;
 }
 
-
-void initializeScanHistory() {
-  if (scanHistory != nullptr) {
-    return;
-  }
-
-  if (!resizeScanHistory(DEFAULT_SCAN_HISTORY_RECORDS, false)) {
-    resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
-  }
-
-  historyResizeMessage = "";
-}
-
 void appendScanRecord(const ScanRecord& record) {
-  if (scanHistory == nullptr || scanHistoryCapacity == 0) {
-    return;
-  }
+  if (scanHistory == nullptr || scanHistoryCapacity == 0) return;
 
   size_t writeIndex;
 
@@ -727,8 +531,7 @@ void appendScanRecord(const ScanRecord& record) {
     historyCount++;
   } else {
     writeIndex = historyStart;
-    historyStart =
-      (historyStart + 1) % scanHistoryCapacity;
+    historyStart = (historyStart + 1) % scanHistoryCapacity;
   }
 
   scanHistory[writeIndex] = record;
@@ -752,13 +555,10 @@ int performLoggedScan() {
   scanCounter++;
   lastScanUptimeMs = millis();
 
-  if (networkCount <= 0) {
-    return networkCount;
-  }
+  if (networkCount <= 0) return networkCount;
 
   for (int i = 0; i < networkCount; i++) {
     ScanRecord record = {};
-
     record.scanNumber = scanCounter;
     record.uptimeMs = lastScanUptimeMs;
 
@@ -772,10 +572,9 @@ int performLoggedScan() {
     record.channel = WiFi.channel(i);
     record.authMode = (uint8_t)WiFi.encryptionType(i);
     record.connected =
-        connectedNow &&
-        connectedBSSID.length() > 0 &&
-        bssid.equalsIgnoreCase(connectedBSSID);
-
+      connectedNow &&
+      connectedBSSID.length() > 0 &&
+      bssid.equalsIgnoreCase(connectedBSSID);
     record.hidden = (ssid.length() == 0);
 
     appendScanRecord(record);
@@ -784,26 +583,327 @@ int performLoggedScan() {
   return networkCount;
 }
 
+
+// ============================================================
+// BLE history
+// ============================================================
+
+const BleScanRecord& bleHistoryRecord(size_t logicalIndex) {
+  size_t physicalIndex =
+      (bleHistoryStart + logicalIndex) % bleHistoryCapacity;
+  return bleHistory[physicalIndex];
+}
+
+bool resizeBleHistory(size_t requestedCapacity, bool preserveRecords = true) {
+  if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
+    requestedCapacity = MIN_BLE_HISTORY_RECORDS;
+  if (requestedCapacity > MAX_BLE_HISTORY_RECORDS)
+    requestedCapacity = MAX_BLE_HISTORY_RECORDS;
+
+  if (bleHistory != nullptr && requestedCapacity == bleHistoryCapacity) {
+    bleHistoryResizeMessage =
+      "BLE history limit unchanged at " +
+      String(bleHistoryCapacity) + " records.";
+    return true;
+  }
+
+  BleScanRecord* newHistory =
+      (BleScanRecord*)malloc(requestedCapacity * sizeof(BleScanRecord));
+
+  if (newHistory == nullptr) {
+    bleHistoryResizeMessage =
+      "Unable to allocate " +
+      String(requestedCapacity) +
+      " BLE records; previous limit retained.";
+    return false;
+  }
+
+  size_t recordsToKeep = 0;
+
+  if (preserveRecords && bleHistory != nullptr && bleHistoryCount > 0) {
+    recordsToKeep =
+      bleHistoryCount < requestedCapacity ? bleHistoryCount : requestedCapacity;
+    size_t first = bleHistoryCount - recordsToKeep;
+
+    for (size_t i = 0; i < recordsToKeep; i++)
+      newHistory[i] = bleHistoryRecord(first + i);
+  }
+
+  if (bleHistory != nullptr) free(bleHistory);
+
+  bleHistory = newHistory;
+  bleHistoryCapacity = requestedCapacity;
+  bleHistoryStart = 0;
+  bleHistoryCount = recordsToKeep;
+
+  bleHistoryResizeMessage =
+    "BLE history limit set to " +
+    String(bleHistoryCapacity) + " records.";
+
+  return true;
+}
+
+bool clearAndResizeBleHistory(size_t requestedCapacity) {
+  if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
+    requestedCapacity = MIN_BLE_HISTORY_RECORDS;
+  if (requestedCapacity > MAX_BLE_HISTORY_RECORDS)
+    requestedCapacity = MAX_BLE_HISTORY_RECORDS;
+
+  size_t previousCapacity = bleHistoryCapacity;
+
+  if (bleHistory != nullptr) {
+    free(bleHistory);
+    bleHistory = nullptr;
+  }
+
+  bleHistoryCapacity = 0;
+  bleHistoryStart = 0;
+  bleHistoryCount = 0;
+  bleScanCounter = 0;
+  lastBleScanUptimeMs = 0;
+
+  BleScanRecord* newHistory =
+      (BleScanRecord*)malloc(requestedCapacity * sizeof(BleScanRecord));
+
+  if (newHistory != nullptr) {
+    bleHistory = newHistory;
+    bleHistoryCapacity = requestedCapacity;
+    bleHistoryResizeMessage =
+      "BLE history cleared; limit set to " +
+      String(bleHistoryCapacity) + " records.";
+    return true;
+  }
+
+  size_t fallback =
+      previousCapacity > 0 ? previousCapacity : MIN_BLE_HISTORY_RECORDS;
+
+  newHistory =
+      (BleScanRecord*)malloc(fallback * sizeof(BleScanRecord));
+
+  if (newHistory != nullptr) {
+    bleHistory = newHistory;
+    bleHistoryCapacity = fallback;
+    bleHistoryResizeMessage =
+      "BLE history cleared, requested resize failed; restored empty " +
+      String(bleHistoryCapacity) + "-record buffer.";
+    return false;
+  }
+
+  bleHistoryResizeMessage =
+    "BLE history cleared, but no BLE history buffer could be allocated.";
+  return false;
+}
+
+void appendBleScanRecord(const BleScanRecord& record) {
+  if (bleHistory == nullptr || bleHistoryCapacity == 0) return;
+
+  size_t writeIndex;
+
+  if (bleHistoryCount < bleHistoryCapacity) {
+    writeIndex =
+      (bleHistoryStart + bleHistoryCount) % bleHistoryCapacity;
+    bleHistoryCount++;
+  } else {
+    writeIndex = bleHistoryStart;
+    bleHistoryStart = (bleHistoryStart + 1) % bleHistoryCapacity;
+  }
+
+  bleHistory[writeIndex] = record;
+}
+
+void clearBleHistory() {
+  bleHistoryStart = 0;
+  bleHistoryCount = 0;
+  bleScanCounter = 0;
+  lastBleScanUptimeMs = 0;
+}
+
+size_t capacityForBudget(
+  size_t budgetBytes,
+  size_t recordSize,
+  size_t minimumRecords,
+  size_t maximumRecords
+) {
+  if (recordSize == 0) return minimumRecords;
+
+  size_t capacity = budgetBytes / recordSize;
+  if (capacity < minimumRecords) capacity = minimumRecords;
+  if (capacity > maximumRecords) capacity = maximumRecords;
+  return capacity;
+}
+
+void initializeAutoSizedHistories() {
+  if (scanHistory != nullptr || bleHistory != nullptr) return;
+
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t available =
+    freeHeap > HISTORY_HEAP_RESERVE_BYTES
+      ? freeHeap - HISTORY_HEAP_RESERVE_BYTES
+      : 0;
+
+  size_t wifiBudget = available / 2;
+  size_t bleBudget = available - wifiBudget;
+
+  size_t wifiTarget = capacityForBudget(
+    wifiBudget,
+    sizeof(ScanRecord),
+    MIN_SCAN_HISTORY_RECORDS,
+    MAX_SCAN_HISTORY_RECORDS
+  );
+
+  size_t bleTarget = capacityForBudget(
+    bleBudget,
+    sizeof(BleScanRecord),
+    MIN_BLE_HISTORY_RECORDS,
+    MAX_BLE_HISTORY_RECORDS
+  );
+
+  if (!resizeScanHistory(wifiTarget, false))
+    resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
+
+  if (!resizeBleHistory(bleTarget, false))
+    resizeBleHistory(MIN_BLE_HISTORY_RECORDS, false);
+
+  bootWifiHistoryCapacity = scanHistoryCapacity;
+  bootBleHistoryCapacity = bleHistoryCapacity;
+
+  historyResizeMessage = "";
+  bleHistoryResizeMessage = "";
+}
+
+bool bleHistoryContainsAddress(const String& address) {
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address))
+      return true;
+  }
+  return false;
+}
+
+String latestBleNameForAddress(const String& address) {
+  for (size_t offset = 0; offset < bleHistoryCount; offset++) {
+    size_t i = bleHistoryCount - 1 - offset;
+    const BleScanRecord& record = bleHistoryRecord(i);
+
+    if (
+      String(record.address).equalsIgnoreCase(address) &&
+      record.named
+    ) {
+      return String(record.name);
+    }
+  }
+  return "(unnamed)";
+}
+
+bool hasNewerBleObservationForAddress(
+  size_t logicalIndex,
+  const String& address
+) {
+  for (size_t i = logicalIndex + 1; i < bleHistoryCount; i++) {
+    if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address))
+      return true;
+  }
+  return false;
+}
+
+bool buildBleDeviceSummary(
+  const String& address,
+  BLEDeviceSummary& summary
+) {
+  summary = {};
+  resetSignalStats(summary.signal);
+
+  bool found = false;
+  String newestName = "";
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    const BleScanRecord& record = bleHistoryRecord(i);
+    if (!String(record.address).equalsIgnoreCase(address)) continue;
+
+    found = true;
+    addSignalObservation(summary.signal, record.rssi, record.uptimeMs);
+    summary.addressType = record.addressType;
+
+    if (record.named && String(record.name).length() > 0)
+      newestName = String(record.name);
+  }
+
+  if (!found) return false;
+
+  address.toCharArray(summary.address, sizeof(summary.address));
+
+  if (newestName.length() > 0) {
+    newestName.toCharArray(summary.name, sizeof(summary.name));
+    summary.named = true;
+  }
+
+  return true;
+}
+
+int performLoggedBLEScan() {
+  initializeBLEScanner();
+
+  BLEScan* scan = BLEDevice::getScan();
+  bleStatusMessage = "BLE scan in progress...";
+
+  BLEScanResults* results =
+      scan->start(BLE_SCAN_DURATION_SECONDS, false);
+
+  bleScanCounter++;
+  lastBleScanUptimeMs = millis();
+
+  int resultCount =
+      results != nullptr ? results->getCount() : 0;
+
+  if (results != nullptr) {
+    for (int i = 0; i < resultCount; i++) {
+      BLEAdvertisedDevice device = results->getDevice(i);
+
+      BleScanRecord record = {};
+      record.scanNumber = bleScanCounter;
+      record.uptimeMs = lastBleScanUptimeMs;
+      record.rssi = device.getRSSI();
+      record.addressType = device.getAddressType();
+
+      String address = device.getAddress().toString();
+      address.toCharArray(record.address, sizeof(record.address));
+
+      if (device.haveName()) {
+        String name = device.getName();
+        if (name.length() > 0) {
+          name.toCharArray(record.name, sizeof(record.name));
+          record.named = true;
+        }
+      }
+
+      appendBleScanRecord(record);
+    }
+  }
+
+  scan->clearResults();
+
+  bleStatusMessage =
+    "BLE scan #" + String(bleScanCounter) +
+    " complete: " + String(resultCount) +
+    " device(s) observed.";
+
+  return resultCount;
+}
+
 void printPadded(const String& value, int width) {
   String output = value;
 
   if (output.length() > width) {
-    if (width > 3) {
-      output = output.substring(0, width - 3) + "...";
-    } else {
-      output = output.substring(0, width);
-    }
+    if (width > 3) output = output.substring(0, width - 3) + "...";
+    else output = output.substring(0, width);
   }
 
   Serial.print(output);
-
-  for (int i = output.length(); i < width; i++) {
-    Serial.print(' ');
-  }
+  for (int i = output.length(); i < width; i++) Serial.print(' ');
 }
 
 
 // ============================================================
+// Wi-Fi credential storage// ============================================================
 // Wi-Fi credential storage
 // ============================================================
 
@@ -1183,7 +1283,32 @@ void printMacAddress() {
 
 
 // ============================================================
+// Firmware information
+// ============================================================
+
+String firmwareBuildTimestamp() {
+  return String(__DATE__) + " " + String(__TIME__);
+}
+
+void printFirmwareInfo() {
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" Firmware Information");
+  Serial.println("================================");
+  Serial.print("File:       ");
+  Serial.println(FIRMWARE_FILE);
+  Serial.print("Version:    ");
+  Serial.println(FIRMWARE_VERSION);
+  Serial.print("Built:      ");
+  Serial.println(firmwareBuildTimestamp());
+  Serial.println();
+}
+
+
+// ============================================================
 // HTML helpers
+// ============================================================
+
 // ============================================================
 
 String htmlEscape(const String& input) {
@@ -1392,6 +1517,26 @@ String pageStyles() {
     margin-top: 12px;
   }
 
+  .settings-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 14px;
+    margin-top: 12px;
+  }
+
+  .checkbox-stack {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 8px;
+    padding-bottom: 2px;
+  }
+
+  .checkbox-stack label {
+    white-space: nowrap;
+  }
+
   .control {
     display: flex;
     flex-direction: column;
@@ -1550,6 +1695,15 @@ void handleRoot() {
 
     <div class="card">
 
+      <h2>Firmware</h2>
+      <div class="row"><span class="label">File</span><span class="value">%FW_FILE%</span></div>
+      <div class="row"><span class="label">Version</span><span class="value">%FW_VERSION%</span></div>
+      <div class="row"><span class="label">Built</span><span class="value">%FW_BUILD%</span></div>
+
+    </div>
+
+    <div class="card">
+
       <h2>Access Point</h2>
 
       <div class="row">
@@ -1571,6 +1725,19 @@ void handleRoot() {
         <span class="label">AP Clients</span>
         <span class="value">%AP_CLIENTS%</span>
       </div>
+
+    </div>
+
+    <div class="card">
+
+      <h2>System Resources</h2>
+      <div class="row"><span class="label">Free Heap</span><span class="value">%FREE_HEAP%</span></div>
+      <div class="row"><span class="label">Largest Free Block</span><span class="value">%LARGEST_BLOCK%</span></div>
+      <div class="row"><span class="label">Minimum Free Heap</span><span class="value">%MIN_HEAP%</span></div>
+      <div class="row"><span class="label">Wi-Fi History RAM</span><span class="value">%WIFI_RAM%</span></div>
+      <div class="row"><span class="label">BLE History RAM</span><span class="value">%BLE_RAM%</span></div>
+      <div class="row"><span class="label">Wi-Fi Records</span><span class="value">%WIFI_RECORDS%</span></div>
+      <div class="row"><span class="label">BLE Records</span><span class="value">%BLE_RECORDS%</span></div>
 
     </div>
 
@@ -1603,6 +1770,16 @@ void handleRoot() {
   html.replace("%AP_SSID%", htmlEscape(apSSID));
   html.replace("%AP_IP%", htmlEscape(apIpText));
   html.replace("%AP_CLIENTS%", htmlEscape(apClientsText));
+  html.replace("%FW_FILE%", htmlEscape(String(FIRMWARE_FILE)));
+  html.replace("%FW_VERSION%", htmlEscape(String(FIRMWARE_VERSION)));
+  html.replace("%FW_BUILD%", htmlEscape(firmwareBuildTimestamp()));
+  html.replace("%FREE_HEAP%", String(ESP.getFreeHeap() / 1024.0, 1) + " KB");
+  html.replace("%LARGEST_BLOCK%", String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0, 1) + " KB");
+  html.replace("%MIN_HEAP%", String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB");
+  html.replace("%WIFI_RAM%", String((scanHistoryCapacity * sizeof(ScanRecord)) / 1024.0, 1) + " KB");
+  html.replace("%BLE_RAM%", String((bleHistoryCapacity * sizeof(BleScanRecord)) / 1024.0, 1) + " KB");
+  html.replace("%WIFI_RECORDS%", String(historyCount) + " / " + String(scanHistoryCapacity));
+  html.replace("%BLE_RECORDS%", String(bleHistoryCount) + " / " + String(bleHistoryCapacity));
 
   server.send(200, "text/html", html);
 }
@@ -2373,32 +2550,21 @@ void handleWebScan() {
 
   loggingCard +=
     "</span></div>"
-    "<form class=\"controls\" action=\"/scan-settings\" method=\"get\">"
-    "<div class=\"control\">"
-    "<label for=\"interval\">Interval (seconds)</label>"
-    "<input id=\"interval\" name=\"interval\" type=\"number\" "
-    "min=\"5\" max=\"3600\" value=\"";
+    "<form class=\"settings-row\" action=\"/scan-settings\" method=\"get\">"
+    "<div class=\"control\"><label for=\"interval\">Interval (seconds)</label>"
+    "<input id=\"interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"";
   loggingCard += String(scanIntervalSeconds);
   loggingCard +=
     "\"></div>"
-    "<div class=\"control\">"
-    "<label for=\"history\">History limit (records)</label>"
-    "<input id=\"history\" name=\"history\" type=\"number\" "
-    "min=\"50\" max=\"2000\" value=\"";
+    "<div class=\"control\"><label for=\"history\">History limit (records)</label>"
+    "<input id=\"history\" name=\"history\" type=\"number\" min=\"50\" max=\"2000\" value=\"";
   loggingCard += String(scanHistoryCapacity);
   loggingCard +=
     "\"></div>"
-    "<div class=\"control\"><label>"
-    "<input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> "
-    "Clear history before resizing"
-    "</label></div>"
-    "<div class=\"control\"><label>"
-    "<input type=\"checkbox\" name=\"auto\" value=\"1\"";
-
-  if (autoScanEnabled) {
-    loggingCard += " checked";
-  }
-
+    "<div class=\"checkbox-stack\">"
+    "<label><input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> Clear history before resizing</label>"
+    "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
+  if (autoScanEnabled) loggingCard += " checked";
   loggingCard +=
     "> Automatic scanning</label></div>"
     "<button type=\"submit\">Apply</button></form>"
@@ -2509,17 +2675,150 @@ void handleWebScan() {
 // BLE web survey
 // ============================================================
 
-void sendBleSummaryTable() {
-  if (bleDeviceCount == 0) {
-    server.sendContent(
-      "<p>No BLE devices have been observed yet.</p>"
-    );
+void redirectToBLEPage() {
+  server.sendHeader("Location", "/ble");
+  server.send(303, "text/plain", "");
+}
+
+void handleBLESettings() {
+  if (server.hasArg("interval")) {
+    long requested = server.arg("interval").toInt();
+    if (requested < (long)MIN_SCAN_INTERVAL_SECONDS) requested = MIN_SCAN_INTERVAL_SECONDS;
+    if (requested > (long)MAX_SCAN_INTERVAL_SECONDS) requested = MAX_SCAN_INTERVAL_SECONDS;
+    bleScanIntervalSeconds = (unsigned long)requested;
+  }
+
+  if (server.hasArg("history")) {
+    long requested = server.arg("history").toInt();
+    if (requested < (long)MIN_BLE_HISTORY_RECORDS) requested = MIN_BLE_HISTORY_RECORDS;
+    if (requested > (long)MAX_BLE_HISTORY_RECORDS) requested = MAX_BLE_HISTORY_RECORDS;
+
+    bool clearBeforeResize = server.hasArg("clear_resize");
+
+    if (clearBeforeResize && (size_t)requested != bleHistoryCapacity)
+      clearAndResizeBleHistory((size_t)requested);
+    else
+      resizeBleHistory((size_t)requested, true);
+  }
+
+  autoBleScanEnabled = server.hasArg("auto");
+  lastAutoBleScanMs = millis();
+  redirectToBLEPage();
+}
+
+void handleClearBLEHistory() {
+  clearBleHistory();
+  redirectToBLEPage();
+}
+
+void handleBLEScanCsv() {
+  server.sendHeader("Content-Disposition", "attachment; filename=\"ble_scan_log.csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n");
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    const BleScanRecord& record = bleHistoryRecord(i);
+
+    String line;
+    line.reserve(180);
+    line += String(record.scanNumber) + ",";
+    line += String(record.uptimeMs) + ",";
+    line += csvEscape(formatUptime(record.uptimeMs)) + ",";
+    line += csvEscape(record.named ? String(record.name) : String("")) + ",";
+    line += csvEscape(String(record.address)) + ",";
+    line += csvEscape(bleAddressTypeLabel(record.addressType)) + ",";
+    line += String(record.rssi) + "\r\n";
+    server.sendContent(line);
+  }
+
+  server.sendContent("");
+}
+
+void sendBleRssiHistoryPlot(const String& selectedAddress) {
+  const int SVG_WIDTH = 720, SVG_HEIGHT = 280;
+  const int LEFT = 58, RIGHT = 20, TOP = 20, BOTTOM = 45;
+  const int plotWidth = SVG_WIDTH - LEFT - RIGHT;
+  const int plotHeight = SVG_HEIGHT - TOP - BOTTOM;
+  const int RSSI_TOP = -30, RSSI_BOTTOM = -100;
+
+  uint32_t firstMs = 0, lastMs = 0;
+  size_t pointCount = 0;
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    const BleScanRecord& record = bleHistoryRecord(i);
+    if (!String(record.address).equalsIgnoreCase(selectedAddress)) continue;
+    if (pointCount == 0) firstMs = record.uptimeMs;
+    lastMs = record.uptimeMs;
+    pointCount++;
+  }
+
+  if (pointCount == 0) {
+    server.sendContent("<p>No retained samples for this BLE device.</p>");
     return;
   }
 
-  server.sendContent(
-    "<table id=\"ble-summary\">"
-    "<thead><tr>"
+  if (lastMs <= firstMs) lastMs = firstMs + 1;
+
+  server.sendContent("<div class=\"plot-wrap\"><svg viewBox=\"0 0 720 280\" role=\"img\">"
+    "<rect x=\"58\" y=\"20\" width=\"642\" height=\"215\" fill=\"white\" stroke=\"#bbb\"/>");
+
+  for (int rssi = -100; rssi <= -30; rssi += 10) {
+    int y = TOP + ((RSSI_TOP - rssi) * plotHeight) / (RSSI_TOP - RSSI_BOTTOM);
+    String grid = "<line x1=\"" + String(LEFT) + "\" y1=\"" + String(y) +
+      "\" x2=\"" + String(SVG_WIDTH - RIGHT) + "\" y2=\"" + String(y) +
+      "\" stroke=\"#ddd\"/><text x=\"" + String(LEFT - 8) + "\" y=\"" +
+      String(y + 4) + "\" text-anchor=\"end\" font-size=\"11\">" +
+      String(rssi) + "</text>";
+    server.sendContent(grid);
+  }
+
+  String points;
+  points.reserve(pointCount * 14);
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    const BleScanRecord& record = bleHistoryRecord(i);
+    if (!String(record.address).equalsIgnoreCase(selectedAddress)) continue;
+
+    int x = LEFT + (uint64_t)(record.uptimeMs - firstMs) * plotWidth / (lastMs - firstMs);
+    int clipped = record.rssi;
+    if (clipped > RSSI_TOP) clipped = RSSI_TOP;
+    if (clipped < RSSI_BOTTOM) clipped = RSSI_BOTTOM;
+    int y = TOP + ((RSSI_TOP - clipped) * plotHeight) / (RSSI_TOP - RSSI_BOTTOM);
+
+    if (points.length()) points += " ";
+    points += String(x) + "," + String(y);
+  }
+
+  server.sendContent("<polyline fill=\"none\" stroke=\"#333\" stroke-width=\"2\" points=\"" + points + "\"/>");
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    const BleScanRecord& record = bleHistoryRecord(i);
+    if (!String(record.address).equalsIgnoreCase(selectedAddress)) continue;
+
+    int x = LEFT + (uint64_t)(record.uptimeMs - firstMs) * plotWidth / (lastMs - firstMs);
+    int clipped = record.rssi;
+    if (clipped > RSSI_TOP) clipped = RSSI_TOP;
+    if (clipped < RSSI_BOTTOM) clipped = RSSI_BOTTOM;
+    int y = TOP + ((RSSI_TOP - clipped) * plotHeight) / (RSSI_TOP - RSSI_BOTTOM);
+
+    String dot = "<circle cx=\"" + String(x) + "\" cy=\"" + String(y) +
+      "\" r=\"4\" fill=\"#333\"><title>Scan #" + String(record.scanNumber) +
+      " | " + htmlEscape(formatUptime(record.uptimeMs)) + " | " +
+      String(record.rssi) + " dBm</title></circle>";
+    server.sendContent(dot);
+  }
+
+  server.sendContent("</svg></div>");
+}
+
+void sendBleSummaryTable() {
+  if (bleHistoryCount == 0) {
+    server.sendContent("<p>No BLE devices have been observed yet.</p>");
+    return;
+  }
+
+  server.sendContent("<table id=\"ble-summary\"><thead><tr>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',0,'text')\">Name</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',1,'text')\">Address</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',2,'text')\">Address Type</th>"
@@ -2527,82 +2826,37 @@ void sendBleSummaryTable() {
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',4,'number')\">Min</th>"
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',5,'number')\">Max</th>"
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',6,'number')\">Avg</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',7,'number')\">Seen</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',7,'number')\">Samples</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',8,'number')\">Last Seen</th>"
-    "</tr></thead><tbody>"
-  );
+    "</tr></thead><tbody>");
 
-  for (size_t i = 0; i < bleDeviceCount; i++) {
-    const BLEDeviceSummary& summary =
-        bleDevices[i];
+  for (size_t offset = 0; offset < bleHistoryCount; offset++) {
+    size_t logicalIndex = bleHistoryCount - 1 - offset;
+    const BleScanRecord& newest = bleHistoryRecord(logicalIndex);
+    String address = String(newest.address);
 
-    String displayName =
-        summary.named
-          ? String(summary.name)
-          : "(unnamed)";
+    if (hasNewerBleObservationForAddress(logicalIndex, address)) continue;
 
-    float avgRssi =
-        averageSignal(summary.signal);
+    BLEDeviceSummary summary = {};
+    if (!buildBleDeviceSummary(address, summary)) continue;
+
+    String plotUrl = "/ble?plot=" + urlEncode(address) + "#rssi-plot";
+    String displayName = summary.named ? String(summary.name) : "(unnamed)";
+    float avgRssi = averageSignal(summary.signal);
 
     String row;
     row.reserve(850);
-
     row += "<tr>";
-
-    row += "<td>";
-    row += htmlEscape(displayName);
-    row += "</td>";
-
-    row += "<td>";
-    row += htmlEscape(String(summary.address));
-    row += "</td>";
-
-    row += "<td>";
-    row += htmlEscape(
-      bleAddressTypeLabel(summary.addressType)
-    );
-    row += "</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.latestRssi);
-    row += "\">";
-    row += String(summary.signal.latestRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.minRssi);
-    row += "\">";
-    row += String(summary.signal.minRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.maxRssi);
-    row += "\">";
-    row += String(summary.signal.maxRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(avgRssi, 1);
-    row += "\">";
-    row += String(avgRssi, 1);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.advertisementCount);
-    row += "\">";
-    row += String(summary.advertisementCount);
-    row += "</td>";
-
-    row += "<td data-sort=\"";
-    row += String(summary.signal.lastSeenMs);
-    row += "\">";
-    row += htmlEscape(
-      formatUptime(summary.signal.lastSeenMs)
-    );
-    row += "</td>";
-
+    row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(displayName) + "</a></td>";
+    row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(address) + "</a></td>";
+    row += "<td>" + htmlEscape(bleAddressTypeLabel(summary.addressType)) + "</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.samples) + "\">" + String(summary.signal.samples) + "</td>";
+    row += "<td data-sort=\"" + String(summary.signal.lastSeenMs) + "\">" + htmlEscape(formatUptime(summary.signal.lastSeenMs)) + "</td>";
     row += "</tr>";
-
     server.sendContent(row);
   }
 
@@ -2610,119 +2864,101 @@ void sendBleSummaryTable() {
 }
 
 void handleBLESurvey() {
+  String selectedAddress = "";
+
+  if (server.hasArg("plot")) {
+    String requested = server.arg("plot");
+    requested.trim();
+    if (bleHistoryContainsAddress(requested)) selectedAddress = requested;
+  }
+
+  if (selectedAddress.length() == 0 && bleHistoryCount > 0)
+    selectedAddress = String(bleHistoryRecord(bleHistoryCount - 1).address);
+
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-
-  server.sendContent(
-    "<!DOCTYPE html><html><head>"
-    "<meta charset=\"UTF-8\">"
+  server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    "<title>ESP32 Bluetooth Survey</title>"
-  );
-
+    "<title>ESP32 Bluetooth Survey</title>");
   server.sendContent(pageStyles());
-
-  server.sendContent(
-    "</head><body><div class=\"container\">"
-    "<h1>Bluetooth Survey</h1>"
-    "<div class=\"card\">"
-    "<h2>BLE Scanner</h2>"
-  );
+  server.sendContent("</head><body><div class=\"container\"><h1>Bluetooth Survey</h1>"
+    "<div class=\"card\"><h2>Scan Logging</h2>");
 
   String status;
-  status.reserve(900);
-
-  status +=
-    "<div class=\"row\"><span class=\"label\">Scan Mode</span>"
-    "<span class=\"value\">Manual only</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Duration</span>"
-    "<span class=\"value\">";
-  status += String(BLE_SCAN_DURATION_SECONDS);
-  status +=
-    " seconds</span></div>"
-    "<div class=\"row\"><span class=\"label\">BLE Scans This Session</span>"
-    "<span class=\"value\">";
-  status += String(bleScanCounter);
-  status +=
-    "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Unique BLE Addresses</span>"
-    "<span class=\"value\">";
-  status += String(bleDeviceCount);
-  status +=
-    " / ";
-  status += String(MAX_BLE_DEVICE_SUMMARIES);
-  status +=
-    "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Last BLE Scan</span>"
-    "<span class=\"value\">";
-
-  if (bleScanCounter == 0) {
-    status += "Never";
-  } else {
-    status += htmlEscape(
-      formatUptime(lastBleScanUptimeMs)
-    );
-    status += " uptime";
-  }
-
+  status.reserve(2600);
+  status += "<div class=\"row\"><span class=\"label\">Automatic Scanning</span><span class=\"value\">" +
+    String(autoBleScanEnabled ? "ON" : "OFF") + "</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Scan Interval</span><span class=\"value\">" +
+    String(bleScanIntervalSeconds) + " seconds</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Scans This Session</span><span class=\"value\">" +
+    String(bleScanCounter) + "</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Stored Records</span><span class=\"value\">" +
+    String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + "</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
+    String((bleHistoryCapacity * sizeof(BleScanRecord)) / 1024.0, 1) + " KB</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
+  status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
   status += "</span></div>";
 
-  if (bleStatusMessage.length() > 0) {
-    status += "<div class=\"note\"><strong>";
-    status += htmlEscape(bleStatusMessage);
-    status += "</strong></div>";
-  }
+  status += "<form class=\"settings-row\" action=\"/ble-settings\" method=\"get\">"
+    "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
+    "<input id=\"ble-interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" +
+    String(bleScanIntervalSeconds) + "\"></div>"
+    "<div class=\"control\"><label for=\"ble-history\">History limit (records)</label>"
+    "<input id=\"ble-history\" name=\"history\" type=\"number\" min=\"50\" max=\"2000\" value=\"" +
+    String(bleHistoryCapacity) + "\"></div>"
+    "<div class=\"checkbox-stack\">"
+    "<label><input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> Clear history before resizing</label>"
+    "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
-  status +=
-    "<div class=\"buttons\">"
-    "<a class=\"button\" href=\"/ble-scan\">Scan BLE Now</a>"
-    "<a class=\"button\" href=\"/ble\">Refresh Page</a>"
+  if (autoBleScanEnabled) status += " checked";
+
+  status += "> Automatic scanning</label></div><button type=\"submit\">Apply</button></form>"
+    "<div class=\"buttons\"><a class=\"button\" href=\"/ble-scan\">Scan Now</a>"
+    "<a class=\"button\" href=\"/blelog.csv\">Download CSV</a>"
+    "<a class=\"button\" href=\"/ble-clear\">Clear History</a>"
     "<a class=\"button\" href=\"/scan\">Wi-Fi Survey</a>"
     "<a class=\"button\" href=\"/\">Back to Status</a>"
-    "</div>"
-    "<div class=\"note\">"
-    "This first BLE revision intentionally uses manual scans only. "
-    "Wi-Fi AP+STA operation remains active while BLE scanning is tested "
-    "for coexistence and stability."
-    "</div>"
-    "</div>";
+    "<a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
+    "<div class=\"note\">Automatic BLE scanning defaults to 300 seconds. "
+    "History capacity is auto-sized at boot from available heap.</div>";
 
+  if (bleHistoryResizeMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleHistoryResizeMessage) + "</strong></div>";
+  if (bleStatusMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleStatusMessage) + "</strong></div>";
+
+  status += "</div>";
   server.sendContent(status);
 
-  server.sendContent(
-    "<div class=\"card\"><h2>Observed BLE Devices</h2>"
-    "<div class=\"note\">"
-    "One row is retained per BLE address for this power cycle. "
-    "Repeated manual scans update RSSI statistics and the Seen count. "
-    "Click any column header to sort."
-    "</div>"
-  );
+  server.sendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2>");
 
+  if (selectedAddress.length()) {
+    String selectedName = latestBleNameForAddress(selectedAddress);
+    server.sendContent("<div class=\"row\"><span class=\"label\">Selected Device</span><span class=\"value\">" +
+      htmlEscape(selectedName) + "</span></div><div class=\"row\"><span class=\"label\">BLE Address</span><span class=\"value\">" +
+      htmlEscape(selectedAddress) + "</span></div>");
+    sendBleRssiHistoryPlot(selectedAddress);
+    server.sendContent("<div class=\"note\">Click any device name or address below to redraw this plot.</div>");
+  } else {
+    server.sendContent("<p>No logged BLE devices are available to plot yet.</p>");
+  }
+
+  server.sendContent("</div><div class=\"card\"><h2>Observed BLE Devices</h2>"
+    "<div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
   sendBleSummaryTable();
-
-  server.sendContent(
-    "</div>"
-    "<div class=\"footer\">ESP32 Web Interface</div>"
-  );
-
+  server.sendContent("</div><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
-
-  server.sendContent(
-    "</div></body></html>"
-  );
-
+  server.sendContent("</div></body></html>");
   server.sendContent("");
 }
 
 void handleBLEScanNow() {
-  performManualBLEScan();
-
-  server.sendHeader("Location", "/ble");
-  server.send(303, "text/plain", "");
+  performLoggedBLEScan();
+  redirectToBLEPage();
 }
 
 
 // ============================================================
+// Access point web configuration// ============================================================
 // Access point web configuration
 // ============================================================
 
@@ -2933,6 +3169,9 @@ void startWebServer() {
   server.on("/scanlog.csv", handleScanCsv);
   server.on("/ble", HTTP_GET, handleBLESurvey);
   server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
+  server.on("/ble-settings", HTTP_GET, handleBLESettings);
+  server.on("/ble-clear", HTTP_GET, handleClearBLEHistory);
+  server.on("/blelog.csv", HTTP_GET, handleBLEScanCsv);
   server.on("/ap", HTTP_GET, handleAccessPointSettingsPage);
   server.on("/ap-save", HTTP_POST, handleSaveAccessPointSettings);
 
@@ -3000,8 +3239,9 @@ void printMenu() {
   Serial.println("4 - Clear saved Wi-Fi credentials");
   Serial.println("5 - Restart ESP32");
   Serial.println();
-  Serial.println("mac - Show Wi-Fi MAC address");
-  Serial.println("h   - Show this menu");
+  Serial.println("mac     - Show Wi-Fi MAC address");
+  Serial.println("version - Show firmware information");
+  Serial.println("h       - Show this menu");
   Serial.println();
 
   Serial.print("> ");
@@ -3100,6 +3340,13 @@ void handleSerialCommand() {
     ESP.restart();
   }
 
+  else if (
+    command.equalsIgnoreCase("version") ||
+    command.equalsIgnoreCase("v")
+  ) {
+    printFirmwareInfo();
+  }
+
   else if (command.equalsIgnoreCase("mac")) {
     printMacAddress();
   }
@@ -3131,7 +3378,6 @@ void handleSerialCommand() {
 
 void setup() {
   Serial.begin(115200);
-
   delay(1500);
 
   Serial.println();
@@ -3139,46 +3385,48 @@ void setup() {
   Serial.println("================================");
   Serial.println(" ESP32 Starting");
   Serial.println("================================");
+  Serial.print("Firmware: ");
+  Serial.println(FIRMWARE_FILE);
+  Serial.print("Version:  ");
+  Serial.println(FIRMWARE_VERSION);
+  Serial.print("Built:    ");
+  Serial.println(firmwareBuildTimestamp());
   Serial.println();
 
-  // Allocate the RAM-only scan history buffer.
-  initializeScanHistory();
-
-  // Start the station interface first so the hardware MAC is available
-  // for unique default AP credentials.
   WiFi.mode(WIFI_STA);
   delay(WIFI_STARTUP_SETTLE_MS);
 
   loadAccessPointSettings();
-
-  if (apEnabled) {
-    startAccessPoint();
-  }
+  if (apEnabled) startAccessPoint();
 
   bool connected = connectUsingSavedCredentials();
 
   if (!connected) {
     Serial.println();
     Serial.println("Infrastructure Wi-Fi is not configured or unavailable.");
-
     if (apRunning) {
-      Serial.println(
-        "The ESP32 access point remains available for surveying "
-        "and web configuration."
-      );
+      Serial.println("The ESP32 access point remains available for surveying and web configuration.");
     } else {
-      Serial.println(
-        "Use serial menu option 3 to configure Wi-Fi."
-      );
+      Serial.println("Use serial menu option 3 to configure Wi-Fi.");
     }
   }
 
-  if (
-    WiFi.status() == WL_CONNECTED ||
-    apRunning
-  ) {
-    startWebServer();
-  }
+  // Initialize both radio stacks before sizing history, so the allocator
+  // sees the runtime cost of Wi-Fi + BLE.
+  initializeBLEScanner();
+  initializeAutoSizedHistories();
+
+  Serial.print("Auto-sized Wi-Fi history: ");
+  Serial.print(scanHistoryCapacity);
+  Serial.println(" records");
+  Serial.print("Auto-sized BLE history:   ");
+  Serial.print(bleHistoryCapacity);
+  Serial.println(" records");
+
+  lastAutoScanMs = millis();
+  lastAutoBleScanMs = millis();
+
+  if (WiFi.status() == WL_CONNECTED || apRunning) startWebServer();
 
   printMenu();
 }
@@ -3186,23 +3434,31 @@ void setup() {
 
 // ============================================================
 // Automatic scan service
+
+
+// ============================================================
+// Automatic scan service
 // ============================================================
 
 void serviceAutomaticScan() {
-  if (!autoScanEnabled) {
-    return;
-  }
+  if (!autoScanEnabled) return;
 
   unsigned long intervalMs = scanIntervalSeconds * 1000UL;
-
-  if (millis() - lastAutoScanMs < intervalMs) {
-    return;
-  }
+  if (millis() - lastAutoScanMs < intervalMs) return;
 
   lastAutoScanMs = millis();
-
   performLoggedScan();
   WiFi.scanDelete();
+}
+
+void serviceAutomaticBLEScan() {
+  if (!autoBleScanEnabled) return;
+
+  unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
+  if (millis() - lastAutoBleScanMs < intervalMs) return;
+
+  lastAutoBleScanMs = millis();
+  performLoggedBLEScan();
 }
 
 
@@ -3216,6 +3472,7 @@ void loop() {
   }
 
   serviceAutomaticScan();
+  serviceAutomaticBLEScan();
   handleSerialCommand();
 
   delay(5);
