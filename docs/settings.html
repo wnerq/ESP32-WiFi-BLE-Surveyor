@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+(function(){const v=localStorage.getItem('demo-theme')||'system';document.documentElement.dataset.theme=
+v==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):v;})();
+</script>
+<title>ESP32 Settings — Demo</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body><div class="container"><div class="site-header"><div class="site-title">ESP32 Wireless Surveyor</div>
+<nav class="nav"><a class="" href="index.html">Wi-Fi</a><a class="" href="bluetooth.html">Bluetooth</a><a class="" href="system.html">System</a><a class="active" href="settings.html">Settings</a></nav>
+<select class="theme-select" data-theme-select aria-label="Theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+</div>
+<div class="demo-banner">Documentation demo — simulated data; no ESP32 is connected.</div>
+<h1>Settings</h1>
+<div class="card"><h2>Infrastructure Wi-Fi</h2>
+<div class="row"><span class="label">Status</span><span class="value good">Connected</span></div>
+<div class="row"><span class="label">SSID</span><span class="value">Plant-Controls</span></div>
+<div class="row"><span class="label">IP Address</span><span class="value">192.168.1.83</span></div>
+<form class="settings-row"><div class="control"><label>SSID</label><input value="Plant-Controls"></div><div class="control"><label>Passphrase</label><input type="password" placeholder="Not displayed"></div><button data-demo-action="Save infrastructure Wi-Fi">Save Wi-Fi</button></form>
+<div class="buttons"><a class="button danger" href="#" data-demo-action="Clear saved Wi-Fi credentials">Clear Saved Credentials</a></div>
+</div>
+<div class="card"><h2>Survey Access Point</h2>
+<div class="row"><span class="label">Status</span><span class="value good">Running</span></div>
+<div class="row"><span class="label">SSID</span><span class="value">ESP32-Surveyor-670F2C</span></div>
+<div class="row"><span class="label">AP Address</span><span class="value">192.168.4.1</span></div>
+<div class="settings-row"><div class="control"><label>AP SSID</label><input value="ESP32-Surveyor-670F2C"></div><div class="control"><label>AP Password</label><input type="password" value="survey-demo"></div><div class="checkbox-stack"><label><input type="checkbox" checked> AP enabled</label></div><button data-demo-action="Save AP settings and restart">Save AP Settings & Restart</button></div>
+</div>
+<div class="card"><h2>Survey Modes</h2>
+<div class="row"><span class="label">Bluetooth Survey</span><span class="value">Disabled</span></div>
+<div class="note">Bluetooth is disabled by default to maximize Wi-Fi history. Changing this setting restarts the ESP32 so RAM can be allocated safely at boot.</div>
+<div class="buttons"><a class="button" href="#" data-demo-action="Enable Bluetooth Survey and restart">Enable Bluetooth Survey</a></div>
+</div>
+<div class="card"><h2>Interface</h2>
+<div class="checkbox-stack"><label><input type="checkbox" checked> Status LED enabled</label><label><input type="checkbox" checked> Auto-refresh survey pages after scans</label></div>
+<div class="buttons"><a class="button" href="#" data-demo-action="Save interface settings">Save Interface Settings</a><a class="button secondary" href="#" data-demo-action="LED self-test">Test Status LED</a></div>
+</div>
+<div class="card"><h2>Network Identity</h2>
+<div class="row"><span class="label">Current Hostname</span><span class="value">surveyor</span></div>
+<div class="row"><span class="label">Friendly Address</span><span class="value">http://surveyor.local/</span></div>
+<form class="settings-row"><div class="control"><label>mDNS hostname</label><input value="surveyor" maxlength="32"></div><button data-demo-action="Save hostname and restart">Save Hostname & Restart</button></form>
+<div class="note">IP addresses remain available as a fallback because .local name resolution depends on the client and network.</div>
+</div>
+<div class="card"><h2>Theme</h2><p class="small">The production web UI stores theme selection in the browser. Use the selector in the page header to demonstrate System / Light / Dark modes.</p></div>
+<div class="footer">ESP32 Wireless Surveyor V23 — static demonstration package</div></div><script src="app.js"></script></body></html>

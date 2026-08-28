@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+(function(){const v=localStorage.getItem('demo-theme')||'system';document.documentElement.dataset.theme=
+v==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):v;})();
+</script>
+<title>ESP32 Bluetooth Survey — Demo</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body><div class="container"><div class="site-header"><div class="site-title">ESP32 Wireless Surveyor</div>
+<nav class="nav"><a class="" href="index.html">Wi-Fi</a><a class="active" href="bluetooth.html">Bluetooth</a><a class="" href="system.html">System</a><a class="" href="settings.html">Settings</a></nav>
+<select class="theme-select" data-theme-select aria-label="Theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+</div>
+<div class="demo-banner">Documentation demo — simulated data; no ESP32 is connected.</div>
+<h1>Bluetooth Survey</h1>
+<div class="card"><h2>Scan Logging</h2>
+<p class="note"><strong>Bluetooth Survey is disabled.</strong> The BLE stack is not initialized, leaving substantially more RAM available for Wi-Fi survey history. Enabling Bluetooth saves the setting and restarts the ESP32 so memory can be allocated safely at boot.</p>
+<div class="row"><span class="label">BLE Stack</span><span class="value">Not initialized</span></div>
+<div class="row"><span class="label">BLE History RAM</span><span class="value">0 KB</span></div>
+<div class="buttons" style="justify-content:flex-start"><a class="button" href="#" data-demo-action="Enable Bluetooth Survey and restart">Enable Bluetooth Survey</a></div></div>
+<div class="footer">ESP32 Wireless Surveyor V23 — static demonstration package</div></div><script src="app.js"></script></body></html>
