@@ -1,4 +1,5 @@
-// WifiConnect20 - optional persisted BLE mode, Wi-Fi-first memory allocation, V19 diagnostics
+// WifiConnect21 - compact normalized Wi-Fi history, logical retention limit,
+// relative first/last-seen ages, scan-completion page refresh, optional BLE mode
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -19,8 +20,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect20_ble_optional.ino";
-const char* FIRMWARE_VERSION = "20";
+const char* FIRMWARE_FILE = "WifiConnect21_compact_wifi_history.ino";
+const char* FIRMWARE_VERSION = "21";
 
 
 Preferences preferences;
@@ -52,7 +53,7 @@ String apStatusMessage = "";
 // The same SSID/BSSID may appear in many records with different scan numbers
 // and timestamps, which is useful for signal-strength trending.
 const size_t MIN_SCAN_HISTORY_RECORDS = 50;
-const size_t MAX_SCAN_HISTORY_RECORDS = 2000;
+const size_t MAX_SCAN_HISTORY_RECORDS = 12000;
 const size_t MIN_BLE_HISTORY_RECORDS = 50;
 const size_t MAX_BLE_HISTORY_RECORDS = 2000;
 
@@ -82,6 +83,8 @@ const TickType_t WIFI_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(75);
 const TickType_t BLE_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(125);
 
 
+// ScanRecord remains a synthesized view used by the existing UI/CSV code.
+// V21 no longer stores this 68-byte structure in the history ring.
 struct ScanRecord {
   uint32_t scanNumber;
   uint32_t uptimeMs;
@@ -92,6 +95,31 @@ struct ScanRecord {
   uint8_t authMode;
   bool connected;
   bool hidden;
+};
+
+// Stable attributes are stored once per unique BSSID/AP.
+struct WifiApEntry {
+  char ssid[33];
+  uint8_t bssid[6];
+  uint8_t channel;
+  uint8_t authMode;
+};
+
+// Scan number and timestamp are stored once per scan. Observations reference
+// one of these slots. Slots are recycled only after observations using the
+// old slot have been discarded.
+struct WifiScanMetadata {
+  uint32_t scanNumber;
+  uint32_t uptimeMs;
+};
+
+// Compact recurring measurement. 6 bytes on the classic ESP32 ABI versus
+// 68 bytes for the old flat ScanRecord.
+struct WifiObservation {
+  uint16_t apIndex;
+  uint16_t scanSlot;
+  int8_t rssi;
+  uint8_t reserved;
 };
 
 struct BleScanRecord {
@@ -139,6 +167,11 @@ struct BootHeapCheckpoint {
   uint32_t largestFreeBlock;
 };
 
+// Explicit prototypes for V21 custom types to avoid Arduino 1.8.x auto-prototype ordering issues.
+const WifiObservation& compactHistoryRecord(size_t logicalIndex);
+ScanRecord historyRecord(size_t logicalIndex);
+void appendWifiObservation(const WifiObservation& observation);
+
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
 size_t bootHeapCheckpointCount = 0;
@@ -146,8 +179,9 @@ size_t bootHeapCheckpointCount = 0;
 TimerHandle_t statusLedTimer = nullptr;
 volatile bool statusLedState = false;
 
-ScanRecord* scanHistory = nullptr;
-size_t scanHistoryCapacity = 0;
+WifiObservation* scanHistory = nullptr;
+size_t scanHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
+size_t scanHistoryRetentionLimit = 0;  // Logical user-selected retention limit.
 size_t historyStart = 0;
 size_t historyCount = 0;
 String historyResizeMessage = "";
@@ -156,6 +190,13 @@ uint32_t lastScanUptimeMs = 0;
 bool autoScanEnabled = true;
 unsigned long scanIntervalSeconds = 300;
 unsigned long lastAutoScanMs = 0;
+
+WifiApEntry* wifiApTable = nullptr;
+size_t wifiApTableCapacity = 0;
+size_t wifiApCount = 0;
+WifiScanMetadata* wifiScanMetadata = nullptr;
+size_t wifiScanMetadataCapacity = 0;
+size_t wifiApTableFullDrops = 0;
 
 BleScanRecord* bleHistory = nullptr;
 size_t bleHistoryCapacity = 0;
@@ -545,13 +586,61 @@ void initializeBLEScanner() {
 
 
 // ============================================================
-// Wi-Fi history
+// Wi-Fi compact normalized history (V21)
 // ============================================================
 
-const ScanRecord& historyRecord(size_t logicalIndex) {
+size_t wifiHistoryAllocatedBytes() {
+  return
+    scanHistoryCapacity * sizeof(WifiObservation) +
+    wifiApTableCapacity * sizeof(WifiApEntry) +
+    wifiScanMetadataCapacity * sizeof(WifiScanMetadata);
+}
+
+const WifiObservation& compactHistoryRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (historyStart + logicalIndex) % scanHistoryCapacity;
   return scanHistory[physicalIndex];
+}
+
+void formatBssid(const uint8_t bssid[6], char output[18]) {
+  snprintf(
+    output, 18,
+    "%02X:%02X:%02X:%02X:%02X:%02X",
+    bssid[0], bssid[1], bssid[2],
+    bssid[3], bssid[4], bssid[5]
+  );
+}
+
+ScanRecord historyRecord(size_t logicalIndex) {
+  ScanRecord record = {};
+  if (
+    scanHistory == nullptr ||
+    logicalIndex >= historyCount ||
+    wifiApTable == nullptr ||
+    wifiScanMetadata == nullptr
+  ) return record;
+
+  const WifiObservation& observation = compactHistoryRecord(logicalIndex);
+  if (
+    observation.apIndex >= wifiApCount ||
+    observation.scanSlot >= wifiScanMetadataCapacity
+  ) return record;
+
+  const WifiApEntry& ap = wifiApTable[observation.apIndex];
+  const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
+
+  record.scanNumber = scan.scanNumber;
+  record.uptimeMs = scan.uptimeMs;
+  memcpy(record.ssid, ap.ssid, sizeof(record.ssid));
+  formatBssid(ap.bssid, record.bssid);
+  record.rssi = observation.rssi;
+  record.channel = ap.channel;
+  record.authMode = ap.authMode;
+  record.hidden = (ap.ssid[0] == '\0');
+  record.connected =
+      WiFi.status() == WL_CONNECTED &&
+      WiFi.BSSIDstr().equalsIgnoreCase(String(record.bssid));
+  return record;
 }
 
 size_t countRetainedScanGroups() {
@@ -562,132 +651,88 @@ size_t countRetainedScanGroups() {
   bool havePrevious = false;
 
   for (size_t i = 0; i < historyCount; i++) {
-    uint32_t currentScan = historyRecord(i).scanNumber;
-
-    if (!havePrevious || currentScan != previousScan) {
+    ScanRecord current = historyRecord(i);
+    if (!havePrevious || current.scanNumber != previousScan) {
       groups++;
-      previousScan = currentScan;
+      previousScan = current.scanNumber;
       havePrevious = true;
     }
   }
   return groups;
 }
 
-bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
-  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS)
-    requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
-  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS)
-    requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
+void discardOldestWifiObservation() {
+  if (historyCount == 0 || scanHistoryCapacity == 0) return;
+  historyStart = (historyStart + 1) % scanHistoryCapacity;
+  historyCount--;
+}
 
-  if (scanHistory != nullptr && requestedCapacity == scanHistoryCapacity) {
-    historyResizeMessage =
-      "History limit unchanged at " +
-      String(scanHistoryCapacity) + " records.";
-    return true;
+void discardObservationsForScanSlot(uint16_t scanSlot) {
+  // Observations are chronological. Any observation using a metadata slot that
+  // is about to be recycled belongs to the oldest retained scan using it.
+  while (historyCount > 0) {
+    const WifiObservation& oldest = compactHistoryRecord(0);
+    if (oldest.scanSlot != scanSlot) break;
+    discardOldestWifiObservation();
   }
+}
 
-  ScanRecord* newHistory =
-      (ScanRecord*)malloc(requestedCapacity * sizeof(ScanRecord));
-
-  if (newHistory == nullptr) {
-    historyResizeMessage =
-      "Unable to allocate " +
-      String(requestedCapacity) +
-      " records; previous limit retained.";
+bool setWifiRetentionLimit(size_t requestedLimit) {
+  if (scanHistory == nullptr || scanHistoryCapacity == 0) {
+    historyResizeMessage = "Wi-Fi history storage is not allocated.";
     return false;
   }
 
-  size_t recordsToKeep = 0;
+  if (requestedLimit < MIN_SCAN_HISTORY_RECORDS)
+    requestedLimit = MIN_SCAN_HISTORY_RECORDS;
+  if (requestedLimit > scanHistoryCapacity)
+    requestedLimit = scanHistoryCapacity;
 
-  if (preserveRecords && scanHistory != nullptr && historyCount > 0) {
-    recordsToKeep =
-      historyCount < requestedCapacity ? historyCount : requestedCapacity;
-    size_t first = historyCount - recordsToKeep;
-
-    for (size_t i = 0; i < recordsToKeep; i++)
-      newHistory[i] = historyRecord(first + i);
-  }
-
-  if (scanHistory != nullptr) free(scanHistory);
-
-  scanHistory = newHistory;
-  scanHistoryCapacity = requestedCapacity;
-  historyStart = 0;
-  historyCount = recordsToKeep;
+  scanHistoryRetentionLimit = requestedLimit;
+  while (historyCount > scanHistoryRetentionLimit)
+    discardOldestWifiObservation();
 
   historyResizeMessage =
-    "History limit set to " +
-    String(scanHistoryCapacity) + " records.";
-
+    "Retention limit set to " +
+    String(scanHistoryRetentionLimit) +
+    " observations. Physical capacity remains " +
+    String(scanHistoryCapacity) + ".";
   return true;
 }
 
+// Compatibility wrapper: V21 no longer reallocates the history buffer at
+// runtime. Web changes alter only the logical retention limit.
+bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
+  (void)preserveRecords;
+  return setWifiRetentionLimit(requestedCapacity);
+}
+
 bool clearAndResizeScanHistory(size_t requestedCapacity) {
-  if (requestedCapacity < MIN_SCAN_HISTORY_RECORDS)
-    requestedCapacity = MIN_SCAN_HISTORY_RECORDS;
-  if (requestedCapacity > MAX_SCAN_HISTORY_RECORDS)
-    requestedCapacity = MAX_SCAN_HISTORY_RECORDS;
-
-  size_t previousCapacity = scanHistoryCapacity;
-
-  if (scanHistory != nullptr) {
-    free(scanHistory);
-    scanHistory = nullptr;
-  }
-
-  scanHistoryCapacity = 0;
   historyStart = 0;
   historyCount = 0;
   scanCounter = 0;
   lastScanUptimeMs = 0;
-
-  ScanRecord* newHistory =
-      (ScanRecord*)malloc(requestedCapacity * sizeof(ScanRecord));
-
-  if (newHistory != nullptr) {
-    scanHistory = newHistory;
-    scanHistoryCapacity = requestedCapacity;
-    historyResizeMessage =
-      "History cleared; limit set to " +
-      String(scanHistoryCapacity) + " records.";
-    return true;
-  }
-
-  size_t fallback =
-      previousCapacity > 0 ? previousCapacity : MIN_SCAN_HISTORY_RECORDS;
-
-  newHistory =
-      (ScanRecord*)malloc(fallback * sizeof(ScanRecord));
-
-  if (newHistory != nullptr) {
-    scanHistory = newHistory;
-    scanHistoryCapacity = fallback;
-    historyResizeMessage =
-      "History cleared, requested resize failed; restored empty " +
-      String(scanHistoryCapacity) + "-record buffer.";
-    return false;
-  }
-
-  historyResizeMessage =
-    "History cleared, but no Wi-Fi history buffer could be allocated.";
-  return false;
+  wifiApCount = 0;
+  wifiApTableFullDrops = 0;
+  if (wifiScanMetadata && wifiScanMetadataCapacity)
+    memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
+  return setWifiRetentionLimit(requestedCapacity);
 }
 
-void appendScanRecord(const ScanRecord& record) {
-  if (scanHistory == nullptr || scanHistoryCapacity == 0) return;
+void appendWifiObservation(const WifiObservation& observation) {
+  if (
+    scanHistory == nullptr ||
+    scanHistoryCapacity == 0 ||
+    scanHistoryRetentionLimit == 0
+  ) return;
 
-  size_t writeIndex;
+  while (historyCount >= scanHistoryRetentionLimit)
+    discardOldestWifiObservation();
 
-  if (historyCount < scanHistoryCapacity) {
-    writeIndex =
+  size_t writeIndex =
       (historyStart + historyCount) % scanHistoryCapacity;
-    historyCount++;
-  } else {
-    writeIndex = historyStart;
-    historyStart = (historyStart + 1) % scanHistoryCapacity;
-  }
-
-  scanHistory[writeIndex] = record;
+  scanHistory[writeIndex] = observation;
+  historyCount++;
 }
 
 void clearScanHistory() {
@@ -695,13 +740,138 @@ void clearScanHistory() {
   historyCount = 0;
   scanCounter = 0;
   lastScanUptimeMs = 0;
+  wifiApCount = 0;
+  wifiApTableFullDrops = 0;
+  if (wifiScanMetadata && wifiScanMetadataCapacity)
+    memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
+}
+
+int findWifiApByBssid(const uint8_t bssid[6]) {
+  for (size_t i = 0; i < wifiApCount; i++) {
+    if (memcmp(wifiApTable[i].bssid, bssid, 6) == 0)
+      return (int)i;
+  }
+  return -1;
+}
+
+bool wifiApIndexIsReferenced(size_t apIndex) {
+  for (size_t i = 0; i < historyCount; i++) {
+    if (compactHistoryRecord(i).apIndex == apIndex) return true;
+  }
+  return false;
+}
+
+int findOrCreateWifiAp(
+  const uint8_t bssid[6],
+  const String& ssid,
+  uint8_t channel,
+  uint8_t authMode
+) {
+  int existing = findWifiApByBssid(bssid);
+
+  if (existing >= 0) {
+    WifiApEntry& ap = wifiApTable[existing];
+
+    if (ap.channel != 0 && ap.channel != channel) {
+      char textBssid[18];
+      formatBssid(bssid, textBssid);
+      Serial.print("Wi-Fi AP channel changed: ");
+      Serial.print(textBssid);
+      Serial.print(" ");
+      Serial.print(ap.channel);
+      Serial.print(" -> ");
+      Serial.println(channel);
+    }
+
+    ssid.toCharArray(ap.ssid, sizeof(ap.ssid));
+    ap.channel = channel;
+    ap.authMode = authMode;
+    return existing;
+  }
+
+  if (wifiApTable == nullptr) {
+    wifiApTableFullDrops++;
+    return -1;
+  }
+
+  size_t targetIndex = wifiApCount;
+  if (wifiApCount >= wifiApTableCapacity) {
+    targetIndex = wifiApTableCapacity;
+    for (size_t i = 0; i < wifiApTableCapacity; i++) {
+      if (!wifiApIndexIsReferenced(i)) {
+        targetIndex = i;
+        break;
+      }
+    }
+    if (targetIndex >= wifiApTableCapacity) {
+      wifiApTableFullDrops++;
+      return -1;
+    }
+  } else {
+    wifiApCount++;
+  }
+
+  WifiApEntry& ap = wifiApTable[targetIndex];
+  memset(&ap, 0, sizeof(ap));
+  ssid.toCharArray(ap.ssid, sizeof(ap.ssid));
+  memcpy(ap.bssid, bssid, 6);
+  ap.channel = channel;
+  ap.authMode = authMode;
+  return (int)targetIndex;
+}
+
+bool initializeCompactWifiHistory(size_t budgetBytes) {
+  // Scale metadata overhead down in BLE mode, where the available Wi-Fi
+  // history budget is intentionally small. Wi-Fi-only mode uses larger tables.
+  size_t apCapacity = budgetBytes >= 24 * 1024 ? 256 : 64;
+  size_t scanCapacity = budgetBytes >= 24 * 1024 ? 1024 : 64;
+
+  size_t metadataBytes =
+      apCapacity * sizeof(WifiApEntry) +
+      scanCapacity * sizeof(WifiScanMetadata);
+
+  size_t observationCapacity = MIN_SCAN_HISTORY_RECORDS;
+  if (budgetBytes > metadataBytes) {
+    observationCapacity =
+        (budgetBytes - metadataBytes) / sizeof(WifiObservation);
+    if (observationCapacity < MIN_SCAN_HISTORY_RECORDS)
+      observationCapacity = MIN_SCAN_HISTORY_RECORDS;
+  }
+  if (observationCapacity > MAX_SCAN_HISTORY_RECORDS)
+    observationCapacity = MAX_SCAN_HISTORY_RECORDS;
+
+  wifiApTable = (WifiApEntry*)calloc(apCapacity, sizeof(WifiApEntry));
+  wifiScanMetadata =
+      (WifiScanMetadata*)calloc(scanCapacity, sizeof(WifiScanMetadata));
+  scanHistory =
+      (WifiObservation*)malloc(observationCapacity * sizeof(WifiObservation));
+
+  if (!wifiApTable || !wifiScanMetadata || !scanHistory) {
+    if (wifiApTable) free(wifiApTable);
+    if (wifiScanMetadata) free(wifiScanMetadata);
+    if (scanHistory) free(scanHistory);
+    wifiApTable = nullptr;
+    wifiScanMetadata = nullptr;
+    scanHistory = nullptr;
+    wifiApTableCapacity = 0;
+    wifiScanMetadataCapacity = 0;
+    scanHistoryCapacity = 0;
+    scanHistoryRetentionLimit = 0;
+    return false;
+  }
+
+  wifiApTableCapacity = apCapacity;
+  wifiScanMetadataCapacity = scanCapacity;
+  scanHistoryCapacity = observationCapacity;
+  scanHistoryRetentionLimit = observationCapacity;
+  historyStart = 0;
+  historyCount = 0;
+  wifiApCount = 0;
+  return true;
 }
 
 int performLoggedScan() {
   ensureWiFiStationMode();
-
-  bool connectedNow = WiFi.status() == WL_CONNECTED;
-  String connectedBSSID = connectedNow ? WiFi.BSSIDstr() : "";
 
   startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
   int networkCount = WiFi.scanNetworks();
@@ -710,34 +880,51 @@ int performLoggedScan() {
   scanCounter++;
   lastScanUptimeMs = millis();
 
+  if (wifiScanMetadata == nullptr || wifiScanMetadataCapacity == 0)
+    return networkCount;
+
+  uint16_t scanSlot =
+      (uint16_t)((scanCounter - 1) % wifiScanMetadataCapacity);
+
+  if (
+    wifiScanMetadata[scanSlot].scanNumber != 0 &&
+    wifiScanMetadata[scanSlot].scanNumber != scanCounter
+  ) {
+    discardObservationsForScanSlot(scanSlot);
+  }
+
+  wifiScanMetadata[scanSlot].scanNumber = scanCounter;
+  wifiScanMetadata[scanSlot].uptimeMs = lastScanUptimeMs;
+
   if (networkCount <= 0) return networkCount;
 
   for (int i = 0; i < networkCount; i++) {
-    ScanRecord record = {};
-    record.scanNumber = scanCounter;
-    record.uptimeMs = lastScanUptimeMs;
+    const uint8_t* rawBssid = WiFi.BSSID(i);
+    if (rawBssid == nullptr) continue;
 
     String ssid = WiFi.SSID(i);
-    String bssid = WiFi.BSSIDstr(i);
+    int apIndex = findOrCreateWifiAp(
+      rawBssid,
+      ssid,
+      (uint8_t)WiFi.channel(i),
+      (uint8_t)WiFi.encryptionType(i)
+    );
 
-    ssid.toCharArray(record.ssid, sizeof(record.ssid));
-    bssid.toCharArray(record.bssid, sizeof(record.bssid));
+    if (apIndex < 0) continue;
 
-    record.rssi = WiFi.RSSI(i);
-    record.channel = WiFi.channel(i);
-    record.authMode = (uint8_t)WiFi.encryptionType(i);
-    record.connected =
-      connectedNow &&
-      connectedBSSID.length() > 0 &&
-      bssid.equalsIgnoreCase(connectedBSSID);
-    record.hidden = (ssid.length() == 0);
+    int rssi = WiFi.RSSI(i);
+    if (rssi < -128) rssi = -128;
+    if (rssi > 127) rssi = 127;
 
-    appendScanRecord(record);
+    WifiObservation observation = {};
+    observation.apIndex = (uint16_t)apIndex;
+    observation.scanSlot = scanSlot;
+    observation.rssi = (int8_t)rssi;
+    appendWifiObservation(observation);
   }
 
   return networkCount;
 }
-
 
 // ============================================================
 // BLE history
@@ -916,23 +1103,23 @@ void initializeAutoSizedHistories() {
       ? freeHeap - HISTORY_HEAP_RESERVE_BYTES
       : 0;
 
-  // When Bluetooth is disabled, all history RAM above the safety reserve is
-  // offered to Wi-Fi. When Bluetooth is enabled, the safe history budget is
-  // divided between Wi-Fi and BLE after the BLE stack has already initialized.
-  size_t wifiBudget =
-      bleSurveyEnabled ? available / 2 : available;
-  size_t bleBudget =
-      bleSurveyEnabled ? available - wifiBudget : 0;
+  size_t wifiBudget = bleSurveyEnabled ? available / 2 : available;
+  size_t bleBudget = bleSurveyEnabled ? available - wifiBudget : 0;
 
-  size_t wifiTarget = capacityForBudget(
-    wifiBudget,
-    sizeof(ScanRecord),
-    MIN_SCAN_HISTORY_RECORDS,
-    MAX_SCAN_HISTORY_RECORDS
-  );
+  // When BLE leaves no budget above the preferred reserve, still provide a
+  // small functional Wi-Fi history footprint comparable to V20's 50 records.
+  size_t minimumCompactBytes =
+      64 * sizeof(WifiApEntry) +
+      64 * sizeof(WifiScanMetadata) +
+      MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
+  if (wifiBudget < minimumCompactBytes)
+    wifiBudget = minimumCompactBytes;
 
-  if (!resizeScanHistory(wifiTarget, false))
-    resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
+  if (!initializeCompactWifiHistory(wifiBudget)) {
+    // Last-resort compact allocation with the minimum practical tables.
+    size_t fallbackBytes = minimumCompactBytes;
+    initializeCompactWifiHistory(fallbackBytes);
+  }
 
   if (bleSurveyEnabled) {
     size_t bleTarget = capacityForBudget(
@@ -1178,7 +1365,7 @@ String retainedWindowLabel(
 String observationAgeLabel(uint32_t observationMs) {
   uint32_t now = millis();
   if (now < observationMs) return "counter wrapped";
-  return formatUptime(now - observationMs);
+  return formatUptime(now - observationMs) + " ago";
 }
 
 
@@ -1958,6 +2145,12 @@ void redirectToScanPage() {
   server.send(303, "text/plain", "");
 }
 
+void handleWifiScanStatus() {
+  String json = "{\"scan\":" + String(scanCounter) +
+                ",\"records\":" + String(historyCount) + "}";
+  server.send(200, "application/json", json);
+}
+
 void handleWebScanNow() {
   performLoggedScan();
   WiFi.scanDelete();
@@ -1981,31 +2174,11 @@ void handleScanSettings() {
 
   if (server.hasArg("history")) {
     long requestedHistory = server.arg("history").toInt();
-
-    if (requestedHistory < (long)MIN_SCAN_HISTORY_RECORDS) {
+    if (requestedHistory < (long)MIN_SCAN_HISTORY_RECORDS)
       requestedHistory = MIN_SCAN_HISTORY_RECORDS;
-    }
-
-    if (requestedHistory > (long)MAX_SCAN_HISTORY_RECORDS) {
-      requestedHistory = MAX_SCAN_HISTORY_RECORDS;
-    }
-
-    bool clearBeforeResize =
-        server.hasArg("clear_resize");
-
-    if (
-      clearBeforeResize &&
-      (size_t)requestedHistory != scanHistoryCapacity
-    ) {
-      clearAndResizeScanHistory(
-        (size_t)requestedHistory
-      );
-    } else {
-      resizeScanHistory(
-        (size_t)requestedHistory,
-        true
-      );
-    }
+    if (requestedHistory > (long)scanHistoryCapacity)
+      requestedHistory = (long)scanHistoryCapacity;
+    setWifiRetentionLimit((size_t)requestedHistory);
   }
 
   autoScanEnabled = server.hasArg("auto");
@@ -2387,7 +2560,8 @@ void sendNetworkSummaryTable() {
     "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',6,'number')\">Avg</th>"
     "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',7,'number')\">Samples</th>"
     "<th class=\"sortable\" onclick=\"sortTable('network-summary',8,'text')\">Security</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('network-summary',9,'number')\">Last Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',9,'number')\">First Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',10,'number')\">Last Seen</th>"
     "</tr></thead><tbody>"
   );
 
@@ -2506,12 +2680,23 @@ void sendNetworkSummaryTable() {
     );
     row += "</td>";
 
+    // Sort by age (smaller = more recent) while displaying relative time.
+    uint32_t nowMs = millis();
+    uint32_t firstAgeMs = nowMs >= summary.signal.firstSeenMs
+        ? nowMs - summary.signal.firstSeenMs : 0;
+    uint32_t lastAgeMs = nowMs >= summary.signal.lastSeenMs
+        ? nowMs - summary.signal.lastSeenMs : 0;
+
     row += "<td data-sort=\"";
-    row += String(summary.signal.lastSeenMs);
+    row += String(firstAgeMs);
     row += "\">";
-    row += htmlEscape(
-      formatUptime(summary.signal.lastSeenMs)
-    );
+    row += htmlEscape(observationAgeLabel(summary.signal.firstSeenMs));
+    row += "</td>";
+
+    row += "<td data-sort=\"";
+    row += String(lastAgeMs);
+    row += "\">";
+    row += htmlEscape(observationAgeLabel(summary.signal.lastSeenMs));
     row += "</td>";
 
     row += "</tr>";
@@ -2827,11 +3012,14 @@ void handleWebScan() {
   loggingCard += String(scanCounter);
   loggingCard +=
     "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Stored Records</span>"
+    "<div class=\"row\"><span class=\"label\">Stored Observations</span>"
     "<span class=\"value\">";
   loggingCard += String(historyCount);
   loggingCard += " / ";
+  loggingCard += String(scanHistoryRetentionLimit);
+  loggingCard += " retained / ";
   loggingCard += String(scanHistoryCapacity);
+  loggingCard += " allocated capacity";
   loggingCard +=
     "</span></div>"
     "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span>"
@@ -2856,12 +3044,26 @@ void handleWebScan() {
   loggingCard +=
     "<div class=\"row\"><span class=\"label\">History RAM</span>"
     "<span class=\"value\">";
-  loggingCard += String(
-    (scanHistoryCapacity * sizeof(ScanRecord)) / 1024.0,
-    1
-  );
+  loggingCard += String(wifiHistoryAllocatedBytes() / 1024.0, 1);
   loggingCard +=
-    " KB</span></div>"
+    " KB total</span></div>"
+    "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">";
+  loggingCard += String((scanHistoryCapacity * sizeof(WifiObservation)) / 1024.0, 1);
+  loggingCard += " KB; ";
+  loggingCard += String(sizeof(WifiObservation));
+  loggingCard += " bytes/observation</span></div>"
+    "<div class=\"row\"><span class=\"label\">AP Table</span><span class=\"value\">";
+  loggingCard += String(wifiApCount);
+  loggingCard += " / ";
+  loggingCard += String(wifiApTableCapacity);
+  loggingCard += " APs; ";
+  loggingCard += String((wifiApTableCapacity * sizeof(WifiApEntry)) / 1024.0, 1);
+  loggingCard += " KB allocated</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Metadata</span><span class=\"value\">";
+  loggingCard += String(wifiScanMetadataCapacity);
+  loggingCard += " slots; ";
+  loggingCard += String((wifiScanMetadataCapacity * sizeof(WifiScanMetadata)) / 1024.0, 1);
+  loggingCard += " KB allocated</span></div>"
     "<div class=\"row\"><span class=\"label\">Free Heap</span>"
     "<span class=\"value\">";
   loggingCard += String(ESP.getFreeHeap() / 1024.0, 1);
@@ -2875,11 +3077,6 @@ void handleWebScan() {
   );
   loggingCard +=
     " KB</span></div>"
-    "<div class=\"row\"><span class=\"label\">Record Size</span>"
-    "<span class=\"value\">";
-  loggingCard += String(sizeof(ScanRecord));
-  loggingCard +=
-    " bytes</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Scan</span>"
     "<span class=\"value\">";
 
@@ -2898,13 +3095,14 @@ void handleWebScan() {
   loggingCard += String(scanIntervalSeconds);
   loggingCard +=
     "\"></div>"
-    "<div class=\"control\"><label for=\"history\">History limit (records)</label>"
-    "<input id=\"history\" name=\"history\" type=\"number\" min=\"50\" max=\"2000\" value=\"";
+    "<div class=\"control\"><label for=\"history\">Retention limit (observations)</label>"
+    "<input id=\"history\" name=\"history\" type=\"number\" min=\"50\" max=\"";
   loggingCard += String(scanHistoryCapacity);
+  loggingCard += "\" value=\"";
+  loggingCard += String(scanHistoryRetentionLimit);
   loggingCard +=
     "\"></div>"
     "<div class=\"checkbox-stack\">"
-    "<label><input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> Clear history before resizing</label>"
     "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
   if (autoScanEnabled) loggingCard += " checked";
   loggingCard +=
@@ -2918,12 +3116,17 @@ void handleWebScan() {
     "</div>"
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
-    "The limit can be changed from 50 to 2000 network observations. "
-    "By default, resizing preserves the newest records, which requires the old "
-    "and new buffers to coexist temporarily. Check 'Clear history before resizing' "
-    "to free the old buffer first and maximize the contiguous memory available. "
-    "When full, the oldest records are overwritten."
+    "V21 allocates the maximum safe compact Wi-Fi history once at boot. "
+    "Changing the retention limit does not reallocate RAM; it only changes how many "
+    "of the allocated observation slots may be retained. When the logical limit is "
+    "full, the oldest observations are discarded."
     "</div>";
+
+  if (wifiApTableFullDrops > 0) {
+    loggingCard += "<div class="note"><strong>Warning:</strong> ";
+    loggingCard += String(wifiApTableFullDrops);
+    loggingCard += " observation(s) were not logged because the unique AP table was full.</div>";
+  }
 
   if (historyResizeMessage.length() > 0) {
     loggingCard += "<div class=\"note\"><strong>";
@@ -3004,6 +3207,29 @@ void handleWebScan() {
 
   sendSortableTableScript();
   sendThemeScript();
+
+  // Poll only for scan sequence changes. Suppress reload while the user is
+  // interacting with a form or after a form value has been edited.
+  String refreshScript =
+    "<script>(function(){"
+    "let scan=" + String(scanCounter) + ";"
+    "let dirty=false;"
+    "document.querySelectorAll('.settings-row input,.settings-row select,.settings-row textarea').forEach(function(e){"
+      "e.addEventListener('input',function(){dirty=true;});"
+      "e.addEventListener('change',function(){dirty=true;});"
+    "});"
+    "setInterval(function(){"
+      "fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
+        "if(s.scan!==scan){"
+          "scan=s.scan;"
+          "var a=document.activeElement;"
+          "var editing=a&&(a.tagName==='INPUT'||a.tagName==='SELECT'||a.tagName==='TEXTAREA');"
+          "if(!dirty&&!editing)location.reload();"
+        "}"
+      "}).catch(function(){});"
+    "},2500);"
+    "})();</script>";
+  server.sendContent(refreshScript);
 
   server.sendContent(
     "</div></body></html>"
@@ -3176,7 +3402,8 @@ void sendBleSummaryTable() {
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',5,'number')\">Max</th>"
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',6,'number')\">Avg</th>"
     "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',7,'number')\">Samples</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',8,'number')\">Last Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',8,'number')\">First Seen</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',9,'number')\">Last Seen</th>"
     "</tr></thead><tbody>");
 
   for (size_t offset = 0; offset < bleHistoryCount; offset++) {
@@ -3204,7 +3431,11 @@ void sendBleSummaryTable() {
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.samples) + "\">" + String(summary.signal.samples) + "</td>";
-    row += "<td data-sort=\"" + String(summary.signal.lastSeenMs) + "\">" + htmlEscape(formatUptime(summary.signal.lastSeenMs)) + "</td>";
+    uint32_t bleNowMs = millis();
+    uint32_t bleFirstAgeMs = bleNowMs >= summary.signal.firstSeenMs ? bleNowMs - summary.signal.firstSeenMs : 0;
+    uint32_t bleLastAgeMs = bleNowMs >= summary.signal.lastSeenMs ? bleNowMs - summary.signal.lastSeenMs : 0;
+    row += "<td data-sort=\"" + String(bleFirstAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.firstSeenMs)) + "</td>";
+    row += "<td data-sort=\"" + String(bleLastAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.lastSeenMs)) + "</td>";
     row += "</tr>";
     server.sendContent(row);
   }
@@ -3408,7 +3639,10 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + " records, " + String(scanHistoryCapacity*sizeof(ScanRecord)/1024.0,1) + " KB allocated</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " physical capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Observation Size</span><span class=\"value\">" + String(sizeof(WifiObservation)) + " bytes (V20 flat record was " + String(sizeof(ScanRecord)) + " bytes)</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + " entries; " + String(wifiApTableCapacity*sizeof(WifiApEntry)/1024.0,1) + " KB allocated</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Metadata</span><span class=\"value\">" + String(wifiScanMetadataCapacity) + " slots; " + String(wifiScanMetadataCapacity*sizeof(WifiScanMetadata)/1024.0,1) + " KB allocated</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Scans</span><span class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>";
   if (historyCount > 0) {
     const ScanRecord& oldestWifi = historyRecord(0);
@@ -3461,7 +3695,11 @@ void handleSystemStatus() {
   } else {
     server.sendContent(selfTestRow("BLE subsystem", "PASS", "disabled by configured survey mode; BLE stack not initialized"));
   }
-  bool wh = scanHistory && scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS && historyCount<=scanHistoryCapacity;
+  bool wh = scanHistory && wifiApTable && wifiScanMetadata &&
+      scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS &&
+      scanHistoryRetentionLimit>=MIN_SCAN_HISTORY_RECORDS &&
+      scanHistoryRetentionLimit<=scanHistoryCapacity &&
+      historyCount<=scanHistoryRetentionLimit;
   bool bh = !bleSurveyEnabled ||
       (bleHistory && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryCount<=bleHistoryCapacity);
   server.sendContent(selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid"));
@@ -3484,7 +3722,7 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V20.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V21.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -3823,6 +4061,7 @@ void startWebServer() {
   server.on("/wifi-save", HTTP_POST, handleSaveStationSettings);
   server.on("/wifi-clear", HTTP_POST, handleClearStationSettings);
   server.on("/scan-now", handleWebScanNow);
+  server.on("/api/wifi/status", HTTP_GET, handleWifiScanStatus);
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
@@ -4100,7 +4339,7 @@ void setup() {
 
   Serial.print("Auto-sized Wi-Fi history: ");
   Serial.print(scanHistoryCapacity);
-  Serial.println(" records");
+  Serial.println(" compact observation slots");
   Serial.print("Auto-sized BLE history:   ");
   if (bleSurveyEnabled) {
     Serial.print(bleHistoryCapacity);
@@ -4115,6 +4354,8 @@ void setup() {
   bool startupFailed =
       !wifiSubsystemInitialized ||
       scanHistory == nullptr ||
+      wifiApTable == nullptr ||
+      wifiScanMetadata == nullptr ||
       (bleSurveyEnabled && (!bleInitialized || bleHistory == nullptr));
 
   bool startupWarning =
