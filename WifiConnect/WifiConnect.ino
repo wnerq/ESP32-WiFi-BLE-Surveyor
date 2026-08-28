@@ -1,4 +1,4 @@
-// WifiConnect27 - non-navigating scan controls, automatic maximum retention, and version-text cleanup
+// WifiConnect28 - streamlined Wi-Fi survey controls and page layout
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect27_ui_control_cleanup.ino";
-const char* FIRMWARE_VERSION = "27";
+const char* FIRMWARE_FILE = "WifiConnect28_survey_ui_cleanup.ino";
+const char* FIRMWARE_VERSION = "28";
 
 
 Preferences preferences;
@@ -239,7 +239,7 @@ size_t historyCount = 0;
 String historyResizeMessage = "";
 uint32_t scanCounter = 0;
 uint32_t lastScanUptimeMs = 0;
-bool autoScanEnabled = true;
+bool autoScanEnabled = true;  // Wi-Fi automatic surveying is intentionally always on.
 unsigned long scanIntervalSeconds = 300;
 unsigned long lastAutoScanMs = 0;
 
@@ -507,6 +507,9 @@ void loadSurveyModeSettings() {
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
+  scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
+  if (scanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS) scanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
+  if (scanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS) scanIntervalSeconds = MAX_SCAN_INTERVAL_SECONDS;
   mdnsHostnameUserConfigured = preferences.isKey("hostname");
   mdnsHostname = normalizedMdnsHostname(preferences.getString("hostname", DEFAULT_MDNS_HOSTNAME));
   preferences.end();
@@ -2176,17 +2179,50 @@ String pageStyles() {
   }
 
   .button {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    min-height: 44px;
     margin: 20px 6px 0 6px;
     padding: 12px 20px;
+    border: 0;
     background: var(--button-bg);
     color: var(--button-text);
     text-decoration: none;
     border-radius: 6px;
+    font: inherit;
+    line-height: 1.2;
+    cursor: pointer;
+    vertical-align: middle;
+  }
+
+  .button:disabled {
+    opacity: 0.65;
+    cursor: default;
   }
 
   .buttons {
     text-align: center;
+  }
+
+  .survey-control-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .survey-control-row .control {
+    margin: 0;
+  }
+
+  .save-state {
+    min-width: 52px;
+    color: var(--muted);
+    font-size: 0.92em;
+    padding-bottom: 10px;
   }
 
   .table-scroll {
@@ -2535,25 +2571,46 @@ void handleLiveUpdatesSetting() {
     String("{\"enabled\":") + (enabled ? "true" : "false") + "}");
 }
 
-void handleScanSettings() {
-  if (server.hasArg("interval")) {
-    long requested = server.arg("interval").toInt();
+bool applyWifiScanIntervalFromRequest() {
+  if (!server.hasArg("interval")) return false;
 
-    if (requested < (long)MIN_SCAN_INTERVAL_SECONDS) {
-      requested = MIN_SCAN_INTERVAL_SECONDS;
-    }
+  long requested = server.arg("interval").toInt();
+  if (requested < (long)MIN_SCAN_INTERVAL_SECONDS)
+    requested = MIN_SCAN_INTERVAL_SECONDS;
+  if (requested > (long)MAX_SCAN_INTERVAL_SECONDS)
+    requested = MAX_SCAN_INTERVAL_SECONDS;
 
-    if (requested > (long)MAX_SCAN_INTERVAL_SECONDS) {
-      requested = MAX_SCAN_INTERVAL_SECONDS;
-    }
-
-    scanIntervalSeconds = (unsigned long)requested;
-  }
-
-  autoScanEnabled = server.hasArg("auto");
+  scanIntervalSeconds = (unsigned long)requested;
   lastAutoScanMs = millis();
 
+  preferences.begin("survey", false);
+  preferences.putULong("wifiInterval", scanIntervalSeconds);
+  preferences.end();
+
+  return true;
+}
+
+void handleScanSettings() {
+  applyWifiScanIntervalFromRequest();
+  autoScanEnabled = true;
   redirectToScanPage();
+}
+
+void handleWifiIntervalSetting() {
+  bool accepted = applyWifiScanIntervalFromRequest();
+  autoScanEnabled = true;
+
+  server.sendHeader("Cache-Control", "no-store");
+  if (!accepted) {
+    server.send(400, "application/json", "{\"saved\":false,\"message\":\"Missing interval\"}");
+    return;
+  }
+
+  server.send(
+    200,
+    "application/json",
+    String("{\"saved\":true,\"interval\":") + String(scanIntervalSeconds) + "}"
+  );
 }
 
 void handleClearScanHistory() {
@@ -3260,16 +3317,16 @@ ChannelAnalysis analyzeLatestWifiScan() {
 
 void sendWifiChannelAnalysis() {
   ChannelAnalysis a = analyzeLatestWifiScan();
-  server.sendContent("<div class=\"card\"><h2>2.4 GHz Channel Analysis</h2>");
+  server.sendContent("<div class=\"card\"><h2>2.4 GHz Observed Channel Interference</h2>");
   if (!a.valid) {
-    server.sendContent("<p>No scan data is available yet.</p><div class=\"note\">This is an advisory interference estimate, not measured airtime utilization.</div></div>");
+    server.sendContent("<p>No scan data is available yet.</p><div class=\"note\">This is an estimate based on observed AP presence and RSSI, not measured airtime utilization or traffic load.</div></div>");
     return;
   }
   String s;
   s.reserve(2600);
   s += "<div class=\"row\"><span class=\"label\">Based On</span><span class=\"value\">Latest scan #" + String(a.scanNumber) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Suggested channel</span><span class=\"value\"><strong>" + String(a.suggestedChannel) + "</strong></span></div>";
-  s += "<div class=\"note\">Suggestion compares channels 1, 6, and 11 using visible AP strength plus co-channel and adjacent-channel overlap. Lower score is preferred. This does not measure actual airtime utilization or non-Wi-Fi interference.</div>";
+  s += "<div class=\"row\"><span class=\"label\">Suggested Channel Based on Observed APs</span><span class=\"value\"><strong>" + String(a.suggestedChannel) + "</strong></span></div>";
+  s += "<div class=\"note\">This estimate compares channels 1, 6, and 11 using visible AP strength plus co-channel and adjacent-channel overlap. Lower score is preferred. It is based only on observed AP presence and RSSI; it does not measure airtime utilization, traffic load, noise floor, retransmissions, or non-Wi-Fi interference.</div>";
   s += "<div class=\"table-scroll\"><table><thead><tr><th>Channel</th><th>APs</th><th>Strongest AP</th><th>Co-channel</th><th>Adjacent</th><th>Total score</th></tr></thead><tbody>";
   for (int ch = 1; ch <= 11; ch++) {
     s += "<tr";
@@ -3374,20 +3431,12 @@ void handleWebScan() {
   }
 
   String loggingCard;
-  loggingCard.reserve(2200);
+  loggingCard.reserve(1800);
 
   loggingCard +=
-    "<div class=\"card\"><h2>Scan Logging</h2>"
-    "<div class=\"row\"><span class=\"label\">Automatic Scanning</span>"
-    "<span class=\"value\">";
-  loggingCard += autoScanEnabled ? "ON" : "OFF";
-  loggingCard +=
-    "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Interval</span>"
-    "<span class=\"value\">";
-  loggingCard += String(scanIntervalSeconds);
-  loggingCard +=
-    " seconds</span></div>"
+    "<div class=\"card\"><h2>Survey Controls</h2>"
+    "<div class=\"row\"><span class=\"label\">Surveying</span>"
+    "<span class=\"value\">Always on</span></div>"
     "<div class=\"row\"><span class=\"label\">Scans This Session</span>"
     "<span class=\"value\">";
   loggingCard += String(scanCounter);
@@ -3397,105 +3446,39 @@ void handleWebScan() {
     "<span class=\"value\">";
   loggingCard += String(historyCount);
   loggingCard += " / ";
-  loggingCard += String(scanHistoryRetentionLimit);
-  loggingCard += " retained / ";
   loggingCard += String(scanHistoryCapacity);
-  loggingCard += " allocated capacity";
   loggingCard +=
-    "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span>"
-    "<span class=\"value\">";
-  loggingCard += String(countRetainedScanGroups());
-  loggingCard += "</span></div>";
-
-  if (historyCount > 0) {
-    const ScanRecord& oldestRetained = historyRecord(0);
-    const ScanRecord& newestRetained = historyRecord(historyCount - 1);
-    loggingCard +=
-      "<div class=\"row\"><span class=\"label\">Oldest Record Age</span>"
-      "<span class=\"value\">" +
-      htmlEscape(observationAgeLabel(oldestRetained.uptimeMs)) +
-      "</span></div>"
-      "<div class=\"row\"><span class=\"label\">Retained Time Window</span>"
-      "<span class=\"value\">" +
-      htmlEscape(retainedWindowLabel(oldestRetained.uptimeMs, newestRetained.uptimeMs)) +
-      "</span></div>";
-  }
-
-  loggingCard +=
-    "<div class=\"row\"><span class=\"label\">History RAM</span>"
-    "<span class=\"value\">";
-  loggingCard += String(wifiHistoryAllocatedBytes() / 1024.0, 1);
-  loggingCard +=
-    " KB total</span></div>"
-    "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">";
-  loggingCard += String((scanHistoryCapacity * sizeof(WifiObservation)) / 1024.0, 1);
-  loggingCard += " KB; ";
-  loggingCard += String(sizeof(WifiObservation));
-  loggingCard += " bytes/observation</span></div>"
-    "<div class=\"row\"><span class=\"label\">AP Table</span><span class=\"value\">";
-  loggingCard += String(wifiApCount);
-  loggingCard += " / ";
-  loggingCard += String(wifiApTableCapacity);
-  loggingCard += " APs; ";
-  loggingCard += String((wifiApTableCapacity * sizeof(WifiApEntry)) / 1024.0, 1);
-  loggingCard += " KB allocated</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Metadata</span><span class=\"value\">";
-  loggingCard += String(wifiScanMetadataCapacity);
-  loggingCard += " slots; ";
-  loggingCard += String((wifiScanMetadataCapacity * sizeof(WifiScanMetadata)) / 1024.0, 1);
-  loggingCard += " KB allocated</span></div>"
-    "<div class=\"row\"><span class=\"label\">Free Heap</span>"
-    "<span class=\"value\">";
-  loggingCard += String(ESP.getFreeHeap() / 1024.0, 1);
-  loggingCard +=
-    " KB</span></div>"
-    "<div class=\"row\"><span class=\"label\">Largest Free Block</span>"
-    "<span class=\"value\">";
-  loggingCard += String(
-    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0,
-    1
-  );
-  loggingCard +=
-    " KB</span></div>"
+    " capacity</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Scan</span>"
     "<span class=\"value\">";
 
   if (scanCounter == 0) {
     loggingCard += "Never";
   } else {
-    loggingCard += htmlEscape(formatUptime(lastScanUptimeMs));
-    loggingCard += " uptime";
+    loggingCard += htmlEscape(observationAgeLabel(lastScanUptimeMs));
   }
 
   loggingCard +=
     "</span></div>"
-    "<form class=\"settings-row\" action=\"/scan-settings\" method=\"get\">"
-    "<div class=\"control\"><label for=\"interval\">Interval (seconds)</label>"
-    "<input id=\"interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"";
+    "<div class=\"survey-control-row\">"
+    "<div class=\"control\"><label for=\"interval\">Scan interval (seconds)</label>"
+    "<input id=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"";
   loggingCard += String(scanIntervalSeconds);
   loggingCard +=
     "\"></div>"
-    "<div class=\"control\"><label>History capacity</label>"
-    "<div class=\"value\">";
-  loggingCard += String(scanHistoryCapacity);
-  loggingCard +=
-    " observations (automatic maximum)</div></div>"
-    "<div class=\"checkbox-stack\">"
-    "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
-  if (autoScanEnabled) loggingCard += " checked";
-  loggingCard +=
-    "> Automatic scanning</label></div>"
-    "<button type=\"submit\">Apply</button></form>"
+    "<span id=\"interval-save-state\" class=\"save-state\"></span>"
+    "</div>"
     "<div class=\"buttons\">"
-    "<button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button><span id=\"wifi-scan-state\" class=\"scan-state\"></span>"
+    "<button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button>"
     "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
     "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
     "<a class=\"button\" href=\"/\">Refresh Page</a>"
     "</div>"
+    "<div id=\"wifi-scan-state\" class=\"scan-state\"></div>"
     "<div class=\"note\">"
-    "Scan history is kept in RAM only and is cleared by reset or power cycle. "
-    "The maximum safe compact Wi-Fi history is allocated once at boot and the full physical capacity is retained.</div>";
+    "Surveying runs automatically whenever the device is operating. "
+    "Changing the interval saves immediately. Scan history is RAM-only and is cleared by reset or power cycle."
+    "</div>";
 
   if (wifiApTableFullDrops > 0) {
     loggingCard += "<div class=\"note\"><strong>Warning:</strong> ";
@@ -3503,17 +3486,8 @@ void handleWebScan() {
     loggingCard += " observation(s) were not logged because the unique AP table was full.</div>";
   }
 
-  if (historyResizeMessage.length() > 0) {
-    loggingCard += "<div class=\"note\"><strong>";
-    loggingCard += htmlEscape(historyResizeMessage);
-    loggingCard += "</strong></div>";
-  }
-
   loggingCard += "</div>";
-
   server.sendContent(loggingCard);
-  sendWifiChannelAnalysis();
-
   server.sendContent(
     "<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2>"
   );
@@ -3576,6 +3550,46 @@ void handleWebScan() {
 
   server.sendContent("</div>");
 
+  String surveyDetails;
+  surveyDetails.reserve(1800);
+  surveyDetails +=
+    "<div class=\"card\"><h2>Survey Details</h2>"
+    "<div class=\"row\"><span class=\"label\">History Capacity</span><span class=\"value\">" +
+    String(scanHistoryCapacity) + " observations (automatic maximum)</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span><span class=\"value\">" +
+    String(countRetainedScanGroups()) + "</span></div>";
+
+  if (historyCount > 0) {
+    const ScanRecord& oldestRetained = historyRecord(0);
+    const ScanRecord& newestRetained = historyRecord(historyCount - 1);
+    surveyDetails +=
+      "<div class=\"row\"><span class=\"label\">Oldest Record Age</span><span class=\"value\">" +
+      htmlEscape(observationAgeLabel(oldestRetained.uptimeMs)) + "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span class=\"value\">" +
+      htmlEscape(retainedWindowLabel(oldestRetained.uptimeMs, newestRetained.uptimeMs)) + "</span></div>";
+  }
+
+  surveyDetails +=
+    "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
+    String(wifiHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>"
+    "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">" +
+    String((scanHistoryCapacity * sizeof(WifiObservation)) / 1024.0, 1) + " KB; " +
+    String(sizeof(WifiObservation)) + " bytes/observation</span></div>"
+    "<div class=\"row\"><span class=\"label\">AP Table</span><span class=\"value\">" +
+    String(wifiApCount) + " / " + String(wifiApTableCapacity) + " APs; " +
+    String((wifiApTableCapacity * sizeof(WifiApEntry)) / 1024.0, 1) + " KB allocated</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Metadata</span><span class=\"value\">" +
+    String(wifiScanMetadataCapacity) + " slots; " +
+    String((wifiScanMetadataCapacity * sizeof(WifiScanMetadata)) / 1024.0, 1) + " KB allocated</span></div>"
+    "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" +
+    String(ESP.getFreeHeap() / 1024.0, 1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" +
+    String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0, 1) + " KB</span></div>"
+    "</div>";
+  server.sendContent(surveyDetails);
+
+  sendWifiChannelAnalysis();
+
   server.sendContent(
     "<div class=\"footer\">ESP32 Web Interface</div>"
   );
@@ -3594,7 +3608,11 @@ void handleWebScan() {
       "let updating=false;"
       "const scanButton=document.getElementById('wifi-scan-now');"
       "const scanState=document.getElementById('wifi-scan-state');"
+      "const intervalInput=document.getElementById('interval');"
+      "const intervalState=document.getElementById('interval-save-state');"
       "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
+      "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
+      "if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Scanning…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
       "async function repaint(){"
         "if(updating)return;updating=true;"
@@ -4200,11 +4218,10 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN",
     initialDone ? (bleSurveyEnabled ? "Wi-Fi and BLE initial scans completed" : "Wi-Fi initial scan completed; Bluetooth Survey disabled")
                 : "one or more required initial scans are still pending"));
-  bool autos = autoScanEnabled &&
-      (!bleSurveyEnabled || autoBleScanEnabled);
+  bool autos = !bleSurveyEnabled || autoBleScanEnabled;
   server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
     autos ? (bleSurveyEnabled ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; Bluetooth Survey disabled")
-          : "one or more enabled automatic scan services are disabled at runtime"));
+          : "BLE automatic scanning is disabled at runtime"));
   server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
     mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
   {
@@ -4636,6 +4653,7 @@ void startWebServer() {
   server.on("/api/wifi/observed", HTTP_GET, handleWifiObservedFragment);
   server.on("/api/wifi/plot", HTTP_GET, handleWifiPlotFragment);
   server.on("/api/live-updates", HTTP_POST, handleLiveUpdatesSetting);
+  server.on("/api/wifi/interval", HTTP_POST, handleWifiIntervalSetting);
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
@@ -4705,8 +4723,7 @@ void printWifiSurveySerial() {
   Serial.println("============================================================");
   Serial.println(" Wi-Fi Survey");
   Serial.println("============================================================");
-  Serial.print("Automatic scanning:  ");
-  Serial.println(autoScanEnabled ? "Enabled" : "Disabled");
+  Serial.println("Automatic scanning:  Always enabled");
   Serial.print("Scan interval:       ");
   Serial.print(scanIntervalSeconds);
   Serial.println(" s");
@@ -4771,9 +4788,7 @@ void printWifiSurveySerial() {
   Serial.println("Wi-Fi commands:");
   Serial.println("  scan                 - Scan now");
   Serial.println("  wclear               - Clear Wi-Fi history");
-  Serial.println("  retention <records>  - Set logical retention limit");
   Serial.println("  interval <seconds>   - Set automatic scan interval");
-  Serial.println("  auto on|off          - Enable/disable automatic Wi-Fi scans");
   Serial.println("  wifi-config          - Configure infrastructure Wi-Fi");
   Serial.println("  wifi-clear           - Clear saved infrastructure credentials");
   Serial.println("  0/back               - Main menu");
@@ -4896,7 +4911,7 @@ void printSoftwareSelfTestsSerial() {
                      scanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS &&
                      (!bleSurveyEnabled || (bleScanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS));
   bool initialDone = !initialWifiScanPending && (!bleSurveyEnabled || !initialBleScanPending);
-  bool autoOk = autoScanEnabled && (!bleSurveyEnabled || autoBleScanEnabled);
+  bool autoOk = !bleSurveyEnabled || autoBleScanEnabled;
   uint32_t selfTestFreeHeap = ESP.getFreeHeap();
   uint32_t selfTestMinHeap = ESP.getMinFreeHeap();
   bool heapOk = bleSurveyEnabled
@@ -4980,11 +4995,16 @@ void handleSerialCommand() {
   if (command.startsWith("interval ")) {
     long n=commandArgument(command,"interval").toInt();
     if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid Wi-Fi interval.");
-    else { scanIntervalSeconds=(unsigned long)n; lastAutoScanMs=millis(); Serial.println("Wi-Fi scan interval updated."); }
+    else {
+      scanIntervalSeconds=(unsigned long)n;
+      lastAutoScanMs=millis();
+      preferences.begin("survey", false);
+      preferences.putULong("wifiInterval", scanIntervalSeconds);
+      preferences.end();
+      Serial.println("Wi-Fi scan interval updated and saved.");
+    }
     printWifiSurveySerial(); return;
   }
-  if (command.equalsIgnoreCase("auto on")) { autoScanEnabled=true; lastAutoScanMs=millis(); Serial.println("Automatic Wi-Fi scanning enabled."); printWifiSurveySerial(); return; }
-  if (command.equalsIgnoreCase("auto off")) { autoScanEnabled=false; Serial.println("Automatic Wi-Fi scanning disabled."); printWifiSurveySerial(); return; }
 
   if (command.equalsIgnoreCase("blescan")) {
     if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled. Use 'ble on' to enable it and restart.");
@@ -5223,7 +5243,7 @@ void serviceInitialSurveyScans() {
 }
 
 void serviceAutomaticScan() {
-  if (!autoScanEnabled || wifiScanInProgress) return;
+  if (wifiScanInProgress) return;
 
   unsigned long intervalMs = scanIntervalSeconds * 1000UL;
   if (millis() - lastAutoScanMs < intervalMs) return;
