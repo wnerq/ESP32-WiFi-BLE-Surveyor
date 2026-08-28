@@ -1,4 +1,4 @@
-// WifiConnect19 - resource diagnostics, status LED, theme first-paint fix, BLE A/B mode
+// WifiConnect20 - optional persisted BLE mode, Wi-Fi-first memory allocation, V19 diagnostics
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -6,6 +6,8 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
+#include <esp_partition.h>
+#include <esp_ota_ops.h>
 #include <esp_arduino_version.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
@@ -17,8 +19,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect19_resource_diagnostics_led_theme.ino";
-const char* FIRMWARE_VERSION = "19";
+const char* FIRMWARE_FILE = "WifiConnect20_ble_optional.ino";
+const char* FIRMWARE_VERSION = "20";
 
 
 Preferences preferences;
@@ -63,9 +65,11 @@ const unsigned long INITIAL_WIFI_SCAN_DELAY_MS = 2500;
 const unsigned long INITIAL_BLE_SCAN_DELAY_MS = 9000;
 const size_t HEAP_WARN_BYTES = 48 * 1024;
 
-// V19 A/B memory diagnostic. Set false and rebuild to measure the complete
-// runtime RAM recovered when the BLE stack is never initialized.
-const bool BLE_SURVEY_ENABLED_AT_BOOT = true;
+// V20 Wi-Fi-first operating mode. Bluetooth is disabled by default and the
+// preference is stored in NVS. Changing the setting from the web UI triggers
+// a controlled restart so BLE is either fully initialized before history
+// allocation or never initialized at all.
+bool bleSurveyEnabled = false;
 
 // Common ESP32 DEVKITV1 boards expose a controllable blue LED on GPIO2.
 // The red LED found on many boards is a hard-wired power LED and cannot be
@@ -175,7 +179,7 @@ size_t bootBleHistoryCapacity = 0;
 
 
 // ============================================================
-// V19 boot/resource diagnostics and status LED
+// V19/V20 boot/resource diagnostics and status LED
 // ============================================================
 
 void captureBootHeapCheckpoint(const char* stage) {
@@ -358,6 +362,18 @@ void saveAccessPointSettings(
   preferences.end();
 }
 
+void loadSurveyModeSettings() {
+  preferences.begin("survey", true);
+  bleSurveyEnabled = preferences.getBool("bleEnabled", false);
+  preferences.end();
+}
+
+void saveBleSurveyEnabled(bool enabled) {
+  preferences.begin("survey", false);
+  preferences.putBool("bleEnabled", enabled);
+  preferences.end();
+}
+
 void ensureWiFiStationMode() {
   wifi_mode_t currentMode = WiFi.getMode();
 
@@ -519,7 +535,7 @@ String bleAddressTypeLabel(uint8_t addressType) {
 }
 
 void initializeBLEScanner() {
-  if (!BLE_SURVEY_ENABLED_AT_BOOT || bleInitialized) return;
+  if (!bleSurveyEnabled || bleInitialized) return;
 
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
@@ -900,14 +916,13 @@ void initializeAutoSizedHistories() {
       ? freeHeap - HISTORY_HEAP_RESERVE_BYTES
       : 0;
 
-  // In normal Wi-Fi + BLE mode, preserve the V18 50/50 policy so the A/B
-  // comparison isolates the cost of disabling BLE rather than also changing
-  // allocation policy. In Wi-Fi-only mode, all safe history budget is offered
-  // to Wi-Fi and no BLE history buffer is allocated.
+  // When Bluetooth is disabled, all history RAM above the safety reserve is
+  // offered to Wi-Fi. When Bluetooth is enabled, the safe history budget is
+  // divided between Wi-Fi and BLE after the BLE stack has already initialized.
   size_t wifiBudget =
-      BLE_SURVEY_ENABLED_AT_BOOT ? available / 2 : available;
+      bleSurveyEnabled ? available / 2 : available;
   size_t bleBudget =
-      BLE_SURVEY_ENABLED_AT_BOOT ? available - wifiBudget : 0;
+      bleSurveyEnabled ? available - wifiBudget : 0;
 
   size_t wifiTarget = capacityForBudget(
     wifiBudget,
@@ -919,7 +934,7 @@ void initializeAutoSizedHistories() {
   if (!resizeScanHistory(wifiTarget, false))
     resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
 
-  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (bleSurveyEnabled) {
     size_t bleTarget = capacityForBudget(
       bleBudget,
       sizeof(BleScanRecord),
@@ -1007,9 +1022,9 @@ bool buildBleDeviceSummary(
 }
 
 int performLoggedBLEScan() {
-  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (!bleSurveyEnabled) {
     bleStatusMessage =
-      "BLE surveying is disabled at boot for V19 memory A/B testing.";
+      "Bluetooth Survey is disabled; BLE stack is not initialized.";
     return -1;
   }
 
@@ -3008,7 +3023,7 @@ void redirectToBLEPage() {
 }
 
 void handleBLESettings() {
-  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (!bleSurveyEnabled) {
     bleStatusMessage =
       "BLE settings are unavailable because BLE is disabled at boot.";
     redirectToBLEPage();
@@ -3221,13 +3236,16 @@ void handleBLESurvey() {
   server.sendContent("<h1>Bluetooth Survey</h1>"
     "<div class=\"card\"><h2>Scan Logging</h2>");
 
-  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (!bleSurveyEnabled) {
     server.sendContent(
-      "<div class=\"note\"><strong>BLE surveying is disabled in this V19 build.</strong> "
-      "The BLE stack was intentionally not initialized so System diagnostics can measure a clean Wi-Fi-only memory baseline. "
-      "Set BLE_SURVEY_ENABLED_AT_BOOT to true and rebuild to restore Bluetooth surveying.</div>"
+      "<div class=\"note\"><strong>Bluetooth Survey is disabled.</strong> "
+      "The BLE stack is not initialized, leaving substantially more RAM available for Wi-Fi survey history. "
+      "Enabling Bluetooth saves the setting and restarts the ESP32 so memory can be allocated safely at boot.</div>"
       "<div class=\"row\"><span class=\"label\">BLE Stack</span><span class=\"value\">Not initialized</span></div>"
       "<div class=\"row\"><span class=\"label\">BLE History RAM</span><span class=\"value\">0 KB</span></div>"
+      "<form class=\"controls\" action=\"/ble-mode\" method=\"post\">"
+      "<input type=\"hidden\" name=\"enabled\" value=\"1\">"
+      "<button type=\"submit\">Enable Bluetooth Survey</button></form>"
       "</div><div class=\"footer\">ESP32 Web Interface</div>");
     sendThemeScript();
     server.sendContent("</div></body></html>");
@@ -3302,9 +3320,9 @@ void handleBLESurvey() {
 }
 
 void handleBLEScanNow() {
-  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (!bleSurveyEnabled) {
     bleStatusMessage =
-      "BLE scan not started because BLE is disabled at boot in this V19 build.";
+      "BLE scan not started because Bluetooth Survey is disabled in Settings.";
     redirectToBLEPage();
     return;
   }
@@ -3381,7 +3399,11 @@ void handleSystemStatus() {
   s += "<div class=\"card\"><h2>Flash & Memory</h2>";
   s += "<div class=\"row\"><span class=\"label\">Flash Size</span><span class=\"value\">" + String(ESP.getFlashChipSize()/1024.0/1024.0, 2) + " MB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Sketch Size</span><span class=\"value\">" + String(ESP.getSketchSize()/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Free App Space</span><span class=\"value\">" + String(ESP.getFreeSketchSpace()/1024.0, 1) + " KB</span></div>";
+  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+  size_t appPartitionBytes = runningPartition ? runningPartition->size : 0;
+  size_t unusedAppBytes = appPartitionBytes > ESP.getSketchSize() ? appPartitionBytes - ESP.getSketchSize() : 0;
+  s += "<div class=\"row\"><span class=\"label\">App Partition Size</span><span class=\"value\">" + String(appPartitionBytes/1024.0, 1) + " KB</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Unused App Partition</span><span class=\"value\">" + String(unusedAppBytes/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Heap Size</span><span class=\"value\">" + String(ESP.getHeapSize()/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
@@ -3394,7 +3416,7 @@ void handleSystemStatus() {
     s += "<div class=\"row\"><span class=\"label\">Wi-Fi Oldest Record Age</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldestWifi.uptimeMs)) + "</span></div>";
     s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestWifi.uptimeMs, newestWifi.uptimeMs)) + "</span></div>";
   }
-  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (bleSurveyEnabled) {
     s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + " records, " + String(bleHistoryCapacity*sizeof(BleScanRecord)/1024.0,1) + " KB allocated</span></div>";
     s += "<div class=\"row\"><span class=\"label\">BLE Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>";
     if (bleHistoryCount > 0) {
@@ -3415,7 +3437,7 @@ void handleSystemStatus() {
   if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(BLE_SURVEY_ENABLED_AT_BOOT ? "Enabled" : "Disabled (Wi-Fi-only A/B test)") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled (maximum Wi-Fi history)") + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_ENABLED ? String("GPIO ") + String(STATUS_LED_PIN) : String("Disabled")) + "</span></div></div>";
   server.sendContent(s);
 
@@ -3434,35 +3456,35 @@ void handleSystemStatus() {
 
   server.sendContent("<div class=\"card\"><h2>Software Self-Tests</h2>");
   server.sendContent(selfTestRow("Wi-Fi subsystem", wifiSubsystemInitialized ? "PASS" : "FAIL", wifiSubsystemInitialized ? "initialized" : "not initialized"));
-  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (bleSurveyEnabled) {
     server.sendContent(selfTestRow("BLE subsystem", bleInitialized ? "PASS" : "FAIL", bleInitialized ? "initialized" : "not initialized"));
   } else {
-    server.sendContent(selfTestRow("BLE subsystem", "PASS", "intentionally disabled at boot for memory A/B testing"));
+    server.sendContent(selfTestRow("BLE subsystem", "PASS", "disabled by configured survey mode; BLE stack not initialized"));
   }
   bool wh = scanHistory && scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS && historyCount<=scanHistoryCapacity;
-  bool bh = !BLE_SURVEY_ENABLED_AT_BOOT ||
+  bool bh = !bleSurveyEnabled ||
       (bleHistory && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryCount<=bleHistoryCapacity);
   server.sendContent(selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid"));
   server.sendContent(selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL",
-    !BLE_SURVEY_ENABLED_AT_BOOT ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid")));
+    !bleSurveyEnabled ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid")));
   bool cfg = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS &&
-      (!BLE_SURVEY_ENABLED_AT_BOOT || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
+      (!bleSurveyEnabled || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
   server.sendContent(selfTestRow("Scan configuration", cfg ? "PASS" : "FAIL", cfg ? "enabled survey intervals within valid range" : "one or more values out of range"));
   bool initialDone = !initialWifiScanPending &&
-      (!BLE_SURVEY_ENABLED_AT_BOOT || !initialBleScanPending);
+      (!bleSurveyEnabled || !initialBleScanPending);
   server.sendContent(selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN",
-    initialDone ? (BLE_SURVEY_ENABLED_AT_BOOT ? "Wi-Fi and BLE initial scans completed" : "Wi-Fi initial scan completed; BLE intentionally disabled")
+    initialDone ? (bleSurveyEnabled ? "Wi-Fi and BLE initial scans completed" : "Wi-Fi initial scan completed; Bluetooth Survey disabled")
                 : "one or more required initial scans are still pending"));
   bool autos = autoScanEnabled &&
-      (!BLE_SURVEY_ENABLED_AT_BOOT || autoBleScanEnabled);
+      (!bleSurveyEnabled || autoBleScanEnabled);
   server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
-    autos ? (BLE_SURVEY_ENABLED_AT_BOOT ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; BLE intentionally disabled")
+    autos ? (bleSurveyEnabled ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; Bluetooth Survey disabled")
           : "one or more enabled automatic scan services are disabled at runtime"));
   server.sendContent(selfTestRow("Heap reserve", freeHeap>=HEAP_WARN_BYTES ? "PASS" : "WARN", String(freeHeap/1024) + " KB free"));
-  server.sendContent(selfTestRow("Application space", ESP.getFreeSketchSpace()>64*1024 ? "PASS" : "WARN", String(ESP.getFreeSketchSpace()/1024) + " KB free app space"));
+  server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V19.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V20.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -3489,13 +3511,16 @@ void handleSettingsPage() {
   s += "<form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>";
   s += "<div class=\"note\">The stored infrastructure passphrase is never displayed. A connection must succeed before new credentials are saved. Infrastructure Wi-Fi is optional; failed or absent infrastructure connectivity does not stop surveying.</div></div>";
   s += "<div class=\"card\"><h2>Survey Access Point</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div><div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div><div class=\"buttons\"><a class=\"button\" href=\"/ap\">Access Point Settings</a></div></div>";
-  s += "<div class=\"card\"><h2>Survey Build Options</h2>"
-    "<div class=\"row\"><span class=\"label\">BLE at Boot</span><span class=\"value\">" +
-    String(BLE_SURVEY_ENABLED_AT_BOOT ? "Enabled" : "Disabled - Wi-Fi-only A/B build") + "</span></div>"
+  s += "<div class=\"card\"><h2>Survey Mode</h2>"
+    "<div class=\"row\"><span class=\"label\">Bluetooth Survey</span><span class=\"value\">" +
+    String(bleSurveyEnabled ? "Enabled" : "Disabled - maximum Wi-Fi history") + "</span></div>"
+    "<form class=\"controls\" action=\"/ble-mode\" method=\"post\">"
+    "<input type=\"hidden\" name=\"enabled\" value=\"" + String(bleSurveyEnabled ? "0" : "1") + "\">"
+    "<button type=\"submit\">" + String(bleSurveyEnabled ? "Disable Bluetooth Survey" : "Enable Bluetooth Survey") + "</button></form>"
+    "<div class=\"note\">Bluetooth is disabled by default to maximize Wi-Fi history depth. Changing this setting is stored in NVS and restarts the ESP32. "
+    "The restart is intentional: BLE uses a large persistent heap allocation, so survey histories must be sized after the selected radio mode is established.</div>"
     "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" +
-    String(STATUS_LED_ENABLED ? "GPIO 2 enabled" : "Disabled") + "</span></div>"
-    "<div class=\"note\">For a clean BLE memory A/B comparison, change BLE_SURVEY_ENABLED_AT_BOOT near the top of the sketch and rebuild. "
-    "Disabling BLE at runtime after initialization would not reclaim the full BLE stack allocation and would give a misleading comparison.</div></div>";
+    String(STATUS_LED_ENABLED ? "GPIO 2 enabled" : "Disabled") + "</span></div></div>";
   s += "<div class=\"card\"><h2>Interface</h2><div class=\"note\">Theme selection is browser-local and is applied in the page head before CSS to avoid a light-theme flash during refresh. Survey interval and history settings remain session-only and are configured on their respective survey pages.</div></div>";
   server.sendContent(s);
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
@@ -3520,6 +3545,32 @@ void handleSaveStationSettings() {
   if (connected) saveCredentials(ssid, password);
   server.sendHeader("Location", "/settings");
   server.send(303, "text/plain", connected ? "Connected and saved." : "Connection failed; previous saved credentials were retained.");
+}
+
+void handleBleModeChange() {
+  if (!server.hasArg("enabled")) {
+    server.send(400, "text/plain", "Missing Bluetooth mode value.");
+    return;
+  }
+
+  bool requested = server.arg("enabled") == "1";
+  if (requested == bleSurveyEnabled) {
+    server.sendHeader("Location", requested ? "/ble" : "/settings");
+    server.send(303, "text/plain", "Bluetooth survey mode unchanged.");
+    return;
+  }
+
+  saveBleSurveyEnabled(requested);
+
+  server.send(200, "text/html",
+    String("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">") +
+    themeBootstrapScript() + pageStyles() +
+    "</head><body><div class=\"container\"><div class=\"card\"><h1>Bluetooth Survey Mode Updated</h1><p>Bluetooth Survey will be " +
+    String(requested ? "enabled" : "disabled") +
+    " after restart.</p><p>The ESP32 is restarting now so radio and history memory can be allocated safely.</p></div></div></body></html>");
+
+  delay(750);
+  ESP.restart();
 }
 
 void handleClearStationSettings() {
@@ -3776,6 +3827,7 @@ void startWebServer() {
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
   server.on("/ble", HTTP_GET, handleBLESurvey);
+  server.on("/ble-mode", HTTP_POST, handleBleModeChange);
   server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
   server.on("/ble-settings", HTTP_GET, handleBLESettings);
   server.on("/ble-clear", HTTP_GET, handleClearBLEHistory);
@@ -4012,6 +4064,9 @@ void setup() {
   captureBootHeapCheckpoint("Wi-Fi initialized");
 
   loadAccessPointSettings();
+  loadSurveyModeSettings();
+  Serial.print("Bluetooth Survey mode: ");
+  Serial.println(bleSurveyEnabled ? "enabled" : "disabled (Wi-Fi-first)");
   if (apEnabled) startAccessPoint();
   captureBootHeapCheckpoint("AP setup complete");
 
@@ -4028,16 +4083,16 @@ void setup() {
     }
   }
 
-  // Initialize BLE only when this build enables it. Keeping it completely
-  // uninitialized in Wi-Fi-only builds provides a clean A/B measurement of
-  // BLE stack + history RAM cost.
-  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+  // Initialize BLE only when the persisted survey mode enables it. When disabled,
+  // the BLE stack remains completely uninitialized so its RAM stays available
+  // to Wi-Fi history.
+  if (bleSurveyEnabled) {
     initializeBLEScanner();
     captureBootHeapCheckpoint("BLE initialized");
   } else {
     autoBleScanEnabled = false;
     initialBleScanPending = false;
-    captureBootHeapCheckpoint("BLE disabled");
+    captureBootHeapCheckpoint("BLE disabled by setting");
   }
 
   initializeAutoSizedHistories();
@@ -4047,7 +4102,7 @@ void setup() {
   Serial.print(scanHistoryCapacity);
   Serial.println(" records");
   Serial.print("Auto-sized BLE history:   ");
-  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+  if (bleSurveyEnabled) {
     Serial.print(bleHistoryCapacity);
     Serial.println(" records");
   } else {
@@ -4060,13 +4115,13 @@ void setup() {
   bool startupFailed =
       !wifiSubsystemInitialized ||
       scanHistory == nullptr ||
-      (BLE_SURVEY_ENABLED_AT_BOOT && (!bleInitialized || bleHistory == nullptr));
+      (bleSurveyEnabled && (!bleInitialized || bleHistory == nullptr));
 
   bool startupWarning =
       !startupFailed &&
       (ESP.getFreeHeap() < HEAP_WARN_BYTES ||
        scanHistoryCapacity == MIN_SCAN_HISTORY_RECORDS ||
-       (BLE_SURVEY_ENABLED_AT_BOOT &&
+       (bleSurveyEnabled &&
         bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS));
 
   indicateStartupStatus(startupFailed, startupWarning);
@@ -4075,7 +4130,7 @@ void setup() {
   lastAutoScanMs = surveyServicesReadyMs;
   lastAutoBleScanMs = surveyServicesReadyMs;
   initialWifiScanPending = true;
-  initialBleScanPending = BLE_SURVEY_ENABLED_AT_BOOT;
+  initialBleScanPending = bleSurveyEnabled;
 
   printMenu();
 }
@@ -4102,7 +4157,7 @@ void serviceInitialSurveyScans() {
   }
 
   if (
-    BLE_SURVEY_ENABLED_AT_BOOT &&
+    bleSurveyEnabled &&
     initialBleScanPending &&
     elapsed >= INITIAL_BLE_SCAN_DELAY_MS
   ) {
@@ -4126,7 +4181,7 @@ void serviceAutomaticScan() {
 }
 
 void serviceAutomaticBLEScan() {
-  if (!BLE_SURVEY_ENABLED_AT_BOOT || !autoBleScanEnabled) return;
+  if (!bleSurveyEnabled || !autoBleScanEnabled) return;
 
   unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
   if (millis() - lastAutoBleScanMs < intervalMs) return;
