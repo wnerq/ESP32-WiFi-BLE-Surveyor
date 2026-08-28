@@ -3123,7 +3123,7 @@ void handleWebScan() {
     "</div>";
 
   if (wifiApTableFullDrops > 0) {
-    loggingCard += "<div class="note"><strong>Warning:</strong> ";
+    loggingCard += "<div class=\"note\"><strong>Warning:</strong> ";
     loggingCard += String(wifiApTableFullDrops);
     loggingCard += " observation(s) were not logged because the unique AP table was full.</div>";
   }
