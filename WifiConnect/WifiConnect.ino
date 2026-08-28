@@ -1,4 +1,4 @@
-// WifiConnect18 - site refactor, diagnostics, channel analysis, headless boot scanning
+// WifiConnect19 - resource diagnostics, status LED, theme first-paint fix, BLE A/B mode
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -10,13 +10,15 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/timers.h>
 
 // ============================================================
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect18_site_diagnostics_channel_analysis.ino";
-const char* FIRMWARE_VERSION = "18";
+const char* FIRMWARE_FILE = "WifiConnect19_resource_diagnostics_led_theme.ino";
+const char* FIRMWARE_VERSION = "19";
 
 
 Preferences preferences;
@@ -60,6 +62,21 @@ const uint32_t BLE_SCAN_DURATION_SECONDS = 5;
 const unsigned long INITIAL_WIFI_SCAN_DELAY_MS = 2500;
 const unsigned long INITIAL_BLE_SCAN_DELAY_MS = 9000;
 const size_t HEAP_WARN_BYTES = 48 * 1024;
+
+// V19 A/B memory diagnostic. Set false and rebuild to measure the complete
+// runtime RAM recovered when the BLE stack is never initialized.
+const bool BLE_SURVEY_ENABLED_AT_BOOT = true;
+
+// Common ESP32 DEVKITV1 boards expose a controllable blue LED on GPIO2.
+// The red LED found on many boards is a hard-wired power LED and cannot be
+// controlled by firmware. Set STATUS_LED_ENABLED false if GPIO2 is not an
+// onboard LED on the specific board being used.
+const bool STATUS_LED_ENABLED = true;
+const uint8_t STATUS_LED_PIN = 2;
+const bool STATUS_LED_ACTIVE_HIGH = true;
+const TickType_t WIFI_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(75);
+const TickType_t BLE_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(125);
+
 
 struct ScanRecord {
   uint32_t scanNumber;
@@ -111,6 +128,20 @@ struct BLEDeviceSummary {
   bool named;
 };
 
+struct BootHeapCheckpoint {
+  const char* stage;
+  uint32_t freeHeap;
+  uint32_t minimumFreeHeap;
+  uint32_t largestFreeBlock;
+};
+
+const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
+BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
+size_t bootHeapCheckpointCount = 0;
+
+TimerHandle_t statusLedTimer = nullptr;
+volatile bool statusLedState = false;
+
 ScanRecord* scanHistory = nullptr;
 size_t scanHistoryCapacity = 0;
 size_t historyStart = 0;
@@ -142,6 +173,101 @@ unsigned long surveyServicesReadyMs = 0;
 size_t bootWifiHistoryCapacity = 0;
 size_t bootBleHistoryCapacity = 0;
 
+
+// ============================================================
+// V19 boot/resource diagnostics and status LED
+// ============================================================
+
+void captureBootHeapCheckpoint(const char* stage) {
+  if (bootHeapCheckpointCount >= MAX_BOOT_HEAP_CHECKPOINTS) return;
+
+  BootHeapCheckpoint& cp = bootHeapCheckpoints[bootHeapCheckpointCount++];
+  cp.stage = stage;
+  cp.freeHeap = ESP.getFreeHeap();
+  cp.minimumFreeHeap = ESP.getMinFreeHeap();
+  cp.largestFreeBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+}
+
+void writeStatusLed(bool on) {
+  if (!STATUS_LED_ENABLED) return;
+
+  statusLedState = on;
+  bool electricalHigh =
+      STATUS_LED_ACTIVE_HIGH ? on : !on;
+  digitalWrite(STATUS_LED_PIN, electricalHigh ? HIGH : LOW);
+}
+
+void statusLedTimerCallback(TimerHandle_t) {
+  writeStatusLed(!statusLedState);
+}
+
+void initializeStatusLed() {
+  if (!STATUS_LED_ENABLED) return;
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  writeStatusLed(false);
+
+  statusLedTimer = xTimerCreate(
+      "surveyLed",
+      WIFI_SCAN_LED_PERIOD_TICKS,
+      pdTRUE,
+      nullptr,
+      statusLedTimerCallback);
+}
+
+void startScanLed(TickType_t periodTicks) {
+  if (!STATUS_LED_ENABLED || statusLedTimer == nullptr) return;
+
+  writeStatusLed(true);
+  xTimerStop(statusLedTimer, 0);
+  xTimerChangePeriod(statusLedTimer, periodTicks, 0);
+}
+
+void stopScanLed() {
+  if (!STATUS_LED_ENABLED) return;
+
+  if (statusLedTimer != nullptr) {
+    xTimerStop(statusLedTimer, 0);
+  }
+
+  writeStatusLed(false);
+}
+
+void statusLedPulse(
+  unsigned long onMs,
+  unsigned long offMs
+) {
+  if (!STATUS_LED_ENABLED) return;
+
+  writeStatusLed(true);
+  delay(onMs);
+  writeStatusLed(false);
+  delay(offMs);
+}
+
+void indicateBootStarted() {
+  if (!STATUS_LED_ENABLED) return;
+
+  statusLedPulse(90, 90);
+  statusLedPulse(90, 0);
+}
+
+void indicateStartupStatus(bool failed, bool warning) {
+  if (!STATUS_LED_ENABLED) return;
+
+  if (failed) {
+    for (int i = 0; i < 3; i++) statusLedPulse(300, 220);
+    return;
+  }
+
+  if (warning) {
+    for (int i = 0; i < 2; i++) statusLedPulse(250, 220);
+    return;
+  }
+
+  statusLedPulse(650, 0);
+}
 
 
 // ============================================================
@@ -393,7 +519,7 @@ String bleAddressTypeLabel(uint8_t addressType) {
 }
 
 void initializeBLEScanner() {
-  if (bleInitialized) return;
+  if (!BLE_SURVEY_ENABLED_AT_BOOT || bleInitialized) return;
 
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
@@ -561,7 +687,9 @@ int performLoggedScan() {
   bool connectedNow = WiFi.status() == WL_CONNECTED;
   String connectedBSSID = connectedNow ? WiFi.BSSIDstr() : "";
 
+  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
   int networkCount = WiFi.scanNetworks();
+  stopScanLed();
 
   scanCounter++;
   lastScanUptimeMs = millis();
@@ -603,6 +731,26 @@ const BleScanRecord& bleHistoryRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (bleHistoryStart + logicalIndex) % bleHistoryCapacity;
   return bleHistory[physicalIndex];
+}
+
+size_t countRetainedBleScanGroups() {
+  if (bleHistoryCount == 0 || bleHistory == nullptr) return 0;
+
+  size_t groups = 0;
+  uint32_t previousScan = 0;
+  bool havePrevious = false;
+
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    uint32_t currentScan = bleHistoryRecord(i).scanNumber;
+
+    if (!havePrevious || currentScan != previousScan) {
+      groups++;
+      previousScan = currentScan;
+      havePrevious = true;
+    }
+  }
+
+  return groups;
 }
 
 bool resizeBleHistory(size_t requestedCapacity, bool preserveRecords = true) {
@@ -752,8 +900,14 @@ void initializeAutoSizedHistories() {
       ? freeHeap - HISTORY_HEAP_RESERVE_BYTES
       : 0;
 
-  size_t wifiBudget = available / 2;
-  size_t bleBudget = available - wifiBudget;
+  // In normal Wi-Fi + BLE mode, preserve the V18 50/50 policy so the A/B
+  // comparison isolates the cost of disabling BLE rather than also changing
+  // allocation policy. In Wi-Fi-only mode, all safe history budget is offered
+  // to Wi-Fi and no BLE history buffer is allocated.
+  size_t wifiBudget =
+      BLE_SURVEY_ENABLED_AT_BOOT ? available / 2 : available;
+  size_t bleBudget =
+      BLE_SURVEY_ENABLED_AT_BOOT ? available - wifiBudget : 0;
 
   size_t wifiTarget = capacityForBudget(
     wifiBudget,
@@ -762,18 +916,20 @@ void initializeAutoSizedHistories() {
     MAX_SCAN_HISTORY_RECORDS
   );
 
-  size_t bleTarget = capacityForBudget(
-    bleBudget,
-    sizeof(BleScanRecord),
-    MIN_BLE_HISTORY_RECORDS,
-    MAX_BLE_HISTORY_RECORDS
-  );
-
   if (!resizeScanHistory(wifiTarget, false))
     resizeScanHistory(MIN_SCAN_HISTORY_RECORDS, false);
 
-  if (!resizeBleHistory(bleTarget, false))
-    resizeBleHistory(MIN_BLE_HISTORY_RECORDS, false);
+  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+    size_t bleTarget = capacityForBudget(
+      bleBudget,
+      sizeof(BleScanRecord),
+      MIN_BLE_HISTORY_RECORDS,
+      MAX_BLE_HISTORY_RECORDS
+    );
+
+    if (!resizeBleHistory(bleTarget, false))
+      resizeBleHistory(MIN_BLE_HISTORY_RECORDS, false);
+  }
 
   bootWifiHistoryCapacity = scanHistoryCapacity;
   bootBleHistoryCapacity = bleHistoryCapacity;
@@ -851,13 +1007,21 @@ bool buildBleDeviceSummary(
 }
 
 int performLoggedBLEScan() {
+  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+    bleStatusMessage =
+      "BLE surveying is disabled at boot for V19 memory A/B testing.";
+    return -1;
+  }
+
   initializeBLEScanner();
 
   BLEScan* scan = BLEDevice::getScan();
   bleStatusMessage = "BLE scan in progress...";
 
+  startScanLed(BLE_SCAN_LED_PERIOD_TICKS);
   BLEScanResults* results =
       scan->start(BLE_SCAN_DURATION_SECONDS, false);
+  stopScanLed();
 
   bleScanCounter++;
   lastBleScanUptimeMs = millis();
@@ -986,6 +1150,20 @@ String formatUptime(uint32_t uptimeMs) {
 
 String getUptimeString() {
   return formatUptime(millis());
+}
+
+String retainedWindowLabel(
+  uint32_t oldestMs,
+  uint32_t newestMs
+) {
+  if (newestMs < oldestMs) return "counter wrapped";
+  return formatUptime(newestMs - oldestMs);
+}
+
+String observationAgeLabel(uint32_t observationMs) {
+  uint32_t now = millis();
+  if (now < observationMs) return "counter wrapped";
+  return formatUptime(now - observationMs);
 }
 
 
@@ -2331,6 +2509,25 @@ void sendNetworkSummaryTable() {
 
 void sendThemeControl();
 
+String themeBootstrapScript() {
+  return
+    "<script>"
+    "(function(){"
+      "try{"
+        "var v=localStorage.getItem('esp32-theme')||'system';"
+        "var d=(v==='system')"
+          "?(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)"
+          ":(v==='dark');"
+        "document.documentElement.dataset.theme=d?'dark':'light';"
+      "}catch(e){}"
+    "})();"
+    "</script>";
+}
+
+void sendThemeBootstrapScript() {
+  server.sendContent(themeBootstrapScript());
+}
+
 String activeNavClass(const String& active, const char* item) {
   return active == item ? " class=\"active\"" : "";
 }
@@ -2377,8 +2574,12 @@ void sendThemeScript() {
     "}"
     "document.addEventListener('DOMContentLoaded',()=>{"
       "const v=localStorage.getItem('esp32-theme')||'system';"
-      "applyTheme(v);"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
+      "if(window.matchMedia){"
+        "window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{"
+          "if((localStorage.getItem('esp32-theme')||'system')==='system')applyTheme('system');"
+        "});"
+      "}"
     "});"
     "</script>"
   );
@@ -2552,6 +2753,7 @@ void handleWebScan() {
     "<title>ESP32 Wi-Fi Survey</title>"
   );
 
+  sendThemeBootstrapScript();
   server.sendContent(pageStyles());
 
   server.sendContent(
@@ -2620,8 +2822,23 @@ void handleWebScan() {
     "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span>"
     "<span class=\"value\">";
   loggingCard += String(countRetainedScanGroups());
+  loggingCard += "</span></div>";
+
+  if (historyCount > 0) {
+    const ScanRecord& oldestRetained = historyRecord(0);
+    const ScanRecord& newestRetained = historyRecord(historyCount - 1);
+    loggingCard +=
+      "<div class=\"row\"><span class=\"label\">Oldest Record Age</span>"
+      "<span class=\"value\">" +
+      htmlEscape(observationAgeLabel(oldestRetained.uptimeMs)) +
+      "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Retained Time Window</span>"
+      "<span class=\"value\">" +
+      htmlEscape(retainedWindowLabel(oldestRetained.uptimeMs, newestRetained.uptimeMs)) +
+      "</span></div>";
+  }
+
   loggingCard +=
-    "</span></div>"
     "<div class=\"row\"><span class=\"label\">History RAM</span>"
     "<span class=\"value\">";
   loggingCard += String(
@@ -2791,6 +3008,13 @@ void redirectToBLEPage() {
 }
 
 void handleBLESettings() {
+  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+    bleStatusMessage =
+      "BLE settings are unavailable because BLE is disabled at boot.";
+    redirectToBLEPage();
+    return;
+  }
+
   if (server.hasArg("interval")) {
     long requested = server.arg("interval").toInt();
     if (requested < (long)MIN_SCAN_INTERVAL_SECONDS) requested = MIN_SCAN_INTERVAL_SECONDS;
@@ -2990,11 +3214,26 @@ void handleBLESurvey() {
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
     "<title>ESP32 Bluetooth Survey</title>");
+  sendThemeBootstrapScript();
   server.sendContent(pageStyles());
   server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("ble");
   server.sendContent("<h1>Bluetooth Survey</h1>"
     "<div class=\"card\"><h2>Scan Logging</h2>");
+
+  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+    server.sendContent(
+      "<div class=\"note\"><strong>BLE surveying is disabled in this V19 build.</strong> "
+      "The BLE stack was intentionally not initialized so System diagnostics can measure a clean Wi-Fi-only memory baseline. "
+      "Set BLE_SURVEY_ENABLED_AT_BOOT to true and rebuild to restore Bluetooth surveying.</div>"
+      "<div class=\"row\"><span class=\"label\">BLE Stack</span><span class=\"value\">Not initialized</span></div>"
+      "<div class=\"row\"><span class=\"label\">BLE History RAM</span><span class=\"value\">0 KB</span></div>"
+      "</div><div class=\"footer\">ESP32 Web Interface</div>");
+    sendThemeScript();
+    server.sendContent("</div></body></html>");
+    server.sendContent("");
+    return;
+  }
 
   String status;
   status.reserve(2600);
@@ -3063,6 +3302,13 @@ void handleBLESurvey() {
 }
 
 void handleBLEScanNow() {
+  if (!BLE_SURVEY_ENABLED_AT_BOOT) {
+    bleStatusMessage =
+      "BLE scan not started because BLE is disabled at boot in this V19 build.";
+    redirectToBLEPage();
+    return;
+  }
+
   performLoggedBLEScan();
   redirectToBLEPage();
 }
@@ -3115,6 +3361,7 @@ void handleSystemStatus() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 System</title>");
+  sendThemeBootstrapScript();
   server.sendContent(pageStyles());
   server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("system");
@@ -3140,7 +3387,26 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + " records, " + String(scanHistoryCapacity*sizeof(ScanRecord)/1024.0,1) + " KB allocated</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + " records, " + String(bleHistoryCapacity*sizeof(BleScanRecord)/1024.0,1) + " KB allocated</span></div></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Scans</span><span class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>";
+  if (historyCount > 0) {
+    const ScanRecord& oldestWifi = historyRecord(0);
+    const ScanRecord& newestWifi = historyRecord(historyCount - 1);
+    s += "<div class=\"row\"><span class=\"label\">Wi-Fi Oldest Record Age</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldestWifi.uptimeMs)) + "</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestWifi.uptimeMs, newestWifi.uptimeMs)) + "</span></div>";
+  }
+  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + " records, " + String(bleHistoryCapacity*sizeof(BleScanRecord)/1024.0,1) + " KB allocated</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>";
+    if (bleHistoryCount > 0) {
+      const BleScanRecord& oldestBle = bleHistoryRecord(0);
+      const BleScanRecord& newestBle = bleHistoryRecord(bleHistoryCount - 1);
+      s += "<div class=\"row\"><span class=\"label\">BLE Oldest Record Age</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldestBle.uptimeMs)) + "</span></div>";
+      s += "<div class=\"row\"><span class=\"label\">BLE Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestBle.uptimeMs, newestBle.uptimeMs)) + "</span></div>";
+    }
+  } else {
+    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">Disabled at boot; 0 KB history allocated</span></div>";
+  }
+  s += "</div>";
   s += "<div class=\"card\"><h2>Radio Status</h2>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">STA MAC</span><span class=\"value\">" + WiFi.macAddress() + "</span></div>";
@@ -3148,27 +3414,55 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Infrastructure Wi-Fi</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div></div>";
+  s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(BLE_SURVEY_ENABLED_AT_BOOT ? "Enabled" : "Disabled (Wi-Fi-only A/B test)") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_ENABLED ? String("GPIO ") + String(STATUS_LED_PIN) : String("Disabled")) + "</span></div></div>";
   server.sendContent(s);
+
+  server.sendContent("<div class=\"card\"><h2>Boot Heap Checkpoints</h2>"
+    "<div class=\"note\">Captured during startup so Wi-Fi, BLE, history, web-server, and initial-scan RAM costs can be compared directly.</div>"
+    "<div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
+  for (size_t i = 0; i < bootHeapCheckpointCount; i++) {
+    const BootHeapCheckpoint& cp = bootHeapCheckpoints[i];
+    String row = "<tr><td>" + htmlEscape(String(cp.stage)) + "</td>"
+      "<td class=\"signal\">" + String(cp.freeHeap / 1024.0, 1) + " KB</td>"
+      "<td class=\"signal\">" + String(cp.minimumFreeHeap / 1024.0, 1) + " KB</td>"
+      "<td class=\"signal\">" + String(cp.largestFreeBlock / 1024.0, 1) + " KB</td></tr>";
+    server.sendContent(row);
+  }
+  server.sendContent("</tbody></table></div></div>");
 
   server.sendContent("<div class=\"card\"><h2>Software Self-Tests</h2>");
   server.sendContent(selfTestRow("Wi-Fi subsystem", wifiSubsystemInitialized ? "PASS" : "FAIL", wifiSubsystemInitialized ? "initialized" : "not initialized"));
-  server.sendContent(selfTestRow("BLE subsystem", bleInitialized ? "PASS" : "FAIL", bleInitialized ? "initialized" : "not initialized"));
+  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+    server.sendContent(selfTestRow("BLE subsystem", bleInitialized ? "PASS" : "FAIL", bleInitialized ? "initialized" : "not initialized"));
+  } else {
+    server.sendContent(selfTestRow("BLE subsystem", "PASS", "intentionally disabled at boot for memory A/B testing"));
+  }
   bool wh = scanHistory && scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS && historyCount<=scanHistoryCapacity;
-  bool bh = bleHistory && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryCount<=bleHistoryCapacity;
+  bool bh = !BLE_SURVEY_ENABLED_AT_BOOT ||
+      (bleHistory && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryCount<=bleHistoryCapacity);
   server.sendContent(selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid"));
-  server.sendContent(selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL", bh ? "allocated and sane" : "allocation/capacity invalid"));
-  bool cfg = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS;
-  server.sendContent(selfTestRow("Scan configuration", cfg ? "PASS" : "FAIL", cfg ? "intervals within valid range" : "one or more values out of range"));
-  bool initialDone = !initialWifiScanPending && !initialBleScanPending;
-  server.sendContent(selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN", initialDone ? "Wi-Fi and BLE initial scans completed" : "one or both initial scans are still pending"));
-  bool autos = autoScanEnabled && autoBleScanEnabled;
-  server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN", autos ? "Wi-Fi and BLE periodic scanning enabled" : "one or both automatic scan services disabled at runtime"));
+  server.sendContent(selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL",
+    !BLE_SURVEY_ENABLED_AT_BOOT ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid")));
+  bool cfg = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS &&
+      (!BLE_SURVEY_ENABLED_AT_BOOT || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
+  server.sendContent(selfTestRow("Scan configuration", cfg ? "PASS" : "FAIL", cfg ? "enabled survey intervals within valid range" : "one or more values out of range"));
+  bool initialDone = !initialWifiScanPending &&
+      (!BLE_SURVEY_ENABLED_AT_BOOT || !initialBleScanPending);
+  server.sendContent(selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN",
+    initialDone ? (BLE_SURVEY_ENABLED_AT_BOOT ? "Wi-Fi and BLE initial scans completed" : "Wi-Fi initial scan completed; BLE intentionally disabled")
+                : "one or more required initial scans are still pending"));
+  bool autos = autoScanEnabled &&
+      (!BLE_SURVEY_ENABLED_AT_BOOT || autoBleScanEnabled);
+  server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
+    autos ? (BLE_SURVEY_ENABLED_AT_BOOT ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; BLE intentionally disabled")
+          : "one or more enabled automatic scan services are disabled at runtime"));
   server.sendContent(selfTestRow("Heap reserve", freeHeap>=HEAP_WARN_BYTES ? "PASS" : "WARN", String(freeHeap/1024) + " KB free"));
   server.sendContent(selfTestRow("Application space", ESP.getFreeSketchSpace()>64*1024 ? "PASS" : "WARN", String(ESP.getFreeSketchSpace()/1024) + " KB free app space"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V18.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V19.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -3179,6 +3473,7 @@ void handleSettingsPage() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Settings</title>");
+  sendThemeBootstrapScript();
   server.sendContent(pageStyles());
   server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("settings");
@@ -3194,7 +3489,14 @@ void handleSettingsPage() {
   s += "<form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>";
   s += "<div class=\"note\">The stored infrastructure passphrase is never displayed. A connection must succeed before new credentials are saved. Infrastructure Wi-Fi is optional; failed or absent infrastructure connectivity does not stop surveying.</div></div>";
   s += "<div class=\"card\"><h2>Survey Access Point</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div><div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div><div class=\"buttons\"><a class=\"button\" href=\"/ap\">Access Point Settings</a></div></div>";
-  s += "<div class=\"card\"><h2>Interface</h2><div class=\"note\">Theme selection is browser-local and available from the Theme control on every main page. Survey interval and history settings remain session-only and are configured on their respective survey pages.</div></div>";
+  s += "<div class=\"card\"><h2>Survey Build Options</h2>"
+    "<div class=\"row\"><span class=\"label\">BLE at Boot</span><span class=\"value\">" +
+    String(BLE_SURVEY_ENABLED_AT_BOOT ? "Enabled" : "Disabled - Wi-Fi-only A/B build") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" +
+    String(STATUS_LED_ENABLED ? "GPIO 2 enabled" : "Disabled") + "</span></div>"
+    "<div class=\"note\">For a clean BLE memory A/B comparison, change BLE_SURVEY_ENABLED_AT_BOOT near the top of the sketch and rebuild. "
+    "Disabling BLE at runtime after initialization would not reclaim the full BLE stack allocation and would give a misleading comparison.</div></div>";
+  s += "<div class=\"card\"><h2>Interface</h2><div class=\"note\">Theme selection is browser-local and is applied in the page head before CSS to avoid a light-theme flash during refresh. Survey interval and history settings remain session-only and are configured on their respective survey pages.</div></div>";
   server.sendContent(s);
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
@@ -3244,6 +3546,7 @@ void handleAccessPointSettingsPage() {
   <title>ESP32 Access Point Settings</title>
 )rawliteral";
 
+  html += themeBootstrapScript();
   html += pageStyles();
 
   html += R"rawliteral(
@@ -3685,6 +3988,11 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
 
+  captureBootHeapCheckpoint("Startup");
+  initializeStatusLed();
+  captureBootHeapCheckpoint("Status LED initialized");
+  indicateBootStarted();
+
   Serial.println();
   Serial.println();
   Serial.println("================================");
@@ -3701,11 +4009,14 @@ void setup() {
   WiFi.mode(WIFI_STA);
   delay(WIFI_STARTUP_SETTLE_MS);
   wifiSubsystemInitialized = (WiFi.getMode() != WIFI_MODE_NULL);
+  captureBootHeapCheckpoint("Wi-Fi initialized");
 
   loadAccessPointSettings();
   if (apEnabled) startAccessPoint();
+  captureBootHeapCheckpoint("AP setup complete");
 
   bool connected = connectUsingSavedCredentials();
+  captureBootHeapCheckpoint("STA attempt complete");
 
   if (!connected) {
     Serial.println();
@@ -3717,25 +4028,54 @@ void setup() {
     }
   }
 
-  // Initialize both radio stacks before sizing history, so the allocator
-  // sees the runtime cost of Wi-Fi + BLE.
-  initializeBLEScanner();
+  // Initialize BLE only when this build enables it. Keeping it completely
+  // uninitialized in Wi-Fi-only builds provides a clean A/B measurement of
+  // BLE stack + history RAM cost.
+  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+    initializeBLEScanner();
+    captureBootHeapCheckpoint("BLE initialized");
+  } else {
+    autoBleScanEnabled = false;
+    initialBleScanPending = false;
+    captureBootHeapCheckpoint("BLE disabled");
+  }
+
   initializeAutoSizedHistories();
+  captureBootHeapCheckpoint("Histories allocated");
 
   Serial.print("Auto-sized Wi-Fi history: ");
   Serial.print(scanHistoryCapacity);
   Serial.println(" records");
   Serial.print("Auto-sized BLE history:   ");
-  Serial.print(bleHistoryCapacity);
-  Serial.println(" records");
+  if (BLE_SURVEY_ENABLED_AT_BOOT) {
+    Serial.print(bleHistoryCapacity);
+    Serial.println(" records");
+  } else {
+    Serial.println("disabled");
+  }
+
+  if (WiFi.status() == WL_CONNECTED || apRunning) startWebServer();
+  captureBootHeapCheckpoint("Web server ready");
+
+  bool startupFailed =
+      !wifiSubsystemInitialized ||
+      scanHistory == nullptr ||
+      (BLE_SURVEY_ENABLED_AT_BOOT && (!bleInitialized || bleHistory == nullptr));
+
+  bool startupWarning =
+      !startupFailed &&
+      (ESP.getFreeHeap() < HEAP_WARN_BYTES ||
+       scanHistoryCapacity == MIN_SCAN_HISTORY_RECORDS ||
+       (BLE_SURVEY_ENABLED_AT_BOOT &&
+        bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS));
+
+  indicateStartupStatus(startupFailed, startupWarning);
 
   surveyServicesReadyMs = millis();
   lastAutoScanMs = surveyServicesReadyMs;
   lastAutoBleScanMs = surveyServicesReadyMs;
   initialWifiScanPending = true;
-  initialBleScanPending = true;
-
-  if (WiFi.status() == WL_CONNECTED || apRunning) startWebServer();
+  initialBleScanPending = BLE_SURVEY_ENABLED_AT_BOOT;
 
   printMenu();
 }
@@ -3758,13 +4098,19 @@ void serviceInitialSurveyScans() {
     performLoggedScan();
     WiFi.scanDelete();
     lastAutoScanMs = millis();
+    captureBootHeapCheckpoint("Initial Wi-Fi scan");
   }
 
-  if (initialBleScanPending && elapsed >= INITIAL_BLE_SCAN_DELAY_MS) {
+  if (
+    BLE_SURVEY_ENABLED_AT_BOOT &&
+    initialBleScanPending &&
+    elapsed >= INITIAL_BLE_SCAN_DELAY_MS
+  ) {
     initialBleScanPending = false;
     Serial.println("Initial headless BLE survey scan...");
     performLoggedBLEScan();
     lastAutoBleScanMs = millis();
+    captureBootHeapCheckpoint("Initial BLE scan");
   }
 }
 
@@ -3780,7 +4126,7 @@ void serviceAutomaticScan() {
 }
 
 void serviceAutomaticBLEScan() {
-  if (!autoBleScanEnabled) return;
+  if (!BLE_SURVEY_ENABLED_AT_BOOT || !autoBleScanEnabled) return;
 
   unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
   if (millis() - lastAutoBleScanMs < intervalMs) return;
