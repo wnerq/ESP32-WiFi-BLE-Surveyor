@@ -13,6 +13,9 @@ The demo uses simulated survey data and does not require ESP32 hardware.
 
 The project began as a simple way to configure Wi-Fi credentials through the Arduino Serial Monitor and has evolved into a portable wireless survey and logging utility. The ESP32 can host its own access point, so the survey interface can be used even when the device is not connected to an existing Wi-Fi network. Wi-Fi and BLE survey data can be collected and reviewed from a phone or PC.
 
+## 3D Printed Enclosure
+**[Honeycomb Case](https://www.printables.com/model/1826305-esp32-honeycomb-case-push-together-no-hardwaretool)**
+
 
 ## Features
 
