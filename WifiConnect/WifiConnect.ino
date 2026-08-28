@@ -1,4 +1,4 @@
-// WifiConnect26 - responsive Wi-Fi surveying, incremental live web updates, and limited BLE mode
+// WifiConnect27 - non-navigating scan controls, automatic maximum retention, and version-text cleanup
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect26_live_updates_async_wifi.ino";
-const char* FIRMWARE_VERSION = "26";
+const char* FIRMWARE_FILE = "WifiConnect27_ui_control_cleanup.ino";
+const char* FIRMWARE_VERSION = "27";
 
 
 Preferences preferences;
@@ -89,10 +89,10 @@ const unsigned long INITIAL_WIFI_SCAN_DELAY_MS = 2500;
 const unsigned long INITIAL_BLE_SCAN_DELAY_MS = 9000;
 const size_t HEAP_WARN_BYTES = 48 * 1024;
 // Minimum-free-heap is the more important unattended-runtime indicator.
-// In dual-radio mode V25 warns below 20 KB; Wi-Fi-only has ample margin.
+// In dual-radio mode warn below 20 KB; Wi-Fi-only has ample margin.
 const size_t DUAL_RADIO_MIN_HEAP_WARN_BYTES = 20 * 1024;
 
-// V20 Wi-Fi-first operating mode. Bluetooth is disabled by default and the
+// Wi-Fi-first operating mode. Bluetooth is disabled by default and the
 // preference is stored in NVS. Changing the setting from the web UI triggers
 // a controlled restart so BLE is either fully initialized before history
 // allocation or never initialized at all.
@@ -151,7 +151,7 @@ struct WifiObservation {
   uint8_t reserved;
 };
 
-// Synthesized BLE view used by existing UI/CSV code. V24+ no longer stores
+// Synthesized BLE view used by existing UI/CSV code. Compact history no longer stores
 // this flat record in the recurring history ring.
 struct BleScanRecord {
   uint32_t scanNumber;
@@ -281,7 +281,7 @@ size_t bootBleHistoryCapacity = 0;
 
 
 // ============================================================
-// V19/V20 boot/resource diagnostics and status LED
+// Boot/resource diagnostics and status LED
 // ============================================================
 
 void captureBootHeapCheckpoint(const char* stage) {
@@ -1156,7 +1156,7 @@ void serviceLoggedWifiScan() {
 }
 
 // ============================================================
-// BLE compact normalized history (V24)
+// BLE compact normalized history
 // ============================================================
 
 size_t bleHistoryAllocatedBytes() {
@@ -1271,7 +1271,7 @@ bool setBleRetentionLimit(size_t requestedCapacity) {
     discardOldestBleObservation();
   bleHistoryResizeMessage =
     "BLE retention limit set to " + String(bleHistoryRetentionLimit) +
-    " observations (physical capacity " + String(bleHistoryCapacity) + ").";
+    " observations (history capacity " + String(bleHistoryCapacity) + ").";
   return true;
 }
 
@@ -2409,6 +2409,17 @@ String pageStyles() {
     margin: 0;
   }
 
+  .scan-state {
+    display: inline-block;
+    margin-left: 8px;
+    color: var(--muted);
+    font-size: 0.92em;
+  }
+
+  .scan-state.active {
+    font-weight: 600;
+  }
+
   .nav a {
     padding: 8px 11px;
     border-radius: 6px;
@@ -2501,10 +2512,15 @@ void handleWifiScanStatus() {
 }
 
 void handleWebScanNow() {
-  if (!beginLoggedWifiScan(false)) {
+  bool started = beginLoggedWifiScan(false);
+  if (!started) {
     wifiScanStatusMessage = wifiScanInProgress ? "Scan already in progress" : "Unable to start scan";
   }
-  redirectToScanPage();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(started || wifiScanInProgress ? 202 : 503, "application/json",
+    String("{\"started\":") + (started ? "true" : "false") +
+    ",\"scanning\":" + (wifiScanInProgress ? "true" : "false") +
+    ",\"message\":\"" + jsEscape(wifiScanStatusMessage) + "\"}");
 }
 
 void handleLiveUpdatesSetting() {
@@ -2532,15 +2548,6 @@ void handleScanSettings() {
     }
 
     scanIntervalSeconds = (unsigned long)requested;
-  }
-
-  if (server.hasArg("history")) {
-    long requestedHistory = server.arg("history").toInt();
-    if (requestedHistory < (long)MIN_SCAN_HISTORY_RECORDS)
-      requestedHistory = MIN_SCAN_HISTORY_RECORDS;
-    if (requestedHistory > (long)scanHistoryCapacity)
-      requestedHistory = (long)scanHistoryCapacity;
-    setWifiRetentionLimit((size_t)requestedHistory);
   }
 
   autoScanEnabled = server.hasArg("auto");
@@ -3469,13 +3476,11 @@ void handleWebScan() {
   loggingCard += String(scanIntervalSeconds);
   loggingCard +=
     "\"></div>"
-    "<div class=\"control\"><label for=\"history\">Retention limit (observations)</label>"
-    "<input id=\"history\" name=\"history\" type=\"number\" min=\"50\" max=\"";
+    "<div class=\"control\"><label>History capacity</label>"
+    "<div class=\"value\">";
   loggingCard += String(scanHistoryCapacity);
-  loggingCard += "\" value=\"";
-  loggingCard += String(scanHistoryRetentionLimit);
   loggingCard +=
-    "\"></div>"
+    " observations (automatic maximum)</div></div>"
     "<div class=\"checkbox-stack\">"
     "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
   if (autoScanEnabled) loggingCard += " checked";
@@ -3483,18 +3488,14 @@ void handleWebScan() {
     "> Automatic scanning</label></div>"
     "<button type=\"submit\">Apply</button></form>"
     "<div class=\"buttons\">"
-    "<a class=\"button\" href=\"/scan-now\">Scan Now</a>"
+    "<button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button><span id=\"wifi-scan-state\" class=\"scan-state\"></span>"
     "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
     "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
     "<a class=\"button\" href=\"/\">Refresh Page</a>"
     "</div>"
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
-    "V22 allocates the maximum safe compact Wi-Fi history once at boot. "
-    "Changing the retention limit does not reallocate RAM; it only changes how many "
-    "of the allocated observation slots may be retained. When the logical limit is "
-    "full, the oldest observations are discarded."
-    "</div>";
+    "The maximum safe compact Wi-Fi history is allocated once at boot and the full physical capacity is retained.</div>";
 
   if (wifiApTableFullDrops > 0) {
     loggingCard += "<div class=\"note\"><strong>Warning:</strong> ";
@@ -3582,7 +3583,7 @@ void handleWebScan() {
   sendSortableTableScript();
   sendThemeScript();
 
-  // V26 live updates repaint only changing survey fragments; the document,
+  // Live updates repaint only changing survey fragments; the document,
   // scroll position, forms, and plot selection remain intact.
   {
     String refreshScript =
@@ -3591,6 +3592,10 @@ void handleWebScan() {
       "const toggle=document.getElementById('live-updates-toggle');"
       "const plotBssid='" + jsEscape(selectedBSSID) + "';"
       "let updating=false;"
+      "const scanButton=document.getElementById('wifi-scan-now');"
+      "const scanState=document.getElementById('wifi-scan-state');"
+      "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
+      "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Scanning…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
       "async function repaint(){"
         "if(updating)return;updating=true;"
         "try{"
@@ -3600,9 +3605,9 @@ void handleWebScan() {
         "}catch(e){}finally{updating=false;}"
       "}"
       "setInterval(function(){"
-        "if(!toggle||!toggle.checked)return;"
         "fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
-          "if(s.scan!==scan){scan=s.scan;repaint();}"
+          "showScanState(!!s.scanning,s.scanning?'Scanning…':'');"
+          "if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}"
         "}).catch(function(){});"
       "},2000);"
       "})();</script>";
@@ -3679,16 +3684,6 @@ void handleBLESettings() {
     if (requested < (long)MIN_SCAN_INTERVAL_SECONDS) requested = MIN_SCAN_INTERVAL_SECONDS;
     if (requested > (long)MAX_SCAN_INTERVAL_SECONDS) requested = MAX_SCAN_INTERVAL_SECONDS;
     bleScanIntervalSeconds = (unsigned long)requested;
-  }
-
-  if (server.hasArg("history")) {
-    long requested = server.arg("history").toInt();
-    if (requested < (long)MIN_BLE_HISTORY_RECORDS) requested = MIN_BLE_HISTORY_RECORDS;
-    if (requested > (long)MAX_BLE_HISTORY_RECORDS) requested = MAX_BLE_HISTORY_RECORDS;
-
-    if ((size_t)requested > bleHistoryCapacity)
-      requested = (long)bleHistoryCapacity;
-    setBleRetentionLimit((size_t)requested);
   }
 
   autoBleScanEnabled = server.hasArg("auto");
@@ -3920,7 +3915,7 @@ void handleBLESurvey() {
   status += "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
     String(bleHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>";
   status += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" +
-    String(sizeof(BleObservation)) + " bytes (V23 flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
+    String(sizeof(BleObservation)) + " bytes (previous flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
   status += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" +
     String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " +
     String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB allocated</span></div>";
@@ -3937,9 +3932,8 @@ void handleBLESurvey() {
     "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
     "<input id=\"ble-interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" +
     String(bleScanIntervalSeconds) + "\"></div>"
-    "<div class=\"control\"><label for=\"ble-history\">Retention limit (observations)</label>"
-    "<input id=\"ble-history\" name=\"history\" type=\"number\" min=\"50\" max=\"" +
-    String(bleHistoryCapacity) + "\" value=\"" + String(bleHistoryRetentionLimit) + "\"></div>"
+    "<div class=\"control\"><label>History capacity</label><div class=\"value\">" +
+    String(bleHistoryCapacity) + " observations (automatic maximum)</div></div>"
     "<div class=\"checkbox-stack\">"
     "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
@@ -4122,7 +4116,7 @@ void handleSystemStatus() {
   if (bleSurveyEnabled) {
     s += "<div class=\"row\"><span class=\"label\">Dual-Radio Low-Water Warning</span><span class=\"value\">" + String(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024) + " KB minimum free heap</span></div>";
   }
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " physical capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " history capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Observation Size</span><span class=\"value\">" + String(sizeof(WifiObservation)) + " bytes (V20 flat record was " + String(sizeof(ScanRecord)) + " bytes)</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + " entries; " + String(wifiApTableCapacity*sizeof(WifiApEntry)/1024.0,1) + " KB allocated</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Metadata</span><span class=\"value\">" + String(wifiScanMetadataCapacity) + " slots; " + String(wifiScanMetadataCapacity*sizeof(WifiScanMetadata)/1024.0,1) + " KB allocated</span></div>";
@@ -4134,8 +4128,8 @@ void handleSystemStatus() {
     s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestWifi.uptimeMs, newestWifi.uptimeMs)) + "</span></div>";
   }
   if (bleSurveyEnabled) {
-    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) + " retained; " + String(bleHistoryCapacity) + " physical; " + String(bleHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" + String(sizeof(BleObservation)) + " bytes (V23 flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) + " retained; " + String(bleHistoryCapacity) + " capacity; " + String(bleHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" + String(sizeof(BleObservation)) + " bytes (previous flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
     s += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" + String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " + String(bleAddressPeakReferenced) + "; drops " + String(bleAddressTableFullDrops) + "</span></div>";
     s += "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" + String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " + String(bleScanMetadataPeakUsed) + "</span></div>";
     s += "<div class=\"row\"><span class=\"label\">BLE Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>";
@@ -4322,7 +4316,7 @@ void handleHostnameSave() {
 }
 
 void handleInterfaceSettings() {
-  // V26 moves Live Updates to the persistent header control. Saving the LED
+  // Live Updates are managed by the persistent header control. Saving the LED
   // setting must not silently overwrite that independently managed preference.
   bool requestedLed = server.hasArg("ledEnabled");
   saveInterfaceSettings(requestedLed, webAutoRefreshEnabled);
@@ -4692,7 +4686,8 @@ void startWebServer() {
 void printSerialMainMenu() {
   Serial.println();
   Serial.println("============================================================");
-  Serial.println(" ESP32 Wireless Surveyor V23");
+  Serial.print(" ESP32 Wireless Surveyor V");
+  Serial.println(FIRMWARE_VERSION);
   Serial.println("============================================================");
   Serial.println("1 - Wi-Fi Survey");
   Serial.println("2 - Bluetooth Survey");
@@ -4721,7 +4716,7 @@ void printWifiSurveySerial() {
   Serial.print(scanHistoryRetentionLimit);
   Serial.print(" retained; ");
   Serial.print(scanHistoryCapacity);
-  Serial.println(" physical capacity");
+  Serial.println(" history capacity");
   Serial.print("Retained scans:      ");
   Serial.println(countRetainedScanGroups());
   Serial.print("Unique AP slots used:");
@@ -4813,7 +4808,6 @@ void printBluetoothSurveySerial() {
     Serial.println("BLE commands:");
     Serial.println("  blescan              - Scan now");
     Serial.println("  bleclear             - Clear BLE history");
-    Serial.println("  bleretention <n>     - Set BLE logical retention limit");
     Serial.println("  bleinterval <sec>    - Set BLE automatic scan interval");
     Serial.println("  bleauto on|off       - Enable/disable automatic BLE scans");
     Serial.println("  ble off              - Disable BLE Survey and restart");
@@ -4982,12 +4976,7 @@ void handleSerialCommand() {
 
   if (command.equalsIgnoreCase("scan")) { performLoggedScan(); WiFi.scanDelete(); printWifiSurveySerial(); return; }
   if (command.equalsIgnoreCase("wclear")) { clearScanHistory(); Serial.println("Wi-Fi history cleared."); printWifiSurveySerial(); return; }
-  if (command.startsWith("retention ")) {
-    long n = commandArgument(command,"retention").toInt();
-    if (n < (long)MIN_SCAN_HISTORY_RECORDS || n > (long)scanHistoryCapacity) Serial.println("Invalid retention limit for current physical capacity.");
-    else { setWifiRetentionLimit((size_t)n); Serial.println("Wi-Fi retention limit updated."); }
-    printWifiSurveySerial(); return;
-  }
+
   if (command.startsWith("interval ")) {
     long n=commandArgument(command,"interval").toInt();
     if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid Wi-Fi interval.");
@@ -5003,13 +4992,7 @@ void handleSerialCommand() {
     printBluetoothSurveySerial(); return;
   }
   if (command.equalsIgnoreCase("bleclear")) { if (bleSurveyEnabled) clearBleHistory(); Serial.println("BLE history cleared."); printBluetoothSurveySerial(); return; }
-  if (command.startsWith("bleretention ")) {
-    long n=commandArgument(command,"bleretention").toInt();
-    if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
-    else if (n < (long)MIN_BLE_HISTORY_RECORDS || n > (long)bleHistoryCapacity) Serial.println("Invalid BLE retention limit for current physical capacity.");
-    else { setBleRetentionLimit((size_t)n); Serial.println("BLE retention limit updated."); }
-    printBluetoothSurveySerial(); return;
-  }
+
   if (command.startsWith("bleinterval ")) {
     long n=commandArgument(command,"bleinterval").toInt();
     if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
