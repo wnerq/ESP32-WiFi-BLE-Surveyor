@@ -1,5 +1,5 @@
-// WifiConnect23 - compact normalized Wi-Fi history, web/serial interface parity,
-// persistent status-LED/refresh controls, and configurable mDNS hostname
+// WifiConnect24 - compact normalized Wi-Fi/BLE history, balanced dual-radio
+// memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -21,8 +21,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect23_mdns_hostname.ino";
-const char* FIRMWARE_VERSION = "23";
+const char* FIRMWARE_FILE = "WifiConnect24_compact_ble_history.ino";
+const char* FIRMWARE_VERSION = "24";
 
 
 Preferences preferences;
@@ -67,7 +67,10 @@ String apStatusMessage = "";
 const size_t MIN_SCAN_HISTORY_RECORDS = 50;
 const size_t MAX_SCAN_HISTORY_RECORDS = 12000;
 const size_t MIN_BLE_HISTORY_RECORDS = 50;
-const size_t MAX_BLE_HISTORY_RECORDS = 2000;
+const size_t MAX_BLE_HISTORY_RECORDS = 12000;
+const size_t BLE_ADDRESS_TABLE_TARGET = 128;
+const size_t BLE_SCAN_METADATA_SLOTS = 256;
+const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 48 * 1024;
 
 const size_t HISTORY_HEAP_RESERVE_BYTES = 96 * 1024;
 
@@ -120,13 +123,13 @@ struct WifiApEntry {
   uint8_t authMode;
 };
 
-// Scan number and timestamp are stored once per scan. Observations reference
-// one of these slots. Slots are recycled only after observations using the
-// old slot have been discarded.
-struct WifiScanMetadata {
+// Generic scan metadata shared by Wi-Fi and BLE. Each radio has its own
+// metadata table/counter, but both use the same representation and lifecycle.
+struct SurveyScanMetadata {
   uint32_t scanNumber;
   uint32_t uptimeMs;
 };
+using WifiScanMetadata = SurveyScanMetadata;
 
 // Compact recurring measurement. 6 bytes on the classic ESP32 ABI versus
 // 68 bytes for the old flat ScanRecord.
@@ -137,6 +140,8 @@ struct WifiObservation {
   uint8_t reserved;
 };
 
+// Synthesized BLE view used by existing UI/CSV code. V24 no longer stores
+// this flat record in the recurring history ring.
 struct BleScanRecord {
   uint32_t scanNumber;
   uint32_t uptimeMs;
@@ -146,6 +151,24 @@ struct BleScanRecord {
   uint8_t addressType;
   bool named;
 };
+
+// Current properties are stored once per observed BLE address. A random BLE
+// address is treated only as an observed address identity; the firmware does
+// not claim that it permanently identifies one physical device.
+struct BleAddressEntry {
+  char name[48];
+  uint8_t address[6];
+  uint8_t addressType;
+};
+
+// Compact recurring BLE measurement. Meaningful payload is address reference,
+// scan reference, and whole-dBm RSSI. Natural alignment makes this 6 bytes.
+struct BleObservation {
+  uint16_t addressIndex;
+  uint16_t scanSlot;
+  int8_t rssi;
+};
+static_assert(sizeof(BleObservation) == 6, "Unexpected BleObservation size");
 
 struct SignalStats {
   uint32_t samples;
@@ -186,6 +209,9 @@ struct BootHeapCheckpoint {
 const WifiObservation& compactHistoryRecord(size_t logicalIndex);
 ScanRecord historyRecord(size_t logicalIndex);
 void appendWifiObservation(const WifiObservation& observation);
+const BleObservation& compactBleHistoryRecord(size_t logicalIndex);
+BleScanRecord bleHistoryRecord(size_t logicalIndex);
+void appendBleObservation(const BleObservation& observation);
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
@@ -213,10 +239,19 @@ WifiScanMetadata* wifiScanMetadata = nullptr;
 size_t wifiScanMetadataCapacity = 0;
 size_t wifiApTableFullDrops = 0;
 
-BleScanRecord* bleHistory = nullptr;
-size_t bleHistoryCapacity = 0;
+BleObservation* bleHistory = nullptr;
+size_t bleHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
+size_t bleHistoryRetentionLimit = 0;  // Logical user-selected retention limit.
 size_t bleHistoryStart = 0;
 size_t bleHistoryCount = 0;
+BleAddressEntry* bleAddressTable = nullptr;
+size_t bleAddressTableCapacity = 0;
+size_t bleAddressCount = 0;
+size_t bleAddressPeakReferenced = 0;
+size_t bleAddressTableFullDrops = 0;
+SurveyScanMetadata* bleScanMetadata = nullptr;
+size_t bleScanMetadataCapacity = 0;
+size_t bleScanMetadataPeakUsed = 0;
 String bleHistoryResizeMessage = "";
 String bleStatusMessage = "";
 uint32_t bleScanCounter = 0;
@@ -1030,150 +1065,133 @@ int performLoggedScan() {
 }
 
 // ============================================================
-// BLE history
+// BLE compact normalized history (V24)
 // ============================================================
 
-const BleScanRecord& bleHistoryRecord(size_t logicalIndex) {
+size_t bleHistoryAllocatedBytes() {
+  return
+    bleHistoryCapacity * sizeof(BleObservation) +
+    bleAddressTableCapacity * sizeof(BleAddressEntry) +
+    bleScanMetadataCapacity * sizeof(SurveyScanMetadata);
+}
+
+const BleObservation& compactBleHistoryRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (bleHistoryStart + logicalIndex) % bleHistoryCapacity;
   return bleHistory[physicalIndex];
 }
 
-size_t countRetainedBleScanGroups() {
-  if (bleHistoryCount == 0 || bleHistory == nullptr) return 0;
-
-  size_t groups = 0;
-  uint32_t previousScan = 0;
-  bool havePrevious = false;
-
-  for (size_t i = 0; i < bleHistoryCount; i++) {
-    uint32_t currentScan = bleHistoryRecord(i).scanNumber;
-
-    if (!havePrevious || currentScan != previousScan) {
-      groups++;
-      previousScan = currentScan;
-      havePrevious = true;
-    }
-  }
-
-  return groups;
-}
-
-bool resizeBleHistory(size_t requestedCapacity, bool preserveRecords = true) {
-  if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
-    requestedCapacity = MIN_BLE_HISTORY_RECORDS;
-  if (requestedCapacity > MAX_BLE_HISTORY_RECORDS)
-    requestedCapacity = MAX_BLE_HISTORY_RECORDS;
-
-  if (bleHistory != nullptr && requestedCapacity == bleHistoryCapacity) {
-    bleHistoryResizeMessage =
-      "BLE history limit unchanged at " +
-      String(bleHistoryCapacity) + " records.";
-    return true;
-  }
-
-  BleScanRecord* newHistory =
-      (BleScanRecord*)malloc(requestedCapacity * sizeof(BleScanRecord));
-
-  if (newHistory == nullptr) {
-    bleHistoryResizeMessage =
-      "Unable to allocate " +
-      String(requestedCapacity) +
-      " BLE records; previous limit retained.";
-    return false;
-  }
-
-  size_t recordsToKeep = 0;
-
-  if (preserveRecords && bleHistory != nullptr && bleHistoryCount > 0) {
-    recordsToKeep =
-      bleHistoryCount < requestedCapacity ? bleHistoryCount : requestedCapacity;
-    size_t first = bleHistoryCount - recordsToKeep;
-
-    for (size_t i = 0; i < recordsToKeep; i++)
-      newHistory[i] = bleHistoryRecord(first + i);
-  }
-
-  if (bleHistory != nullptr) free(bleHistory);
-
-  bleHistory = newHistory;
-  bleHistoryCapacity = requestedCapacity;
-  bleHistoryStart = 0;
-  bleHistoryCount = recordsToKeep;
-
-  bleHistoryResizeMessage =
-    "BLE history limit set to " +
-    String(bleHistoryCapacity) + " records.";
-
+bool parseBleAddress(const String& text, uint8_t output[6]) {
+  unsigned int b[6];
+  if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
+      &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) output[i] = (uint8_t)b[i];
   return true;
 }
 
-bool clearAndResizeBleHistory(size_t requestedCapacity) {
-  if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
-    requestedCapacity = MIN_BLE_HISTORY_RECORDS;
-  if (requestedCapacity > MAX_BLE_HISTORY_RECORDS)
-    requestedCapacity = MAX_BLE_HISTORY_RECORDS;
+void formatBleAddress(const uint8_t address[6], char output[18]) {
+  snprintf(output, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+    address[0], address[1], address[2], address[3], address[4], address[5]);
+}
 
-  size_t previousCapacity = bleHistoryCapacity;
+BleScanRecord bleHistoryRecord(size_t logicalIndex) {
+  BleScanRecord record = {};
+  if (
+    bleHistory == nullptr || logicalIndex >= bleHistoryCount ||
+    bleAddressTable == nullptr || bleScanMetadata == nullptr
+  ) return record;
 
-  if (bleHistory != nullptr) {
-    free(bleHistory);
-    bleHistory = nullptr;
+  const BleObservation& observation = compactBleHistoryRecord(logicalIndex);
+  if (
+    observation.addressIndex >= bleAddressTableCapacity ||
+    observation.scanSlot >= bleScanMetadataCapacity
+  ) return record;
+
+  const BleAddressEntry& entry = bleAddressTable[observation.addressIndex];
+  const SurveyScanMetadata& scan = bleScanMetadata[observation.scanSlot];
+  record.scanNumber = scan.scanNumber;
+  record.uptimeMs = scan.uptimeMs;
+  memcpy(record.name, entry.name, sizeof(record.name));
+  formatBleAddress(entry.address, record.address);
+  record.rssi = observation.rssi;
+  record.addressType = entry.addressType;
+  record.named = entry.name[0] != '\0';
+  return record;
+}
+
+bool bleAddressIndexIsReferenced(size_t addressIndex) {
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    if (compactBleHistoryRecord(i).addressIndex == addressIndex) return true;
   }
-
-  bleHistoryCapacity = 0;
-  bleHistoryStart = 0;
-  bleHistoryCount = 0;
-  bleScanCounter = 0;
-  lastBleScanUptimeMs = 0;
-
-  BleScanRecord* newHistory =
-      (BleScanRecord*)malloc(requestedCapacity * sizeof(BleScanRecord));
-
-  if (newHistory != nullptr) {
-    bleHistory = newHistory;
-    bleHistoryCapacity = requestedCapacity;
-    bleHistoryResizeMessage =
-      "BLE history cleared; limit set to " +
-      String(bleHistoryCapacity) + " records.";
-    return true;
-  }
-
-  size_t fallback =
-      previousCapacity > 0 ? previousCapacity : MIN_BLE_HISTORY_RECORDS;
-
-  newHistory =
-      (BleScanRecord*)malloc(fallback * sizeof(BleScanRecord));
-
-  if (newHistory != nullptr) {
-    bleHistory = newHistory;
-    bleHistoryCapacity = fallback;
-    bleHistoryResizeMessage =
-      "BLE history cleared, requested resize failed; restored empty " +
-      String(bleHistoryCapacity) + "-record buffer.";
-    return false;
-  }
-
-  bleHistoryResizeMessage =
-    "BLE history cleared, but no BLE history buffer could be allocated.";
   return false;
 }
 
-void appendBleScanRecord(const BleScanRecord& record) {
-  if (bleHistory == nullptr || bleHistoryCapacity == 0) return;
+size_t countReferencedBleAddresses() {
+  if (!bleAddressTable || bleAddressTableCapacity == 0) return 0;
+  size_t count = 0;
+  for (size_t i = 0; i < bleAddressTableCapacity; i++)
+    if (bleAddressIndexIsReferenced(i)) count++;
+  return count;
+}
 
-  size_t writeIndex;
-
-  if (bleHistoryCount < bleHistoryCapacity) {
-    writeIndex =
-      (bleHistoryStart + bleHistoryCount) % bleHistoryCapacity;
-    bleHistoryCount++;
-  } else {
-    writeIndex = bleHistoryStart;
-    bleHistoryStart = (bleHistoryStart + 1) % bleHistoryCapacity;
+size_t countReferencedBleScanSlots() {
+  if (!bleScanMetadata || bleScanMetadataCapacity == 0) return 0;
+  size_t count = 0;
+  for (size_t slot = 0; slot < bleScanMetadataCapacity; slot++) {
+    bool referenced = false;
+    for (size_t i = 0; i < bleHistoryCount; i++) {
+      if (compactBleHistoryRecord(i).scanSlot == slot) { referenced = true; break; }
+    }
+    if (referenced) count++;
   }
+  return count;
+}
 
-  bleHistory[writeIndex] = record;
+void updateBleUsageHighWaterMarks() {
+  size_t addresses = countReferencedBleAddresses();
+  if (addresses > bleAddressPeakReferenced) bleAddressPeakReferenced = addresses;
+  size_t scans = countReferencedBleScanSlots();
+  if (scans > bleScanMetadataPeakUsed) bleScanMetadataPeakUsed = scans;
+}
+
+void discardOldestBleObservation() {
+  if (bleHistoryCount == 0 || bleHistoryCapacity == 0) return;
+  bleHistoryStart = (bleHistoryStart + 1) % bleHistoryCapacity;
+  bleHistoryCount--;
+}
+
+void discardBleObservationsForScanSlot(uint16_t scanSlot) {
+  if (bleHistoryCount == 0) return;
+  size_t original = bleHistoryCount;
+  for (size_t i = 0; i < original; i++) {
+    BleObservation observation = compactBleHistoryRecord(0);
+    discardOldestBleObservation();
+    if (observation.scanSlot != scanSlot) appendBleObservation(observation);
+  }
+}
+
+bool setBleRetentionLimit(size_t requestedCapacity) {
+  if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
+    requestedCapacity = MIN_BLE_HISTORY_RECORDS;
+  if (requestedCapacity > bleHistoryCapacity)
+    requestedCapacity = bleHistoryCapacity;
+  bleHistoryRetentionLimit = requestedCapacity;
+  while (bleHistoryCount > bleHistoryRetentionLimit)
+    discardOldestBleObservation();
+  bleHistoryResizeMessage =
+    "BLE retention limit set to " + String(bleHistoryRetentionLimit) +
+    " observations (physical capacity " + String(bleHistoryCapacity) + ").";
+  return true;
+}
+
+void appendBleObservation(const BleObservation& observation) {
+  if (!bleHistory || bleHistoryCapacity == 0 || bleHistoryRetentionLimit == 0)
+    return;
+  while (bleHistoryCount >= bleHistoryRetentionLimit)
+    discardOldestBleObservation();
+  size_t writeIndex = (bleHistoryStart + bleHistoryCount) % bleHistoryCapacity;
+  bleHistory[writeIndex] = observation;
+  bleHistoryCount++;
 }
 
 void clearBleHistory() {
@@ -1181,191 +1199,282 @@ void clearBleHistory() {
   bleHistoryCount = 0;
   bleScanCounter = 0;
   lastBleScanUptimeMs = 0;
+  bleAddressCount = 0;
+  bleAddressPeakReferenced = 0;
+  bleAddressTableFullDrops = 0;
+  bleScanMetadataPeakUsed = 0;
+  if (bleAddressTable && bleAddressTableCapacity)
+    memset(bleAddressTable, 0, bleAddressTableCapacity * sizeof(BleAddressEntry));
+  if (bleScanMetadata && bleScanMetadataCapacity)
+    memset(bleScanMetadata, 0, bleScanMetadataCapacity * sizeof(SurveyScanMetadata));
 }
 
-size_t capacityForBudget(
-  size_t budgetBytes,
-  size_t recordSize,
-  size_t minimumRecords,
-  size_t maximumRecords
-) {
-  if (recordSize == 0) return minimumRecords;
+int findBleAddress(const uint8_t address[6]) {
+  for (size_t i = 0; i < bleAddressCount; i++) {
+    if (memcmp(bleAddressTable[i].address, address, 6) == 0) return (int)i;
+  }
+  return -1;
+}
 
-  size_t capacity = budgetBytes / recordSize;
-  if (capacity < minimumRecords) capacity = minimumRecords;
-  if (capacity > maximumRecords) capacity = maximumRecords;
-  return capacity;
+int findOrCreateBleAddress(
+  const uint8_t address[6],
+  const String& name,
+  uint8_t addressType
+) {
+  int existing = findBleAddress(address);
+  if (existing >= 0) {
+    BleAddressEntry& entry = bleAddressTable[existing];
+    if (name.length() > 0 && !name.equals(String(entry.name)))
+      name.toCharArray(entry.name, sizeof(entry.name));
+    entry.addressType = addressType;
+    return existing;
+  }
+
+  if (!bleAddressTable) { bleAddressTableFullDrops++; return -1; }
+
+  size_t target = bleAddressCount;
+  if (bleAddressCount >= bleAddressTableCapacity) {
+    target = bleAddressTableCapacity;
+    for (size_t i = 0; i < bleAddressTableCapacity; i++) {
+      if (!bleAddressIndexIsReferenced(i)) { target = i; break; }
+    }
+    if (target >= bleAddressTableCapacity) {
+      bleAddressTableFullDrops++;
+      return -1;
+    }
+  } else {
+    bleAddressCount++;
+  }
+
+  BleAddressEntry& entry = bleAddressTable[target];
+  memset(&entry, 0, sizeof(entry));
+  memcpy(entry.address, address, 6);
+  if (name.length() > 0) name.toCharArray(entry.name, sizeof(entry.name));
+  entry.addressType = addressType;
+  return (int)target;
+}
+
+bool initializeCompactBleHistory(size_t budgetBytes) {
+  const size_t addressCapacity = BLE_ADDRESS_TABLE_TARGET;
+  const size_t scanCapacity = BLE_SCAN_METADATA_SLOTS;
+  size_t metadataBytes =
+      addressCapacity * sizeof(BleAddressEntry) +
+      scanCapacity * sizeof(SurveyScanMetadata);
+  size_t observationCapacity = MIN_BLE_HISTORY_RECORDS;
+  if (budgetBytes > metadataBytes) {
+    observationCapacity =
+      (budgetBytes - metadataBytes) / sizeof(BleObservation);
+    if (observationCapacity < MIN_BLE_HISTORY_RECORDS)
+      observationCapacity = MIN_BLE_HISTORY_RECORDS;
+  }
+  if (observationCapacity > MAX_BLE_HISTORY_RECORDS)
+    observationCapacity = MAX_BLE_HISTORY_RECORDS;
+
+  bleAddressTable = (BleAddressEntry*)calloc(addressCapacity, sizeof(BleAddressEntry));
+  bleScanMetadata =
+      (SurveyScanMetadata*)calloc(scanCapacity, sizeof(SurveyScanMetadata));
+  bleHistory =
+      (BleObservation*)malloc(observationCapacity * sizeof(BleObservation));
+
+  if (!bleAddressTable || !bleScanMetadata || !bleHistory) {
+    if (bleAddressTable) free(bleAddressTable);
+    if (bleScanMetadata) free(bleScanMetadata);
+    if (bleHistory) free(bleHistory);
+    bleAddressTable = nullptr;
+    bleScanMetadata = nullptr;
+    bleHistory = nullptr;
+    bleAddressTableCapacity = 0;
+    bleScanMetadataCapacity = 0;
+    bleHistoryCapacity = 0;
+    bleHistoryRetentionLimit = 0;
+    return false;
+  }
+
+  bleAddressTableCapacity = addressCapacity;
+  bleScanMetadataCapacity = scanCapacity;
+  bleHistoryCapacity = observationCapacity;
+  bleHistoryRetentionLimit = observationCapacity;
+  bleHistoryStart = 0;
+  bleHistoryCount = 0;
+  bleAddressCount = 0;
+  bleAddressPeakReferenced = 0;
+  bleScanMetadataPeakUsed = 0;
+  bleAddressTableFullDrops = 0;
+  return true;
+}
+
+size_t countRetainedBleScanGroups() {
+  if (bleHistoryCount == 0 || bleHistory == nullptr) return 0;
+  size_t groups = 0;
+  uint32_t previousScan = 0;
+  bool havePrevious = false;
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    uint32_t currentScan = bleHistoryRecord(i).scanNumber;
+    if (!havePrevious || currentScan != previousScan) {
+      groups++;
+      previousScan = currentScan;
+      havePrevious = true;
+    }
+  }
+  return groups;
 }
 
 void initializeAutoSizedHistories() {
   if (scanHistory != nullptr || bleHistory != nullptr) return;
 
   size_t freeHeap = ESP.getFreeHeap();
-  size_t available =
-    freeHeap > HISTORY_HEAP_RESERVE_BYTES
-      ? freeHeap - HISTORY_HEAP_RESERVE_BYTES
-      : 0;
 
-  size_t wifiBudget = bleSurveyEnabled ? available / 2 : available;
-  size_t bleBudget = bleSurveyEnabled ? available - wifiBudget : 0;
+  if (!bleSurveyEnabled) {
+    size_t available = freeHeap > HISTORY_HEAP_RESERVE_BYTES
+      ? freeHeap - HISTORY_HEAP_RESERVE_BYTES : 0;
+    size_t minimumCompactBytes =
+        64 * sizeof(WifiApEntry) +
+        64 * sizeof(WifiScanMetadata) +
+        MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
+    if (available < minimumCompactBytes) available = minimumCompactBytes;
+    if (!initializeCompactWifiHistory(available))
+      initializeCompactWifiHistory(minimumCompactBytes);
+  } else {
+    // BLE initialization itself consumes substantial heap. In dual-radio mode
+    // preserve an explicit 48 KB runtime floor, then split remaining recurring
+    // observation RAM 50/50 after each radio's fixed metadata structures.
+    size_t available = freeHeap > DUAL_RADIO_HEAP_RESERVE_BYTES
+      ? freeHeap - DUAL_RADIO_HEAP_RESERVE_BYTES : 0;
 
-  // When BLE leaves no budget above the preferred reserve, still provide a
-  // small functional Wi-Fi history footprint comparable to V20's 50 records.
-  size_t minimumCompactBytes =
-      64 * sizeof(WifiApEntry) +
-      64 * sizeof(WifiScanMetadata) +
-      MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
-  if (wifiBudget < minimumCompactBytes)
-    wifiBudget = minimumCompactBytes;
+    const size_t wifiMetadata =
+        64 * sizeof(WifiApEntry) + 64 * sizeof(WifiScanMetadata);
+    const size_t bleMetadata =
+        BLE_ADDRESS_TABLE_TARGET * sizeof(BleAddressEntry) +
+        BLE_SCAN_METADATA_SLOTS * sizeof(SurveyScanMetadata);
+    const size_t minimumWifiObs =
+        MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
+    const size_t minimumBleObs =
+        MIN_BLE_HISTORY_RECORDS * sizeof(BleObservation);
+    const size_t minimumTotal =
+        wifiMetadata + bleMetadata + minimumWifiObs + minimumBleObs;
 
-  if (!initializeCompactWifiHistory(wifiBudget)) {
-    // Last-resort compact allocation with the minimum practical tables.
-    size_t fallbackBytes = minimumCompactBytes;
-    initializeCompactWifiHistory(fallbackBytes);
-  }
+    size_t extra = available > minimumTotal ? available - minimumTotal : 0;
+    size_t wifiExtra = extra / 2;
+    size_t bleExtra = extra - wifiExtra;
+    size_t wifiBudget = wifiMetadata + minimumWifiObs + wifiExtra;
+    size_t bleBudget = bleMetadata + minimumBleObs + bleExtra;
 
-  if (bleSurveyEnabled) {
-    size_t bleTarget = capacityForBudget(
-      bleBudget,
-      sizeof(BleScanRecord),
-      MIN_BLE_HISTORY_RECORDS,
-      MAX_BLE_HISTORY_RECORDS
-    );
-
-    if (!resizeBleHistory(bleTarget, false))
-      resizeBleHistory(MIN_BLE_HISTORY_RECORDS, false);
+    if (!initializeCompactWifiHistory(wifiBudget))
+      initializeCompactWifiHistory(wifiMetadata + minimumWifiObs);
+    if (!initializeCompactBleHistory(bleBudget))
+      initializeCompactBleHistory(bleMetadata + minimumBleObs);
   }
 
   bootWifiHistoryCapacity = scanHistoryCapacity;
   bootBleHistoryCapacity = bleHistoryCapacity;
-
   historyResizeMessage = "";
   bleHistoryResizeMessage = "";
 }
 
 bool bleHistoryContainsAddress(const String& address) {
-  for (size_t i = 0; i < bleHistoryCount; i++) {
-    if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address))
-      return true;
-  }
-  return false;
+  uint8_t parsed[6];
+  if (!parseBleAddress(address, parsed)) return false;
+  int index = findBleAddress(parsed);
+  return index >= 0 && bleAddressIndexIsReferenced((size_t)index);
 }
 
 String latestBleNameForAddress(const String& address) {
-  for (size_t offset = 0; offset < bleHistoryCount; offset++) {
-    size_t i = bleHistoryCount - 1 - offset;
-    const BleScanRecord& record = bleHistoryRecord(i);
-
-    if (
-      String(record.address).equalsIgnoreCase(address) &&
-      record.named
-    ) {
-      return String(record.name);
-    }
-  }
-  return "(unnamed)";
+  uint8_t parsed[6];
+  if (!parseBleAddress(address, parsed)) return "(unnamed)";
+  int index = findBleAddress(parsed);
+  if (index < 0 || !bleAddressIndexIsReferenced((size_t)index)) return "(unnamed)";
+  return bleAddressTable[index].name[0] ? String(bleAddressTable[index].name) : String("(unnamed)");
 }
 
-bool hasNewerBleObservationForAddress(
-  size_t logicalIndex,
-  const String& address
-) {
+bool hasNewerBleObservationForAddress(size_t logicalIndex, const String& address) {
   for (size_t i = logicalIndex + 1; i < bleHistoryCount; i++) {
-    if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address))
-      return true;
+    if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address)) return true;
   }
   return false;
 }
 
-bool buildBleDeviceSummary(
-  const String& address,
-  BLEDeviceSummary& summary
-) {
+bool buildBleDeviceSummary(const String& address, BLEDeviceSummary& summary) {
   summary = {};
   resetSignalStats(summary.signal);
-
   bool found = false;
-  String newestName = "";
-
   for (size_t i = 0; i < bleHistoryCount; i++) {
-    const BleScanRecord& record = bleHistoryRecord(i);
+    BleScanRecord record = bleHistoryRecord(i);
     if (!String(record.address).equalsIgnoreCase(address)) continue;
-
     found = true;
     addSignalObservation(summary.signal, record.rssi, record.uptimeMs);
     summary.addressType = record.addressType;
-
-    if (record.named && String(record.name).length() > 0)
-      newestName = String(record.name);
   }
-
   if (!found) return false;
-
   address.toCharArray(summary.address, sizeof(summary.address));
-
-  if (newestName.length() > 0) {
-    newestName.toCharArray(summary.name, sizeof(summary.name));
+  String currentName = latestBleNameForAddress(address);
+  if (currentName != "(unnamed)") {
+    currentName.toCharArray(summary.name, sizeof(summary.name));
     summary.named = true;
   }
-
   return true;
 }
 
 int performLoggedBLEScan() {
   if (!bleSurveyEnabled) {
-    bleStatusMessage =
-      "Bluetooth Survey is disabled; BLE stack is not initialized.";
+    bleStatusMessage = "Bluetooth Survey is disabled; BLE stack is not initialized.";
     return -1;
   }
 
   initializeBLEScanner();
-
   BLEScan* scan = BLEDevice::getScan();
   bleStatusMessage = "BLE scan in progress...";
-
   startScanLed(BLE_SCAN_LED_PERIOD_TICKS);
-  BLEScanResults* results =
-      scan->start(BLE_SCAN_DURATION_SECONDS, false);
+  BLEScanResults* results = scan->start(BLE_SCAN_DURATION_SECONDS, false);
   stopScanLed();
 
   bleScanCounter++;
   lastBleScanUptimeMs = millis();
+  int resultCount = results != nullptr ? results->getCount() : 0;
 
-  int resultCount =
-      results != nullptr ? results->getCount() : 0;
+  if (!bleScanMetadata || bleScanMetadataCapacity == 0) {
+    if (results) scan->clearResults();
+    return resultCount;
+  }
+
+  uint16_t scanSlot =
+      (uint16_t)((bleScanCounter - 1) % bleScanMetadataCapacity);
+  if (
+    bleScanMetadata[scanSlot].scanNumber != 0 &&
+    bleScanMetadata[scanSlot].scanNumber != bleScanCounter
+  ) discardBleObservationsForScanSlot(scanSlot);
+  bleScanMetadata[scanSlot].scanNumber = bleScanCounter;
+  bleScanMetadata[scanSlot].uptimeMs = lastBleScanUptimeMs;
 
   if (results != nullptr) {
     for (int i = 0; i < resultCount; i++) {
       BLEAdvertisedDevice device = results->getDevice(i);
-
-      BleScanRecord record = {};
-      record.scanNumber = bleScanCounter;
-      record.uptimeMs = lastBleScanUptimeMs;
-      record.rssi = device.getRSSI();
-      record.addressType = device.getAddressType();
-
-      String address = device.getAddress().toString();
-      address.toCharArray(record.address, sizeof(record.address));
-
-      if (device.haveName()) {
-        String name = device.getName();
-        if (name.length() > 0) {
-          name.toCharArray(record.name, sizeof(record.name));
-          record.named = true;
-        }
-      }
-
-      appendBleScanRecord(record);
+      String addressText = device.getAddress().toString();
+      uint8_t rawAddress[6];
+      if (!parseBleAddress(addressText, rawAddress)) continue;
+      String name = "";
+      if (device.haveName()) name = device.getName();
+      int addressIndex = findOrCreateBleAddress(
+        rawAddress, name, (uint8_t)device.getAddressType());
+      if (addressIndex < 0) continue;
+      int rssi = device.getRSSI();
+      if (rssi < -128) rssi = -128;
+      if (rssi > 127) rssi = 127;
+      BleObservation observation = {};
+      observation.addressIndex = (uint16_t)addressIndex;
+      observation.scanSlot = scanSlot;
+      observation.rssi = (int8_t)rssi;
+      appendBleObservation(observation);
     }
   }
 
   scan->clearResults();
-
+  updateBleUsageHighWaterMarks();
   bleStatusMessage =
-    "BLE scan #" + String(bleScanCounter) +
-    " complete: " + String(resultCount) +
-    " device(s) observed.";
-
+    "BLE scan #" + String(bleScanCounter) + " complete: " +
+    String(resultCount) + " address(es) observed.";
+  if (bleAddressTableFullDrops > 0)
+    bleStatusMessage += " WARN: " + String(bleAddressTableFullDrops) +
+      " observation(s) dropped because the BLE Address Table was full.";
   return resultCount;
 }
 
@@ -3373,12 +3482,9 @@ void handleBLESettings() {
     if (requested < (long)MIN_BLE_HISTORY_RECORDS) requested = MIN_BLE_HISTORY_RECORDS;
     if (requested > (long)MAX_BLE_HISTORY_RECORDS) requested = MAX_BLE_HISTORY_RECORDS;
 
-    bool clearBeforeResize = server.hasArg("clear_resize");
-
-    if (clearBeforeResize && (size_t)requested != bleHistoryCapacity)
-      clearAndResizeBleHistory((size_t)requested);
-    else
-      resizeBleHistory((size_t)requested, true);
+    if ((size_t)requested > bleHistoryCapacity)
+      requested = (long)bleHistoryCapacity;
+    setBleRetentionLimit((size_t)requested);
   }
 
   autoBleScanEnabled = server.hasArg("auto");
@@ -3605,9 +3711,20 @@ void handleBLESurvey() {
   status += "<div class=\"row\"><span class=\"label\">Scans This Session</span><span class=\"value\">" +
     String(bleScanCounter) + "</span></div>";
   status += "<div class=\"row\"><span class=\"label\">Stored Records</span><span class=\"value\">" +
-    String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + "</span></div>";
+    String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) +
+    " retained; " + String(bleHistoryCapacity) + " physical</span></div>";
   status += "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
-    String((bleHistoryCapacity * sizeof(BleScanRecord)) / 1024.0, 1) + " KB</span></div>";
+    String(bleHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" +
+    String(sizeof(BleObservation)) + " bytes (V23 flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" +
+    String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " +
+    String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB allocated</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" +
+    String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " +
+    String(bleScanMetadataPeakUsed) + "; " + String(bleScanMetadataCapacity*sizeof(SurveyScanMetadata)/1024.0,1) + " KB allocated</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Dropped BLE Observations</span><span class=\"value\">" +
+    String(bleAddressTableFullDrops) + " (address table full)</span></div>";
   status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
   status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
   status += "</span></div>";
@@ -3616,11 +3733,10 @@ void handleBLESurvey() {
     "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
     "<input id=\"ble-interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" +
     String(bleScanIntervalSeconds) + "\"></div>"
-    "<div class=\"control\"><label for=\"ble-history\">History limit (records)</label>"
-    "<input id=\"ble-history\" name=\"history\" type=\"number\" min=\"50\" max=\"2000\" value=\"" +
-    String(bleHistoryCapacity) + "\"></div>"
+    "<div class=\"control\"><label for=\"ble-history\">Retention limit (observations)</label>"
+    "<input id=\"ble-history\" name=\"history\" type=\"number\" min=\"50\" max=\"" +
+    String(bleHistoryCapacity) + "\" value=\"" + String(bleHistoryRetentionLimit) + "\"></div>"
     "<div class=\"checkbox-stack\">"
-    "<label><input type=\"checkbox\" name=\"clear_resize\" value=\"1\"> Clear history before resizing</label>"
     "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
 
   if (autoBleScanEnabled) status += " checked";
@@ -3631,7 +3747,7 @@ void handleBLESurvey() {
     "<a class=\"button\" href=\"/ble-clear\">Clear History</a>"
     "<a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
     "<div class=\"note\">Automatic BLE scanning defaults to 300 seconds. "
-    "History capacity is auto-sized at boot from available heap.</div>";
+    "Physical capacity is allocated once at boot; the retention limit changes immediately without reallocating RAM.</div>";
 
   if (bleHistoryResizeMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleHistoryResizeMessage) + "</strong></div>";
   if (bleStatusMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleStatusMessage) + "</strong></div>";
@@ -3766,6 +3882,8 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Target Heap Reserve</span><span class=\"value\">" + String((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024) + " KB at history allocation</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " physical capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Observation Size</span><span class=\"value\">" + String(sizeof(WifiObservation)) + " bytes (V20 flat record was " + String(sizeof(ScanRecord)) + " bytes)</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + " entries; " + String(wifiApTableCapacity*sizeof(WifiApEntry)/1024.0,1) + " KB allocated</span></div>";
@@ -3778,7 +3896,10 @@ void handleSystemStatus() {
     s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestWifi.uptimeMs, newestWifi.uptimeMs)) + "</span></div>";
   }
   if (bleSurveyEnabled) {
-    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryCapacity) + " records, " + String(bleHistoryCapacity*sizeof(BleScanRecord)/1024.0,1) + " KB allocated</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) + " retained; " + String(bleHistoryCapacity) + " physical; " + String(bleHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" + String(sizeof(BleObservation)) + " bytes (V23 flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" + String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " + String(bleAddressPeakReferenced) + "; drops " + String(bleAddressTableFullDrops) + "</span></div>";
+    s += "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" + String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " + String(bleScanMetadataPeakUsed) + "</span></div>";
     s += "<div class=\"row\"><span class=\"label\">BLE Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>";
     if (bleHistoryCount > 0) {
       const BleScanRecord& oldestBle = bleHistoryRecord(0);
@@ -3831,7 +3952,11 @@ void handleSystemStatus() {
       scanHistoryRetentionLimit<=scanHistoryCapacity &&
       historyCount<=scanHistoryRetentionLimit;
   bool bh = !bleSurveyEnabled ||
-      (bleHistory && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryCount<=bleHistoryCapacity);
+      (bleHistory && bleAddressTable && bleScanMetadata &&
+       bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS &&
+       bleHistoryRetentionLimit>=MIN_BLE_HISTORY_RECORDS &&
+       bleHistoryRetentionLimit<=bleHistoryCapacity &&
+       bleHistoryCount<=bleHistoryRetentionLimit);
   server.sendContent(selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid"));
   server.sendContent(selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL",
     !bleSurveyEnabled ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid")));
@@ -3854,7 +3979,7 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V23.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V24. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -4412,13 +4537,18 @@ void printBluetoothSurveySerial() {
     Serial.print(bleScanIntervalSeconds);
     Serial.println(" s");
     Serial.print("History:             ");
-    Serial.print(bleHistoryCount);
-    Serial.print(" / ");
-    Serial.println(bleHistoryCapacity);
+    Serial.print(bleHistoryCount); Serial.print(" / "); Serial.print(bleHistoryRetentionLimit);
+    Serial.print(" retained; "); Serial.print(bleHistoryCapacity); Serial.println(" physical");
+    Serial.print("History RAM:         "); Serial.print(bleHistoryAllocatedBytes()/1024.0,1); Serial.println(" KB total");
+    Serial.print("Observation size:    "); Serial.print(sizeof(BleObservation)); Serial.println(" bytes");
+    Serial.print("Address table:       "); Serial.print(countReferencedBleAddresses()); Serial.print(" / "); Serial.print(bleAddressTableCapacity); Serial.print(" referenced; peak "); Serial.println(bleAddressPeakReferenced);
+    Serial.print("Scan metadata:       "); Serial.print(countReferencedBleScanSlots()); Serial.print(" / "); Serial.print(bleScanMetadataCapacity); Serial.print(" referenced; peak "); Serial.println(bleScanMetadataPeakUsed);
+    Serial.print("Address-table drops: "); Serial.println(bleAddressTableFullDrops);
     Serial.println();
     Serial.println("BLE commands:");
     Serial.println("  blescan              - Scan now");
     Serial.println("  bleclear             - Clear BLE history");
+    Serial.println("  bleretention <n>     - Set BLE logical retention limit");
     Serial.println("  bleinterval <sec>    - Set BLE automatic scan interval");
     Serial.println("  bleauto on|off       - Enable/disable automatic BLE scans");
     Serial.println("  ble off              - Disable BLE Survey and restart");
@@ -4459,12 +4589,14 @@ void printSystemSerial() {
   Serial.print("Free heap:            "); Serial.print(freeHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Minimum free heap:    "); Serial.print(minHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Largest free block:   "); Serial.print(largest/1024.0, 1); Serial.println(" KB");
+  Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only");
+  Serial.print("History reserve target:"); Serial.print(" "); Serial.print((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024); Serial.println(" KB at allocation");
   Serial.print("STA MAC:              "); Serial.println(WiFi.macAddress());
   Serial.print("AP MAC:               "); Serial.println(WiFi.softAPmacAddress());
   Serial.print("Wi-Fi history:        "); Serial.print(historyCount); Serial.print(" / "); Serial.print(scanHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(scanHistoryCapacity); Serial.println(" physical");
   Serial.print("Wi-Fi history RAM:    "); Serial.print(wifiHistoryAllocatedBytes()/1024.0, 1); Serial.println(" KB");
   Serial.print("BLE history:          ");
-  if (bleSurveyEnabled) { Serial.print(bleHistoryCount); Serial.print(" / "); Serial.println(bleHistoryCapacity); }
+  if (bleSurveyEnabled) { Serial.print(bleHistoryCount); Serial.print(" / "); Serial.print(bleHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(bleHistoryCapacity); Serial.println(" physical"); }
   else Serial.println("Disabled at boot");
   Serial.print("Status LED:           "); Serial.println(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled by setting") : "Not available");
   Serial.print("Web auto-refresh:     "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
@@ -4496,7 +4628,8 @@ void printSystemSerial() {
 void printSoftwareSelfTestsSerial() {
   bool wifiHistOk = scanHistory && wifiApTable && wifiScanMetadata &&
                     scanHistoryCapacity >= MIN_SCAN_HISTORY_RECORDS;
-  bool bleOk = !bleSurveyEnabled || (bleInitialized && bleHistory != nullptr);
+  bool bleOk = !bleSurveyEnabled ||
+      (bleInitialized && bleHistory != nullptr && bleAddressTable != nullptr && bleScanMetadata != nullptr);
   bool intervalsOk = scanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS &&
                      scanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS &&
                      (!bleSurveyEnabled || (bleScanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS));
@@ -4594,6 +4727,13 @@ void handleSerialCommand() {
     printBluetoothSurveySerial(); return;
   }
   if (command.equalsIgnoreCase("bleclear")) { if (bleSurveyEnabled) clearBleHistory(); Serial.println("BLE history cleared."); printBluetoothSurveySerial(); return; }
+  if (command.startsWith("bleretention ")) {
+    long n=commandArgument(command,"bleretention").toInt();
+    if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
+    else if (n < (long)MIN_BLE_HISTORY_RECORDS || n > (long)bleHistoryCapacity) Serial.println("Invalid BLE retention limit for current physical capacity.");
+    else { setBleRetentionLimit((size_t)n); Serial.println("BLE retention limit updated."); }
+    printBluetoothSurveySerial(); return;
+  }
   if (command.startsWith("bleinterval ")) {
     long n=commandArgument(command,"bleinterval").toInt();
     if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
@@ -4737,7 +4877,7 @@ void setup() {
   Serial.print("Auto-sized BLE history:   ");
   if (bleSurveyEnabled) {
     Serial.print(bleHistoryCapacity);
-    Serial.println(" records");
+    Serial.println(" compact observation slots");
   } else {
     Serial.println("disabled");
   }
@@ -4762,7 +4902,8 @@ void setup() {
       scanHistory == nullptr ||
       wifiApTable == nullptr ||
       wifiScanMetadata == nullptr ||
-      (bleSurveyEnabled && (!bleInitialized || bleHistory == nullptr));
+      (bleSurveyEnabled && (!bleInitialized || bleHistory == nullptr ||
+        bleAddressTable == nullptr || bleScanMetadata == nullptr));
 
   bool startupWarning =
       !startupFailed &&
@@ -4770,7 +4911,7 @@ void setup() {
        (mdnsAttempted && !mdnsStarted) ||
        scanHistoryCapacity == MIN_SCAN_HISTORY_RECORDS ||
        (bleSurveyEnabled &&
-        bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS));
+        (bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS || bleAddressTableFullDrops > 0)));
 
   indicateStartupStatus(startupFailed, startupWarning);
 
