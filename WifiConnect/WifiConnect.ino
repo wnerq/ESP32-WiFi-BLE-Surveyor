@@ -1,8 +1,9 @@
-// WifiConnect22 - compact normalized Wi-Fi history, web/serial interface parity,
-// persistent status-LED controls, configurable scan-completion page refresh
+// WifiConnect23 - compact normalized Wi-Fi history, web/serial interface parity,
+// persistent status-LED/refresh controls, and configurable mDNS hostname
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -20,8 +21,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect22_serial_ui_led_controls.ino";
-const char* FIRMWARE_VERSION = "22";
+const char* FIRMWARE_FILE = "WifiConnect23_mdns_hostname.ino";
+const char* FIRMWARE_VERSION = "23";
 
 
 Preferences preferences;
@@ -31,6 +32,17 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
 
 bool webServerStarted = false;
+
+// ============================================================
+// Local network identity / mDNS
+// ============================================================
+
+const char* DEFAULT_MDNS_HOSTNAME = "surveyor";
+const size_t MAX_MDNS_HOSTNAME_LENGTH = 32;
+String mdnsHostname = DEFAULT_MDNS_HOSTNAME;
+bool mdnsStarted = false;
+bool mdnsAttempted = false;
+String mdnsStatusMessage = "Not started";
 
 
 // ============================================================
@@ -421,12 +433,74 @@ void saveAccessPointSettings(
   preferences.end();
 }
 
+bool isValidMdnsHostname(const String& value) {
+  if (value.length() < 1 || value.length() > MAX_MDNS_HOSTNAME_LENGTH) return false;
+  if (value[0] == '-' || value[value.length() - 1] == '-') return false;
+
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    bool digit = (c >= '0' && c <= '9');
+    if (!alpha && !digit && c != '-') return false;
+  }
+  return true;
+}
+
+String normalizedMdnsHostname(String value) {
+  value.trim();
+  value.toLowerCase();
+  return value;
+}
+
+String mdnsWebAddress() {
+  return "http://" + mdnsHostname + ".local/";
+}
+
 void loadSurveyModeSettings() {
   preferences.begin("survey", true);
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
+  mdnsHostname = normalizedMdnsHostname(preferences.getString("hostname", DEFAULT_MDNS_HOSTNAME));
   preferences.end();
+
+  if (!isValidMdnsHostname(mdnsHostname)) {
+    mdnsHostname = DEFAULT_MDNS_HOSTNAME;
+  }
+}
+
+void saveMdnsHostname(const String& hostname) {
+  mdnsHostname = normalizedMdnsHostname(hostname);
+  preferences.begin("survey", false);
+  preferences.putString("hostname", mdnsHostname);
+  preferences.end();
+}
+
+bool startMdnsService() {
+  mdnsAttempted = true;
+
+  if (WiFi.status() != WL_CONNECTED && !apRunning) {
+    mdnsStarted = false;
+    mdnsStatusMessage = "No active network interface";
+    return false;
+  }
+
+  if (!isValidMdnsHostname(mdnsHostname)) {
+    mdnsStarted = false;
+    mdnsStatusMessage = "Invalid hostname";
+    return false;
+  }
+
+  if (!MDNS.begin(mdnsHostname.c_str())) {
+    mdnsStarted = false;
+    mdnsStatusMessage = "mDNS responder failed to start";
+    return false;
+  }
+
+  MDNS.addService("http", "tcp", 80);
+  mdnsStarted = true;
+  mdnsStatusMessage = "Advertising " + mdnsHostname + ".local";
+  return true;
 }
 
 void saveBleSurveyEnabled(bool enabled) {
@@ -3724,12 +3798,15 @@ void handleSystemStatus() {
   if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">mDNS Hostname</span><span class=\"value\">" + htmlEscape(mdnsHostname) + ".local</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\"><a href=\"" + htmlEscape(mdnsWebAddress()) + "\">" + htmlEscape(mdnsWebAddress()) + "</a></span></div>";
+  s += "<div class=\"row\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled (maximum Wi-Fi history)") + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_AVAILABLE ? (statusLedEnabled ? String("GPIO ") + String(STATUS_LED_PIN) + String(" enabled") : String("Disabled by setting")) : String("Not available")) + "</span></div></div>";
   server.sendContent(s);
 
   server.sendContent("<div class=\"card\"><h2>Boot Heap Checkpoints</h2>"
-    "<div class=\"note\">Captured during startup so Wi-Fi, BLE, history, web-server, and initial-scan RAM costs can be compared directly.</div>"
+    "<div class=\"note\">Captured during startup so Wi-Fi, BLE, history, web-server, mDNS, and initial-scan RAM costs can be compared directly.</div>"
     "<div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
   for (size_t i = 0; i < bootHeapCheckpointCount; i++) {
     const BootHeapCheckpoint& cp = bootHeapCheckpoints[i];
@@ -3771,11 +3848,13 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
     autos ? (bleSurveyEnabled ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; Bluetooth Survey disabled")
           : "one or more enabled automatic scan services are disabled at runtime"));
+  server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
+    mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
   server.sendContent(selfTestRow("Heap reserve", freeHeap>=HEAP_WARN_BYTES ? "PASS" : "WARN", String(freeHeap/1024) + " KB free"));
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V22.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V23.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -3801,6 +3880,14 @@ void handleSettingsPage() {
   s += "<form class=\"controls\" action=\"/wifi-save\" method=\"post\"><div class=\"control\"><label for=\"sta-ssid\">SSID</label><input id=\"sta-ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" required></div><div class=\"control\"><label for=\"sta-password\">Password</label><input id=\"sta-password\" name=\"password\" type=\"password\" maxlength=\"63\"></div><button type=\"submit\">Connect &amp; Save</button></form>";
   s += "<form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>";
   s += "<div class=\"note\">The stored infrastructure passphrase is never displayed. A connection must succeed before new credentials are saved. Infrastructure Wi-Fi is optional; failed or absent infrastructure connectivity does not stop surveying.</div></div>";
+  s += "<div class=\"card\"><h2>Network Identity</h2>"
+    "<div class=\"row\"><span class=\"label\">mDNS Hostname</span><span class=\"value\">" + htmlEscape(mdnsHostname) + ".local</span></div>"
+    "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\">" + htmlEscape(mdnsWebAddress()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>"
+    "<form class=\"controls\" action=\"/hostname-save\" method=\"post\">"
+    "<div class=\"control\"><label for=\"mdns-hostname\">Hostname</label><input id=\"mdns-hostname\" name=\"hostname\" type=\"text\" maxlength=\"32\" value=\"" + htmlEscape(mdnsHostname) + "\" required></div>"
+    "<button type=\"submit\">Save Hostname &amp; Restart</button></form>"
+    "<div class=\"note\">Use letters, numbers, and hyphens only. The name cannot begin or end with a hyphen. The normal friendly address is &lt;hostname&gt;.local. mDNS support on a directly connected ESP32 access point can vary by client, so the displayed IP addresses remain the fallback.</div></div>";
   s += "<div class=\"card\"><h2>Survey Access Point</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div><div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div><div class=\"buttons\"><a class=\"button\" href=\"/ap\">Access Point Settings</a></div></div>";
   s += "<div class=\"card\"><h2>Survey Mode</h2>"
     "<div class=\"row\"><span class=\"label\">Bluetooth Survey</span><span class=\"value\">" +
@@ -3824,6 +3911,34 @@ void handleSettingsPage() {
   sendThemeScript();
   server.sendContent("</div></body></html>");
   server.sendContent("");
+}
+
+void handleHostnameSave() {
+  if (!server.hasArg("hostname")) {
+    server.send(400, "text/plain", "Hostname is required.");
+    return;
+  }
+
+  String requested = normalizedMdnsHostname(server.arg("hostname"));
+  if (!isValidMdnsHostname(requested)) {
+    server.send(400, "text/plain", "Invalid hostname. Use 1-32 letters, numbers, or hyphens; do not begin or end with a hyphen.");
+    return;
+  }
+
+  if (requested == mdnsHostname) {
+    server.sendHeader("Location", "/settings");
+    server.send(303, "text/plain", "Hostname unchanged.");
+    return;
+  }
+
+  saveMdnsHostname(requested);
+  server.send(200, "text/html",
+    String("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">") +
+    themeBootstrapScript() + pageStyles() +
+    "</head><body><div class=\"container\"><div class=\"card\"><h1>Hostname Updated</h1><p>The ESP32 will advertise as <strong>" +
+    htmlEscape(mdnsHostname) + ".local</strong> after restart.</p><p>The ESP32 is restarting now.</p></div></div></body></html>");
+  delay(750);
+  ESP.restart();
 }
 
 void handleInterfaceSettings() {
@@ -4134,6 +4249,7 @@ void startWebServer() {
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/wifi-save", HTTP_POST, handleSaveStationSettings);
   server.on("/wifi-clear", HTTP_POST, handleClearStationSettings);
+  server.on("/hostname-save", HTTP_POST, handleHostnameSave);
   server.on("/interface-settings", HTTP_POST, handleInterfaceSettings);
   server.on("/led-test", HTTP_POST, handleLedSelfTest);
   server.on("/scan-now", handleWebScanNow);
@@ -4186,7 +4302,7 @@ void startWebServer() {
 void printSerialMainMenu() {
   Serial.println();
   Serial.println("============================================================");
-  Serial.println(" ESP32 Wireless Surveyor V22");
+  Serial.println(" ESP32 Wireless Surveyor V23");
   Serial.println("============================================================");
   Serial.println("1 - Wi-Fi Survey");
   Serial.println("2 - Bluetooth Survey");
@@ -4352,6 +4468,9 @@ void printSystemSerial() {
   else Serial.println("Disabled at boot");
   Serial.print("Status LED:           "); Serial.println(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled by setting") : "Not available");
   Serial.print("Web auto-refresh:     "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+  Serial.print("mDNS hostname:        "); Serial.print(mdnsHostname); Serial.println(".local");
+  Serial.print("Friendly web address:"); Serial.print(" "); Serial.println(mdnsWebAddress());
+  Serial.print("mDNS status:          "); Serial.println(mdnsStatusMessage);
 
   Serial.println();
   Serial.println("Boot Heap Checkpoints:");
@@ -4394,6 +4513,7 @@ void printSoftwareSelfTestsSerial() {
   Serial.print("Configuration ranges:      "); Serial.println(intervalsOk ? "PASS" : "WARN");
   Serial.print("Initial boot scan(s):      "); Serial.println(initialDone ? "PASS" : "WARN");
   Serial.print("Headless automatic survey: "); Serial.println(autoOk ? "PASS" : "WARN");
+  Serial.print("mDNS hostname:             "); Serial.println(mdnsStarted ? "PASS" : "WARN");
   Serial.print("Heap reserve:              "); Serial.println(heapOk ? "PASS" : "WARN");
   Serial.print("Boot/reset diagnostic:     "); Serial.println(resetReasonLabel(esp_reset_reason()));
   Serial.println();
@@ -4411,13 +4531,16 @@ void printSettingsSerial() {
   Serial.print("Bluetooth Survey:      "); Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled");
   Serial.print("Status LED:            "); Serial.println(statusLedEnabled ? "Enabled" : "Disabled");
   Serial.print("Web auto-refresh:      "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+  Serial.print("mDNS hostname:         "); Serial.print(mdnsHostname); Serial.println(".local");
+  Serial.print("Friendly web address: "); Serial.println(mdnsWebAddress());
   Serial.println();
   Serial.println("Settings commands:");
   Serial.println("  wifi-config           - Configure infrastructure Wi-Fi");
   Serial.println("  wifi-clear            - Clear saved infrastructure Wi-Fi");
   Serial.println("  ble on|off            - Change BLE mode and restart");
   Serial.println("  led on|off|test       - Status LED control/self-test");
-  Serial.println("  refresh on|off        - Wi-Fi web-page auto-refresh");
+  Serial.println("  refresh on|off        - Survey web-page auto-refresh");
+  Serial.println("  hostname <name>       - Set mDNS hostname and restart");
   Serial.println("  ap on|off             - Enable/disable Survey AP and restart");
   Serial.println("  apssid <name>         - Change Survey AP SSID and restart");
   Serial.println("  appass <password>     - Change Survey AP password and restart");
@@ -4501,6 +4624,21 @@ void handleSerialCommand() {
 
   if (command.equalsIgnoreCase("wifi-config")) { configureWiFi(); printSettingsSerial(); return; }
   if (command.equalsIgnoreCase("wifi-clear")) { eraseCredentials(); WiFi.disconnect(false); ensureWiFiStationMode(); Serial.println("Saved infrastructure Wi-Fi credentials cleared."); printSettingsSerial(); return; }
+
+  if (command.startsWith("hostname ")) {
+    String requested = normalizedMdnsHostname(commandArgument(command, "hostname"));
+    if (!isValidMdnsHostname(requested)) {
+      Serial.println("Hostname must be 1-32 letters, numbers, or hyphens and cannot begin/end with a hyphen.");
+      printSettingsSerial(); return;
+    }
+    if (requested == mdnsHostname) {
+      Serial.println("mDNS hostname is already set to that value.");
+      printSettingsSerial(); return;
+    }
+    saveMdnsHostname(requested);
+    Serial.print("mDNS hostname saved as "); Serial.print(mdnsHostname); Serial.println(".local. Restarting...");
+    delay(500); ESP.restart(); return;
+  }
 
   if (command.equalsIgnoreCase("ap on") || command.equalsIgnoreCase("ap off")) {
     bool requested=command.endsWith("on"); saveAccessPointSettings(requested,apSSID,apPassword);
@@ -4607,6 +4745,18 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED || apRunning) startWebServer();
   captureBootHeapCheckpoint("Web server ready");
 
+  if (webServerStarted) {
+    startMdnsService();
+    if (mdnsStarted) {
+      Serial.print("Friendly web UI: ");
+      Serial.println(mdnsWebAddress());
+    } else {
+      Serial.print("mDNS warning: ");
+      Serial.println(mdnsStatusMessage);
+    }
+  }
+  captureBootHeapCheckpoint("mDNS ready");
+
   bool startupFailed =
       !wifiSubsystemInitialized ||
       scanHistory == nullptr ||
@@ -4617,6 +4767,7 @@ void setup() {
   bool startupWarning =
       !startupFailed &&
       (ESP.getFreeHeap() < HEAP_WARN_BYTES ||
+       (mdnsAttempted && !mdnsStarted) ||
        scanHistoryCapacity == MIN_SCAN_HISTORY_RECORDS ||
        (bleSurveyEnabled &&
         bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS));
