@@ -1,4 +1,4 @@
-// WifiConnect24 - compact normalized Wi-Fi/BLE history, balanced dual-radio
+// WifiConnect25 - conservative dual-radio heap policy and compact Wi-Fi/BLE history
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -21,8 +21,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect24_compact_ble_history.ino";
-const char* FIRMWARE_VERSION = "24";
+const char* FIRMWARE_FILE = "WifiConnect25_dual_radio_heap_margin.ino";
+const char* FIRMWARE_VERSION = "25";
 
 
 Preferences preferences;
@@ -70,7 +70,13 @@ const size_t MIN_BLE_HISTORY_RECORDS = 50;
 const size_t MAX_BLE_HISTORY_RECORDS = 12000;
 const size_t BLE_ADDRESS_TABLE_TARGET = 128;
 const size_t BLE_SCAN_METADATA_SLOTS = 256;
-const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 48 * 1024;
+// Dual-radio mode has a much tighter heap envelope because the BLE stack
+// remains resident and Wi-Fi scans have a large transient allocation. V24's
+// 48 KB allocation-time target yielded an ~11 KB observed low-water mark.
+// V25 intentionally targets 60 KB here; if fixed compact metadata + minimum
+// observation rings exceed the remaining budget, only those minimum rings are
+// allocated rather than consuming additional heap.
+const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 60 * 1024;
 
 const size_t HISTORY_HEAP_RESERVE_BYTES = 96 * 1024;
 
@@ -80,6 +86,9 @@ const uint32_t BLE_SCAN_DURATION_SECONDS = 5;
 const unsigned long INITIAL_WIFI_SCAN_DELAY_MS = 2500;
 const unsigned long INITIAL_BLE_SCAN_DELAY_MS = 9000;
 const size_t HEAP_WARN_BYTES = 48 * 1024;
+// Minimum-free-heap is the more important unattended-runtime indicator.
+// In dual-radio mode V25 warns below 20 KB; Wi-Fi-only has ample margin.
+const size_t DUAL_RADIO_MIN_HEAP_WARN_BYTES = 20 * 1024;
 
 // V20 Wi-Fi-first operating mode. Bluetooth is disabled by default and the
 // preference is stored in NVS. Changing the setting from the web UI triggers
@@ -140,7 +149,7 @@ struct WifiObservation {
   uint8_t reserved;
 };
 
-// Synthesized BLE view used by existing UI/CSV code. V24 no longer stores
+// Synthesized BLE view used by existing UI/CSV code. V24+ no longer stores
 // this flat record in the recurring history ring.
 struct BleScanRecord {
   uint32_t scanNumber;
@@ -1335,9 +1344,12 @@ void initializeAutoSizedHistories() {
     if (!initializeCompactWifiHistory(available))
       initializeCompactWifiHistory(minimumCompactBytes);
   } else {
-    // BLE initialization itself consumes substantial heap. In dual-radio mode
-    // preserve an explicit 48 KB runtime floor, then split remaining recurring
-    // observation RAM 50/50 after each radio's fixed metadata structures.
+    // BLE initialization itself consumes substantial heap. V24 showed that a
+    // 48 KB allocation-time target resulted in only ~11 KB minimum free heap
+    // during the initial radio scans after WebServer + mDNS startup. V25 uses
+    // a more conservative 60 KB allocation-time target. If the agreed fixed
+    // tables plus minimum observation rings exceed that budget, the minimum
+    // rings win and no additional 50/50 observation expansion is attempted.
     size_t available = freeHeap > DUAL_RADIO_HEAP_RESERVE_BYTES
       ? freeHeap - DUAL_RADIO_HEAP_RESERVE_BYTES : 0;
 
@@ -3884,6 +3896,9 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only") + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Target Heap Reserve</span><span class=\"value\">" + String((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024) + " KB at history allocation</span></div>";
+  if (bleSurveyEnabled) {
+    s += "<div class=\"row\"><span class=\"label\">Dual-Radio Low-Water Warning</span><span class=\"value\">" + String(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024) + " KB minimum free heap</span></div>";
+  }
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " physical capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Observation Size</span><span class=\"value\">" + String(sizeof(WifiObservation)) + " bytes (V20 flat record was " + String(sizeof(ScanRecord)) + " bytes)</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + " entries; " + String(wifiApTableCapacity*sizeof(WifiApEntry)/1024.0,1) + " KB allocated</span></div>";
@@ -3975,7 +3990,25 @@ void handleSystemStatus() {
           : "one or more enabled automatic scan services are disabled at runtime"));
   server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
     mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
-  server.sendContent(selfTestRow("Heap reserve", freeHeap>=HEAP_WARN_BYTES ? "PASS" : "WARN", String(freeHeap/1024) + " KB free"));
+  {
+    uint32_t minFreeHeap = ESP.getMinFreeHeap();
+    bool currentHeapOk = bleSurveyEnabled
+      ? freeHeap >= 24 * 1024
+      : freeHeap >= HEAP_WARN_BYTES;
+    bool lowWaterOk = bleSurveyEnabled
+      ? minFreeHeap >= DUAL_RADIO_MIN_HEAP_WARN_BYTES
+      : minFreeHeap >= HEAP_WARN_BYTES;
+    String heapDetail =
+      String(freeHeap/1024) + " KB free; " +
+      String(minFreeHeap/1024) + " KB minimum";
+    server.sendContent(
+      selfTestRow(
+        "Heap reserve",
+        (currentHeapOk && lowWaterOk) ? "PASS" : "WARN",
+        heapDetail
+      )
+    );
+  }
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
@@ -4591,6 +4624,9 @@ void printSystemSerial() {
   Serial.print("Largest free block:   "); Serial.print(largest/1024.0, 1); Serial.println(" KB");
   Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only");
   Serial.print("History reserve target:"); Serial.print(" "); Serial.print((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024); Serial.println(" KB at allocation");
+  if (bleSurveyEnabled) {
+    Serial.print("Low-water WARN below: "); Serial.print(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024); Serial.println(" KB minimum free heap");
+  }
   Serial.print("STA MAC:              "); Serial.println(WiFi.macAddress());
   Serial.print("AP MAC:               "); Serial.println(WiFi.softAPmacAddress());
   Serial.print("Wi-Fi history:        "); Serial.print(historyCount); Serial.print(" / "); Serial.print(scanHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(scanHistoryCapacity); Serial.println(" physical");
@@ -4635,7 +4671,13 @@ void printSoftwareSelfTestsSerial() {
                      (!bleSurveyEnabled || (bleScanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS));
   bool initialDone = !initialWifiScanPending && (!bleSurveyEnabled || !initialBleScanPending);
   bool autoOk = autoScanEnabled && (!bleSurveyEnabled || autoBleScanEnabled);
-  bool heapOk = ESP.getFreeHeap() >= HEAP_WARN_BYTES;
+  uint32_t selfTestFreeHeap = ESP.getFreeHeap();
+  uint32_t selfTestMinHeap = ESP.getMinFreeHeap();
+  bool heapOk = bleSurveyEnabled
+    ? (selfTestFreeHeap >= 24 * 1024 &&
+       selfTestMinHeap >= DUAL_RADIO_MIN_HEAP_WARN_BYTES)
+    : (selfTestFreeHeap >= HEAP_WARN_BYTES &&
+       selfTestMinHeap >= HEAP_WARN_BYTES);
 
   Serial.println();
   Serial.println("Software Self-Tests");
@@ -4647,7 +4689,9 @@ void printSoftwareSelfTestsSerial() {
   Serial.print("Initial boot scan(s):      "); Serial.println(initialDone ? "PASS" : "WARN");
   Serial.print("Headless automatic survey: "); Serial.println(autoOk ? "PASS" : "WARN");
   Serial.print("mDNS hostname:             "); Serial.println(mdnsStarted ? "PASS" : "WARN");
-  Serial.print("Heap reserve:              "); Serial.println(heapOk ? "PASS" : "WARN");
+  Serial.print("Heap reserve:              "); Serial.print(heapOk ? "PASS" : "WARN");
+  Serial.print(" - "); Serial.print(selfTestFreeHeap/1024); Serial.print(" KB free, ");
+  Serial.print(selfTestMinHeap/1024); Serial.println(" KB minimum");
   Serial.print("Boot/reset diagnostic:     "); Serial.println(resetReasonLabel(esp_reset_reason()));
   Serial.println();
 }
