@@ -7,7 +7,7 @@ An ESP32 Wi-Fi and Bluetooth wireless-survey/logger with parallel serial and sel
 
 Explore a static demonstration of the ESP32 Wireless Surveyor web interface:
 
-**[Open the Wi-Fi / BLE Surveyor Demo](https://wnerq.github.io/ESP32-WiFi-Surveyor/)**
+**[Open the Wi-Fi / BLE Surveyor Demo](https://wnerq.github.io/ESP32-WiFi-BLE-Surveyor/)**
 
 The demo uses simulated survey data and does not require ESP32 hardware.
 
