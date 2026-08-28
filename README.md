@@ -1,6 +1,6 @@
 # ESP32 Wireless Surveyor
 
-An ESP32 Wi-Fi and Bluetooth wireless-survey/logger with a serial interface, self-hosted web UI, AP+STA operation, automatic Wi-Fi and BLE scanning, RSSI history plotting, configurable in-memory history, and CSV export.
+An ESP32 Wi-Fi and Bluetooth wireless-survey/logger with parallel serial and self-hosted web interfaces, AP+STA operation, headless automatic surveying, compact in-memory Wi-Fi history, RSSI history plotting, 2.4 GHz channel analysis, diagnostics/self-tests, configurable status LED behavior, CSV export, and mDNS hostname access.
 
 The project began as a simple way to configure Wi-Fi credentials through the Arduino Serial Monitor and has evolved into a portable wireless survey and logging utility. The ESP32 can host its own access point, so the survey interface can be used even when the device is not connected to an existing Wi-Fi network. Wi-Fi and BLE survey data can be collected and reviewed from a phone or PC.
 
@@ -45,58 +45,66 @@ affect AP or HTTP responsiveness.
 
 ### Serial interface
 
-The interactive serial menu provides station Wi-Fi status, SSID, IP
-address, MAC address, hostname, gateway, subnet, RSSI, uptime, AP
-status, Wi-Fi scans, configuration, credential erasure, and software
-restart.
+The serial interface is organized around the same information architecture as
+the web UI while remaining text-oriented and non-blocking:
 
 ``` text
 ================================
- ESP32 Control Menu
+ ESP32 Wireless Surveyor
 ================================
-Wi-Fi: Connected to MyNetwork
-IP:    192.168.1.135
-AP:    ESP32-Surveyor-670F2C @ 192.168.4.1
 
-1 - Wi-Fi status
-2 - Scan Wi-Fi networks
-3 - Configure Wi-Fi
-4 - Clear saved Wi-Fi credentials
-5 - Restart ESP32
+1 - Wi-Fi Survey
+2 - Bluetooth Survey
+3 - System
+4 - Settings
 
-mac - Show Wi-Fi MAC address
-h   - Show this menu
-
+h - Help
 >
 ```
 
+The Wi-Fi and Bluetooth menus provide survey status and scan controls. The
+System menu exposes firmware, radio, flash, heap, boot-checkpoint, history, and
+self-test information. Settings provides configuration controls including
+infrastructure Wi-Fi, AP settings, BLE enable/disable, status LED control,
+web-page auto-refresh, and the mDNS hostname.
+
+Serial input is processed without blocking the automatic survey scheduler, so
+headless Wi-Fi/BLE scanning continues whether or not a serial terminal is
+connected. The status LED can be enabled/disabled persistently and manually
+self-tested from serial.
+
 ### Web interface
 
-The ESP32 starts a local HTTP server whenever either the station
-connection or its own access point is available.
+The ESP32 runs a local HTTP server and uses a common page shell with persistent
+navigation:
 
-The web interface provides:
+- **Wi-Fi** — default `/` page and primary survey workspace.
+- **Bluetooth** — BLE survey workspace.
+- **System** — device status, diagnostics, resources, firmware information,
+  boot heap checkpoints, and software self-tests.
+- **Settings** — infrastructure Wi-Fi/AP configuration and device-wide options.
 
--   Station network and device status.
--   Access-point status, SSID, IP address, and client count.
--   AP configuration page.
--   Manual Wi-Fi scans.
--   Automatic periodic scans.
--   Configurable scan interval.
--   Configurable scan-history capacity.
--   Connected SSID and BSSID.
--   Current RSSI.
--   Complete retained scan history, newest scan first.
--   A single RSSI history plot that can display any retained BSSID.
--   Clickable SSID/BSSID entries to redraw the RSSI plot.
--   CSV download.
--   Scan-history clearing.
--   Free-heap and scan-history RAM information.
+The Wi-Fi Survey page provides manual and automatic scans, compact RAM-backed
+history, per-BSSID RSSI statistics and plotting, CSV export, relative **First
+Seen** / **Last Seen** ages, and advisory 2.4 GHz channel analysis. Survey pages
+can automatically refresh after a completed scan; this behavior is
+persistently configurable and refresh is suppressed while a form control is
+being edited.
 
-Navigation controls are kept at the top of the survey page so normal
-actions do not require scrolling through accumulated scan history.
+The interface retains the lightweight **System / Light / Dark** browser theme
+selector. The status LED can be enabled/disabled persistently and manually
+self-tested from the web UI.
 
-Recent revisions also add responsive table containers for narrow/mobile displays and a lightweight **System / Light / Dark** theme selector stored in browser `localStorage`. RSSI plots are theme-aware so their canvas, grid, labels, lines, and markers remain readable in dark mode.
+V23 adds configurable mDNS network identity. The default hostname is
+`surveyor`, making the preferred friendly URL:
+
+``` text
+http://surveyor.local/
+```
+
+The configured hostname is stored in NVS and is shown in the System, Settings,
+and serial interfaces. IP addresses remain available as a fallback because
+mDNS behavior can vary by client/network.
 
 ## Bluetooth Low Energy survey
 
@@ -106,35 +114,50 @@ BLE automatic scanning is intended to operate independently of browser interacti
 
 ## Wi-Fi survey data
 
-Each detected network can include:
+V21 replaced the original flat 68-byte-per-observation Wi-Fi record with a
+normalized in-memory representation. Repeated data is no longer copied into
+every observation.
 
-  -----------------------------------------------------------------------
-  Field                               Description
-  ----------------------------------- -----------------------------------
-  SSID                                Human-readable Wi-Fi network name
+### Compact Wi-Fi history architecture
 
-  BSSID                               MAC address identifying the
-                                      individual access point/radio
+**Per observation** (6 bytes in the current implementation):
 
-  Channel                             2.4 GHz Wi-Fi channel
+- Reference to the unique AP/BSSID entry.
+- Reference to the scan metadata entry.
+- RSSI stored at full reported integer-dBm resolution using a compact signed
+  representation.
 
-  RSSI                                Received signal strength in dBm
+**Per unique AP/BSSID**:
 
-  Security                            Reported Wi-Fi
-                                      authentication/security mode
+- SSID.
+- BSSID stored as a 6-byte binary MAC address and formatted as text only for
+  display/export.
+- Current channel.
+- Current authentication/security mode.
 
-  Connected                           Whether the record represents the
-                                      infrastructure AP currently serving
-                                      the ESP32
+Channel and security are treated as current AP properties rather than repeated
+historical measurements. If an AP is later observed on a different channel,
+the AP table is updated.
 
-  Hidden                              Whether the network has a
-                                      hidden/empty SSID
+**Per scan**:
 
-  Scan                                Scan sequence number
+- Scan sequence number.
+- Scan uptime/timestamp metadata.
 
-  Uptime                              ESP32 uptime when the scan was
-                                      performed
-  -----------------------------------------------------------------------
+The following values are derived rather than stored in every observation:
+
+- Current connected-AP state.
+- Hidden-network state from an empty SSID.
+- Observation count.
+- Minimum, maximum, and average RSSI.
+- First Seen and Last Seen ages.
+- Retained scan count and retained time window.
+
+This preserves the useful survey information while greatly reducing RAM
+duplication. On the validated V21/V22 architecture, the Wi-Fi observation
+structure is 6 bytes versus 68 bytes in V20. A measured Wi-Fi-only boot
+allocated approximately 6,253 physical observations in about 54.9 KB total
+Wi-Fi history RAM, including the AP and scan-metadata tables.
 
 ### SSID vs. BSSID
 
@@ -194,41 +217,36 @@ Each plotted point represents one logged scan observation.
 
 ## Scan logging
 
-Scan history is stored in **RAM only**. This avoids repeated flash
-writes and deliberately starts a new survey session after reset or power
-cycle.
+Survey history is currently stored in **RAM only** and is intentionally lost
+on reset or power cycle. Persistent flash logging is deferred to a future
+revision.
 
-The history uses a dynamically allocated ring buffer. The retention
-limit is configurable from the survey page:
+Wi-Fi history uses three fixed allocations established during boot:
 
-``` text
-Minimum: firmware-defined safety floor
-Default: allocated automatically/configured by the current firmware
-Maximum: constrained by available heap and the firmware safety limit
-```
+1. Compact observation ring.
+2. Unique AP/BSSID table.
+3. Scan-metadata table.
 
-A network observation is one network detected during one scan. A scan
-finding 10 networks therefore consumes 10 records.
+The physical Wi-Fi capacity is allocated once at boot based on available heap
+and the firmware safety reserve. The user-facing **Retention Limit** is a
+logical limit within that already allocated buffer; changing it does not
+reallocate a large history buffer at runtime. This avoids the heap
+fragmentation/allocation failures encountered with earlier revisions.
 
-When the configured buffer is full, the oldest records are overwritten.
-Changing the capacity at runtime preserves the newest records when
-possible.
+A Wi-Fi observation is one AP/BSSID detected during one scan. A scan finding
+10 APs therefore adds 10 observations but only one scan-metadata entry.
 
-The survey page reports:
+The System page reports physical capacity, logical retention, observation
+record size, AP-table usage/allocation, scan-metadata allocation, retained scan
+count, retained time window, and heap health.
 
--   Stored records / configured capacity.
--   Number of retained scan groups.
--   RAM allocated to scan history.
--   Current free heap.
-
-History is currently RAM-backed and therefore session-only. Current firmware revisions report history allocation and heap/resource information in the web interface.
-
-Wi-Fi station credentials and AP configuration are different: those are
-stored persistently in NVS.
+BLE still uses its older flat history representation and is intentionally
+deferred for a later normalization pass.
 
 ## Automatic scanning
 
-Automatic scanning is **enabled by default** after boot.
+Automatic Wi-Fi surveying is **enabled by default** and is a core headless
+operating requirement.
 
 ``` text
 Default interval: 300 seconds
@@ -236,17 +254,19 @@ Minimum interval: 5 seconds
 Maximum interval: 3600 seconds
 ```
 
-The interval and automatic-scanning state can be changed from the web
-survey page. The current implementation treats these as runtime
-settings; after reboot the firmware defaults to automatic scanning
-enabled at 300 seconds.
+After boot, an initial Wi-Fi scan is performed shortly after initialization and
+periodic scanning continues without requiring a browser, serial terminal, or
+successful infrastructure Wi-Fi connection.
 
-For an active walk-around survey, temporarily selecting a shorter
-interval such as 10-15 seconds can make changes in signal level easier
-to observe.
+Bluetooth surveying is **disabled by default** to maximize RAM available for
+Wi-Fi history. The BLE setting is persistent. Enabling or disabling BLE saves
+the setting and restarts the ESP32 so the radio stacks and history buffers can
+be allocated safely at boot. When BLE is enabled, BLE automatic scanning also
+operates headlessly.
 
-Frequent scans consume radio time and can temporarily affect normal
-Wi-Fi and HTTP communication.
+For an active walk-around survey, a shorter Wi-Fi interval such as 10-30
+seconds can make signal changes easier to observe. Frequent scans consume radio
+time and can temporarily affect AP, station, and HTTP responsiveness.
 
 ## CSV export
 
@@ -298,6 +318,7 @@ The project has been developed with:
 -   `WiFi.h`
 -   `WebServer.h`
 -   `Preferences.h`
+-   `ESPmDNS.h`
 -   ESP32 BLE library
 
 Tested board selection:
@@ -310,9 +331,9 @@ Typical tested settings:
 
 ``` text
 Flash Size:        4MB (32Mb)
-Partition Scheme:  Default 4MB with SPIFFS
+Partition Scheme:  Huge APP (3MB No OTA / 1MB SPIFFS)
 CPU Frequency:     240 MHz
-Upload Speed:      115200
+Upload Speed:      project/tool dependent
 ```
 
 Arduino menu wording may vary by ESP32 core or IDE version.
@@ -331,32 +352,36 @@ No additional third-party Arduino libraries are currently required.
 
 ## First boot and web access
 
-On startup, the ESP32 initializes its survey access point. Serial
-Monitor reports the AP information, for example:
+On startup, the ESP32 loads persistent configuration, initializes Wi-Fi,
+starts its survey AP when enabled, attempts the saved infrastructure STA
+connection when configured, starts mDNS, allocates survey history, starts the
+web server, and begins headless surveying.
+
+The default mDNS hostname is:
 
 ``` text
-Access point started.
-AP SSID:     ESP32-Surveyor-670F2C
-AP Password: survey-670F2C
-AP IP:       192.168.4.1
+surveyor
 ```
 
-You can then:
-
-1.  Connect a laptop or phone to the ESP32's AP.
-2.  Open `http://192.168.4.1/`.
-3.  Use the survey interface without configuring infrastructure Wi-Fi.
-
-If saved station credentials exist, the ESP32 also attempts to connect
-to that network. When successful, the same web interface is available
-from the station-side DHCP address as well.
-
-For example:
+Preferred friendly URL:
 
 ``` text
-LAN web UI: http://192.168.1.135/
-AP web UI:  http://192.168.4.1/
+http://surveyor.local/
 ```
+
+The AP-side IP remains normally available at:
+
+``` text
+http://192.168.4.1/
+```
+
+When the ESP32 successfully joins infrastructure Wi-Fi, the web UI is also
+available at its DHCP-assigned LAN address. The System and serial interfaces
+show the active addresses and mDNS status.
+
+Failure to connect to infrastructure Wi-Fi does **not** stop surveying. The
+device is designed to operate unattended from a USB power bank and accumulate
+survey data before a browser or serial terminal is connected.
 
 ## Configuring infrastructure Wi-Fi
 
@@ -383,7 +408,7 @@ Subsequent resets and power cycles automatically attempt to reconnect.
 
 ## Configuring the ESP32 access point
 
-Open **AP Settings** from the status page.
+Open **Settings** and use the access-point configuration section.
 
 The AP configuration page allows:
 
@@ -402,27 +427,26 @@ AP changes are saved to NVS and applied after an automatic restart.
 
 ## Persistent settings and firmware updates
 
-A normal sketch upload does **not** normally erase NVS because
-application firmware and NVS occupy separate flash regions.
+A normal sketch upload does **not** normally erase NVS because application
+firmware and NVS occupy separate flash regions. A full flash erase can remove
+NVS data.
 
-Currently persistent across ordinary reset/power cycle:
+Persistent device configuration includes:
 
--   Infrastructure Wi-Fi credentials.
--   AP enabled/disabled state.
--   AP SSID.
--   AP password.
+- Infrastructure Wi-Fi credentials.
+- AP enabled/disabled state, SSID, and password.
+- Bluetooth survey enabled/disabled state.
+- Status LED enabled/disabled state.
+- Web survey auto-refresh enabled/disabled state.
+- mDNS hostname.
 
-Currently session-only:
+The mDNS hostname defaults to `surveyor`. Hostnames are normalized/validated
+before storage; changing the hostname causes a controlled restart so mDNS is
+registered cleanly on the next boot.
 
--   Scan observations/history.
--   History-capacity selection.
--   Scan interval changes.
--   Automatic-scanning changes.
-
-A full flash erase can remove NVS data.
-
-Station credentials can be deliberately removed using serial menu option
-`4`. Doing so leaves the survey AP running.
+Survey observations/history remain session-only RAM data. Some survey controls
+such as active scan interval/retention behavior may be runtime-oriented; the
+System/Settings interfaces report the active values.
 
 ## Basic site-survey workflows
 
@@ -430,7 +454,7 @@ Station credentials can be deliberately removed using serial menu option
 
 1.  Power the ESP32.
 2.  Connect a laptop or phone to the ESP32 survey AP.
-3.  Browse to `192.168.4.1`.
+3.  Browse to `http://surveyor.local/` when mDNS is available, or use `192.168.4.1` as the AP-side fallback.
 4.  Open the Wi-Fi Survey page.
 5.  Leave automatic scanning enabled or select a shorter interval for an
     active survey.
@@ -444,7 +468,7 @@ This mode does not require the ESP32 to join the network being surveyed.
 ### Infrastructure-connected survey
 
 1.  Configure the ESP32 to join the desired Wi-Fi network.
-2.  Access the web UI from either its LAN address or its own AP.
+2.  Access the web UI using `http://surveyor.local/` when available, its LAN address, or its own AP-side IP.
 3.  Open the Wi-Fi Survey page.
 4.  Accumulate scans.
 5.  Compare the connected AP against other visible BSSIDs.
@@ -492,8 +516,12 @@ Arduino also reports application usage relative to the selected
 flash capacity.
 
 Scan-history capacity affects **dynamic RAM**, not just program flash.
-The web survey page therefore reports the RAM allocated to the history
-buffer and the remaining free heap.
+The System page reports the RAM allocated to survey history and the remaining
+heap. The compact V21+ Wi-Fi architecture reduced each observation from the
+V20 flat-record size of 68 bytes to 6 bytes, while moving repeated SSID/BSSID,
+channel/security, and scan metadata into shared tables. A representative
+Wi-Fi-only V21 run allocated 6,253 observations in approximately 54.9 KB total
+Wi-Fi history RAM.
 
 ## Security considerations
 
@@ -520,117 +548,75 @@ acceptable.
 
 ## Known limitations
 
--   2.4 GHz Wi-Fi only on the tested classic ESP32.
--   Scan history is intentionally lost on reset/power cycle.
--   History capacity is limited to 50-2000 retained network
-    observations.
--   History-capacity, scan-interval, and automatic-scan changes
-    currently return to firmware defaults after reboot.
--   AP+STA operation and scanning share one physical Wi-Fi radio.
--   Automatic scans can affect AP, station, and HTTP responsiveness.
--   RSSI is useful for relative comparison but is not a calibrated RF
-    power measurement.
--   HTTP-only, unauthenticated web interface.
--   Automatic bootloader entry can be intermittent on some DEVKITV1
-    boards.
+- 2.4 GHz Wi-Fi only on the tested classic ESP32.
+- Survey history is intentionally lost on reset/power cycle.
+- BLE uses substantially more heap when initialized and therefore remains
+  disabled by default.
+- BLE history still uses the older flat-record representation and has not yet
+  received the Wi-Fi normalization pass.
+- AP+STA operation and scanning share one physical Wi-Fi radio.
+- Automatic scans can affect AP, station, and HTTP responsiveness.
+- RSSI is useful for relative comparison but is not a calibrated RF power
+  measurement.
+- The ESP32 cannot directly provide accurate total board supply current/power;
+  external monitoring hardware is required for those measurements.
+- HTTP-only, unauthenticated web interface.
+- mDNS `.local` resolution depends on client/network support; IP access remains
+  the fallback.
+- Automatic bootloader entry can be intermittent on some DEVKITV1 boards.
 
 ## Current firmware state
 
-The current working revision at the time of this README update is **V17**, `WifiConnect17_theme_aware_plots.ino`. It includes Wi-Fi and BLE survey pages, automatic scan/history controls, selectable RSSI plots, responsive tables, AP+STA operation, firmware identification, resource reporting, and light/dark/system themes.
+The current working revision is **V23**, `WifiConnect23_mdns_hostname.ino`.
 
-The firmware has grown beyond the original 1.2 MB application partition. Development therefore moved to a larger application partition; recent builds have been approximately 1.7 MB. The exact Arduino partition selection should be checked before flashing. This matters for future persistent logging and OTA design.
+Major structural milestones since the older V17 README include:
 
-## Project evolution
+1. **V18 — survey-oriented site architecture**
+   - Wi-Fi Survey became the default `/` page.
+   - Common Wi-Fi / Bluetooth / System / Settings navigation and shared page
+     infrastructure replaced the old Back-to-Status model.
+   - Headless boot scanning was explicitly implemented/verified.
+   - Expanded System diagnostics/self-tests and advisory 2.4 GHz channel
+     analysis were added.
 
-The project was developed incrementally:
+2. **V19/V20 — runtime diagnostics and optional BLE**
+   - Boot heap checkpoints quantified subsystem RAM costs.
+   - BLE initialization was measured as the dominant heap consumer.
+   - BLE became disabled by default and persistently selectable, with a reboot
+     on mode change so history allocation occurs safely at boot.
+   - Wi-Fi-only operation therefore receives substantially more history RAM.
 
-1.  Serial Wi-Fi configuration and persistent credential storage.
-2.  Interactive serial control menu and web status page.
-3.  Expanded network status and improved Wi-Fi state handling.
-4.  Tabular serial scans and browser-based Wi-Fi scanning.
-5.  Session logging, detailed security information, BSSID/channel
-    capture, automatic scans, and CSV export.
-6.  RSSI history plotting and complete newest-first scan-history
-    display.
-7.  Dynamically configurable scan-history capacity with heap/RAM
-    reporting.
-8.  Automatic scanning enabled by default at a 300-second interval.
-9.  Survey-page navigation controls moved to the top of the page.
-10. Configurable AP+STA mode, allowing the ESP32 to host its own survey
-    network.
-11. Selectable per-BSSID RSSI plotting from the scan-history tables.
+3. **V21 — normalized compact Wi-Fi history**
+   - Replaced the 68-byte flat Wi-Fi observation with a 6-byte compact
+     observation plus shared AP and scan-metadata tables.
+   - Physical history capacity is allocated once at boot.
+   - User retention is a logical limit rather than a runtime reallocation.
+   - Added relative First Seen / Last Seen presentation.
+   - Added scan-completion page auto-refresh with edit/focus suppression.
 
-Git history can preserve these iterations while the sketch keeps a
-single stable filename in the repository.
+4. **V22 — serial/web control parity**
+   - Refactored serial navigation to mirror Wi-Fi Survey / Bluetooth Survey /
+     System / Settings in text form.
+   - Added persistent status-LED enable/disable and manual LED self-test from
+     web and serial.
+   - Added persistent web survey auto-refresh enable/disable.
 
-## Planned next revision / architecture
+5. **V23 — network identity**
+   - Added configurable/persistent mDNS hostname.
+   - Default friendly URL is `http://surveyor.local/`.
+   - Added mDNS status to System diagnostics/self-tests and serial output.
 
-The next revision is intended to reorganize the web application around the survey/logger use case rather than the original status-page use case.
+The firmware is approximately 1.7 MB and requires the larger application
+partition used by the project. Development currently favors the **Huge APP /
+no OTA** layout; persistent survey logging is considered more valuable than
+OTA if the 4 MB flash budget ultimately forces that trade-off.
 
-### Site layout
+## Next architecture work
 
-Use a common page shell and persistent navigation:
-
-- **Wi-Fi** — default `/` page and primary survey workspace.
-- **Bluetooth** — parallel BLE survey workspace.
-- **System** — device status, diagnostics, resources, firmware information, and self-test results.
-- **Settings** — infrastructure Wi-Fi/AP configuration and device-wide UI/configuration options.
-
-The current `Back to Status` navigation model should be removed. Page terminology should be standardized to **Wi-Fi Survey** and **Bluetooth Survey**, with contextual action buttons simply labeled **Scan Now**. Shared header/navigation/theme/footer generation should replace duplicated page-shell HTML.
-
-### Headless logger requirement
-
-A core design requirement is unattended operation from a USB power bank:
-
-1. Power is applied.
-2. Configuration is loaded.
-3. Wi-Fi and BLE subsystems initialize.
-4. An initial Wi-Fi and BLE scan occurs shortly after boot.
-5. Automatic scans continue at their defaults without a browser, serial terminal, or infrastructure Wi-Fi connection.
-6. Saved infrastructure Wi-Fi may be joined when available, but connection failure must not prevent surveying.
-7. The ESP32 AP remains the local method for connecting later to inspect/download data.
-
-V18 should explicitly verify this behavior rather than assume the current automatic-scan paths satisfy it. A useful acceptance test is to power the ESP32 with no serial terminal and no known infrastructure network, leave it untouched for at least 20 minutes, then connect to its AP and confirm that multiple Wi-Fi and BLE scans were logged automatically.
-
-### Wi-Fi channel analysis
-
-Add advisory 2.4 GHz channel analysis based on observed scan data. The ESP32 cannot measure true airtime utilization or non-Wi-Fi interference, so the UI should not claim to measure actual channel utilization. Instead it can estimate congestion from:
-
-- AP count by channel.
-- Strongest observed interferer.
-- RSSI-weighted interference.
-- Co-channel interference.
-- Adjacent-channel overlap.
-- Comparison of the commonly preferred non-overlapping US 2.4 GHz channels 1, 6, and 11.
-
-The UI should report a **Suggested channel**, with a concise reason, rather than claiming a definitive "best" channel.
-
-### Expanded System Status and diagnostics
-
-Planned System Status fields include:
-
-- Firmware filename and version.
-- Arduino ESP32 core and ESP-IDF versions.
-- Uptime and last reset reason.
-- ESP32 chip model, silicon revision, CPU frequency, and core count.
-- Flash size, sketch size, application-partition/free-app-space information.
-- Free heap, minimum free heap, largest free block, and useful fragmentation/resource indicators.
-- STA/AP MAC addresses, Wi-Fi mode/channel/RSSI, and other radio information where reliable.
-- Wi-Fi and BLE history usage/allocation.
-
-Possible software self-tests/status checks include:
-
-- Wi-Fi subsystem initialized.
-- BLE subsystem initialized.
-- Wi-Fi history buffer allocated and sane.
-- BLE history buffer allocated and sane.
-- Configuration values within valid ranges.
-- Adequate heap reserve / allocation health.
-- Flash/application-space sanity.
-- Filesystem availability once persistent logging is implemented.
-- Boot/reset diagnostic status.
-
-Nonfatal conditions should normally be reported as **WARN** rather than turning the overall device state into a failure.
+The next major data-structure task is a field-by-field review and normalization
+of **BLE history**, following the same approach that reduced Wi-Fi history RAM.
+This work is intentionally deferred until the V23 Wi-Fi/web/serial architecture
+is stable.
 
 ## Longer-term roadmap
 
@@ -661,11 +647,10 @@ Longer-term possibilities include:
 
 ### Other possible improvements
 
+- Normalize/flatten BLE history to remove repeated per-observation data.
 - Filter observations by SSID/BSSID/device.
-- Minimum/maximum/average RSSI statistics.
 - Manually entered location/survey-point labels before GPS support.
-- Persist optional scan settings such as interval/history capacity.
-- mDNS hostname access.
+- Evaluate which additional scan settings should persist across reboot.
 - Authentication or a more secure provisioning model.
 - OTA firmware updates only if flash budget and usefulness justify it. Browser OTA would require uploading a **compiled firmware binary**, not a raw `.ino` source file.
 
