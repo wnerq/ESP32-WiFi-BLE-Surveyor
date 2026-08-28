@@ -2,7 +2,17 @@
 
 An ESP32 Wi-Fi and Bluetooth wireless-survey/logger with parallel serial and self-hosted web interfaces, AP+STA operation, headless automatic surveying, compact in-memory Wi-Fi history, RSSI history plotting, 2.4 GHz channel analysis, diagnostics/self-tests, configurable status LED behavior, CSV export, and mDNS hostname access.
 
+
+## Live Web Interface Demo
+
+Explore a static demonstration of the ESP32 Wireless Surveyor web interface:
+
+**[Open the Wi-Fi / BLE Surveyor Demo](https://wnerq.github.io/ESP32-WiFi-Surveyor/)**
+
+The demo uses simulated survey data and does not require ESP32 hardware.
+
 The project began as a simple way to configure Wi-Fi credentials through the Arduino Serial Monitor and has evolved into a portable wireless survey and logging utility. The ESP32 can host its own access point, so the survey interface can be used even when the device is not connected to an existing Wi-Fi network. Wi-Fi and BLE survey data can be collected and reviewed from a phone or PC.
+
 
 ## Features
 
