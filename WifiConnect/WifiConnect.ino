@@ -1,5 +1,5 @@
-// WifiConnect21 - compact normalized Wi-Fi history, logical retention limit,
-// relative first/last-seen ages, scan-completion page refresh, optional BLE mode
+// WifiConnect22 - compact normalized Wi-Fi history, web/serial interface parity,
+// persistent status-LED controls, configurable scan-completion page refresh
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -20,8 +20,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect21_compact_wifi_history.ino";
-const char* FIRMWARE_VERSION = "21";
+const char* FIRMWARE_FILE = "WifiConnect22_serial_ui_led_controls.ino";
+const char* FIRMWARE_VERSION = "22";
 
 
 Preferences preferences;
@@ -74,9 +74,12 @@ bool bleSurveyEnabled = false;
 
 // Common ESP32 DEVKITV1 boards expose a controllable blue LED on GPIO2.
 // The red LED found on many boards is a hard-wired power LED and cannot be
-// controlled by firmware. Set STATUS_LED_ENABLED false if GPIO2 is not an
+// controlled by firmware. Set STATUS_LED_AVAILABLE false if GPIO2 is not an
 // onboard LED on the specific board being used.
-const bool STATUS_LED_ENABLED = true;
+const bool STATUS_LED_AVAILABLE = true;
+bool statusLedEnabled = true;
+bool statusLedSelfTestOverride = false;
+bool webAutoRefreshEnabled = true;
 const uint8_t STATUS_LED_PIN = 2;
 const bool STATUS_LED_ACTIVE_HIGH = true;
 const TickType_t WIFI_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(75);
@@ -235,7 +238,8 @@ void captureBootHeapCheckpoint(const char* stage) {
 }
 
 void writeStatusLed(bool on) {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE) return;
+  if (on && !statusLedEnabled && !statusLedSelfTestOverride) return;
 
   statusLedState = on;
   bool electricalHigh =
@@ -248,7 +252,7 @@ void statusLedTimerCallback(TimerHandle_t) {
 }
 
 void initializeStatusLed() {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE) return;
 
   pinMode(STATUS_LED_PIN, OUTPUT);
   writeStatusLed(false);
@@ -262,7 +266,7 @@ void initializeStatusLed() {
 }
 
 void startScanLed(TickType_t periodTicks) {
-  if (!STATUS_LED_ENABLED || statusLedTimer == nullptr) return;
+  if (!STATUS_LED_AVAILABLE || !statusLedEnabled || statusLedTimer == nullptr) return;
 
   writeStatusLed(true);
   xTimerStop(statusLedTimer, 0);
@@ -270,7 +274,7 @@ void startScanLed(TickType_t periodTicks) {
 }
 
 void stopScanLed() {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE) return;
 
   if (statusLedTimer != nullptr) {
     xTimerStop(statusLedTimer, 0);
@@ -283,7 +287,7 @@ void statusLedPulse(
   unsigned long onMs,
   unsigned long offMs
 ) {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
 
   writeStatusLed(true);
   delay(onMs);
@@ -292,14 +296,14 @@ void statusLedPulse(
 }
 
 void indicateBootStarted() {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
 
   statusLedPulse(90, 90);
   statusLedPulse(90, 0);
 }
 
 void indicateStartupStatus(bool failed, bool warning) {
-  if (!STATUS_LED_ENABLED) return;
+  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
 
   if (failed) {
     for (int i = 0; i < 3; i++) statusLedPulse(300, 220);
@@ -312,6 +316,20 @@ void indicateStartupStatus(bool failed, bool warning) {
   }
 
   statusLedPulse(650, 0);
+}
+
+void runStatusLedSelfTest() {
+  if (!STATUS_LED_AVAILABLE) return;
+
+  if (statusLedTimer != nullptr) xTimerStop(statusLedTimer, 0);
+  statusLedSelfTestOverride = true;
+  writeStatusLed(false);
+  delay(120);
+  for (int i = 0; i < 3; i++) statusLedPulse(180, 180);
+  writeStatusLed(true);
+  delay(650);
+  writeStatusLed(false);
+  statusLedSelfTestOverride = false;
 }
 
 
@@ -406,12 +424,23 @@ void saveAccessPointSettings(
 void loadSurveyModeSettings() {
   preferences.begin("survey", true);
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
+  statusLedEnabled = preferences.getBool("ledEnabled", true);
+  webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
   preferences.end();
 }
 
 void saveBleSurveyEnabled(bool enabled) {
   preferences.begin("survey", false);
   preferences.putBool("bleEnabled", enabled);
+  preferences.end();
+}
+
+void saveInterfaceSettings(bool ledEnabled, bool autoRefreshEnabled) {
+  statusLedEnabled = ledEnabled;
+  webAutoRefreshEnabled = autoRefreshEnabled;
+  preferences.begin("survey", false);
+  preferences.putBool("ledEnabled", statusLedEnabled);
+  preferences.putBool("webRefresh", webAutoRefreshEnabled);
   preferences.end();
 }
 
@@ -1479,7 +1508,7 @@ void scanNetworks() {
   Serial.println(" records.");
 
   Serial.println("Scan complete.");
-  Serial.println("Use '3' or 'wifi' to configure a network.");
+  Serial.println("Use 'wifi-config' to configure an infrastructure network.");
 
   WiFi.scanDelete();
 }
@@ -3116,7 +3145,7 @@ void handleWebScan() {
     "</div>"
     "<div class=\"note\">"
     "Scan history is kept in RAM only and is cleared by reset or power cycle. "
-    "V21 allocates the maximum safe compact Wi-Fi history once at boot. "
+    "V22 allocates the maximum safe compact Wi-Fi history once at boot. "
     "Changing the retention limit does not reallocate RAM; it only changes how many "
     "of the allocated observation slots may be retained. When the logical limit is "
     "full, the oldest observations are discarded."
@@ -3208,8 +3237,9 @@ void handleWebScan() {
   sendSortableTableScript();
   sendThemeScript();
 
-  // Poll only for scan sequence changes. Suppress reload while the user is
-  // interacting with a form or after a form value has been edited.
+  // Poll only for scan sequence changes when the persistent auto-refresh
+  // setting is enabled. Suppress reload while a form is being edited.
+  if (webAutoRefreshEnabled) {
   String refreshScript =
     "<script>(function(){"
     "let scan=" + String(scanCounter) + ";"
@@ -3230,6 +3260,7 @@ void handleWebScan() {
     "},2500);"
     "})();</script>";
   server.sendContent(refreshScript);
+  }
 
   server.sendContent(
     "</div></body></html>"
@@ -3443,6 +3474,13 @@ void sendBleSummaryTable() {
   server.sendContent("</tbody></table></div>");
 }
 
+void handleBleScanStatus() {
+  String json = "{\"scan\":" + String(bleScanCounter) +
+                ",\"records\":" + String(bleHistoryCount) + "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
 void handleBLESurvey() {
   String selectedAddress = "";
 
@@ -3546,6 +3584,21 @@ void handleBLESurvey() {
   server.sendContent("</div><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
+  if (webAutoRefreshEnabled) {
+    String refreshScript =
+      "<script>(function(){"
+      "let scan=" + String(bleScanCounter) + ";let dirty=false;"
+      "document.querySelectorAll('.settings-row input,.settings-row select,.settings-row textarea').forEach(function(e){"
+        "e.addEventListener('input',function(){dirty=true;});"
+        "e.addEventListener('change',function(){dirty=true;});"
+      "});"
+      "setInterval(function(){fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
+        "if(s.scan!==scan){scan=s.scan;var a=document.activeElement;"
+        "var editing=a&&(a.tagName==='INPUT'||a.tagName==='SELECT'||a.tagName==='TEXTAREA');"
+        "if(!dirty&&!editing)location.reload();}"
+      "}).catch(function(){});},2500);})();</script>";
+    server.sendContent(refreshScript);
+  }
   server.sendContent("</div></body></html>");
   server.sendContent("");
 }
@@ -3672,7 +3725,7 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled (maximum Wi-Fi history)") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_ENABLED ? String("GPIO ") + String(STATUS_LED_PIN) : String("Disabled")) + "</span></div></div>";
+  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_AVAILABLE ? (statusLedEnabled ? String("GPIO ") + String(STATUS_LED_PIN) + String(" enabled") : String("Disabled by setting")) : String("Not available")) + "</span></div></div>";
   server.sendContent(s);
 
   server.sendContent("<div class=\"card\"><h2>Boot Heap Checkpoints</h2>"
@@ -3722,7 +3775,7 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V21.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V22.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -3756,15 +3809,36 @@ void handleSettingsPage() {
     "<input type=\"hidden\" name=\"enabled\" value=\"" + String(bleSurveyEnabled ? "0" : "1") + "\">"
     "<button type=\"submit\">" + String(bleSurveyEnabled ? "Disable Bluetooth Survey" : "Enable Bluetooth Survey") + "</button></form>"
     "<div class=\"note\">Bluetooth is disabled by default to maximize Wi-Fi history depth. Changing this setting is stored in NVS and restarts the ESP32. "
-    "The restart is intentional: BLE uses a large persistent heap allocation, so survey histories must be sized after the selected radio mode is established.</div>"
-    "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" +
-    String(STATUS_LED_ENABLED ? "GPIO 2 enabled" : "Disabled") + "</span></div></div>";
-  s += "<div class=\"card\"><h2>Interface</h2><div class=\"note\">Theme selection is browser-local and is applied in the page head before CSS to avoid a light-theme flash during refresh. Survey interval and history settings remain session-only and are configured on their respective survey pages.</div></div>";
+    "The restart is intentional: BLE uses a large persistent heap allocation, so survey histories must be sized after the selected radio mode is established.</div></div>";
+  s += "<div class=\"card\"><h2>Interface &amp; Indicators</h2>"
+    "<form class=\"controls\" action=\"/interface-settings\" method=\"post\">"
+    "<div class=\"control\"><label><input type=\"checkbox\" name=\"ledEnabled\" value=\"1\" " + String(statusLedEnabled ? "checked" : "") + "> Enable status LED indicators</label></div>"
+    "<div class=\"control\"><label><input type=\"checkbox\" name=\"autoRefresh\" value=\"1\" " + String(webAutoRefreshEnabled ? "checked" : "") + "> Auto-refresh survey pages after a completed scan</label></div>"
+    "<button type=\"submit\">Save Interface Settings</button></form>"
+    "<form class=\"controls\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
+    "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled on GPIO 2" : "Disabled by setting") : "Not available") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Survey Page Auto-refresh</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
+    "<div class=\"note\">LED and auto-refresh settings are stored in NVS. The LED self-test temporarily overrides the disabled setting. Theme selection remains browser-local.</div></div>";
   server.sendContent(s);
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
   server.sendContent("");
+}
+
+void handleInterfaceSettings() {
+  bool requestedLed = server.hasArg("ledEnabled");
+  bool requestedRefresh = server.hasArg("autoRefresh");
+  saveInterfaceSettings(requestedLed, requestedRefresh);
+  if (!statusLedEnabled) stopScanLed();
+  server.sendHeader("Location", "/settings");
+  server.send(303, "text/plain", "Interface settings saved.");
+}
+
+void handleLedSelfTest() {
+  runStatusLedSelfTest();
+  server.sendHeader("Location", "/settings");
+  server.send(303, "text/plain", "Status LED self-test complete.");
 }
 
 void handleSaveStationSettings() {
@@ -4060,12 +4134,15 @@ void startWebServer() {
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/wifi-save", HTTP_POST, handleSaveStationSettings);
   server.on("/wifi-clear", HTTP_POST, handleClearStationSettings);
+  server.on("/interface-settings", HTTP_POST, handleInterfaceSettings);
+  server.on("/led-test", HTTP_POST, handleLedSelfTest);
   server.on("/scan-now", handleWebScanNow);
   server.on("/api/wifi/status", HTTP_GET, handleWifiScanStatus);
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
   server.on("/ble", HTTP_GET, handleBLESurvey);
+  server.on("/api/ble/status", HTTP_GET, handleBleScanStatus);
   server.on("/ble-mode", HTTP_POST, handleBleModeChange);
   server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
   server.on("/ble-settings", HTTP_GET, handleBLESettings);
@@ -4103,173 +4180,351 @@ void startWebServer() {
 
 
 // ============================================================
-// Serial menu
+// Serial interface - text-oriented parity with the web UI
 // ============================================================
 
-void printMenu() {
+void printSerialMainMenu() {
   Serial.println();
-  Serial.println("================================");
-  Serial.println(" ESP32 Control Menu");
-  Serial.println("================================");
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Wi-Fi: Connected to ");
-    Serial.println(WiFi.SSID());
-
-    Serial.print("IP:    ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Wi-Fi: Not connected");
-  }
-
-  if (apRunning) {
-    Serial.print("AP:    ");
-    Serial.print(apSSID);
-    Serial.print(" @ ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    Serial.println("AP:    Disabled");
-  }
-
+  Serial.println("============================================================");
+  Serial.println(" ESP32 Wireless Surveyor V22");
+  Serial.println("============================================================");
+  Serial.println("1 - Wi-Fi Survey");
+  Serial.println("2 - Bluetooth Survey");
+  Serial.println("3 - System");
+  Serial.println("4 - Settings");
   Serial.println();
-  Serial.println("1 - Wi-Fi status");
-  Serial.println("2 - Scan Wi-Fi networks");
-  Serial.println("3 - Configure Wi-Fi");
-  Serial.println("4 - Clear saved Wi-Fi credentials");
-  Serial.println("5 - Restart ESP32");
+  Serial.println("h/help - Show this menu");
+  Serial.println("restart - Restart ESP32");
   Serial.println();
-  Serial.println("mac     - Show Wi-Fi MAC address");
-  Serial.println("version - Show firmware information");
-  Serial.println("h       - Show this menu");
-  Serial.println();
-
   Serial.print("> ");
 }
 
+void printWifiSurveySerial() {
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println(" Wi-Fi Survey");
+  Serial.println("============================================================");
+  Serial.print("Automatic scanning:  ");
+  Serial.println(autoScanEnabled ? "Enabled" : "Disabled");
+  Serial.print("Scan interval:       ");
+  Serial.print(scanIntervalSeconds);
+  Serial.println(" s");
+  Serial.print("Observations:        ");
+  Serial.print(historyCount);
+  Serial.print(" / ");
+  Serial.print(scanHistoryRetentionLimit);
+  Serial.print(" retained; ");
+  Serial.print(scanHistoryCapacity);
+  Serial.println(" physical capacity");
+  Serial.print("Retained scans:      ");
+  Serial.println(countRetainedScanGroups());
+  Serial.print("Unique AP slots used:");
+  Serial.print(" ");
+  Serial.print(wifiApCount);
+  Serial.print(" / ");
+  Serial.println(wifiApTableCapacity);
+  Serial.println();
 
-// ============================================================
-// Serial command handling
-// ============================================================
+  if (historyCount == 0) {
+    Serial.println("No Wi-Fi observations retained yet.");
+  } else {
+    Serial.println("SSID                 BSSID              CH  Latest  Min  Max  Avg    N   First Seen    Last Seen");
+    Serial.println("-------------------  -----------------  --  ------  ---  ---  -----  ---  ------------  ------------");
+    for (size_t apIndex = 0; apIndex < wifiApCount; apIndex++) {
+      if (!wifiApIndexIsReferenced(apIndex)) continue;
+      char bssidText[18];
+      formatBssid(wifiApTable[apIndex].bssid, bssidText);
+      NetworkSummary summary;
+      if (!buildNetworkSummary(String(bssidText), summary)) continue;
+
+      String ssid = summary.hidden ? "(hidden)" : String(summary.ssid);
+      if (summary.connected) ssid += "*";
+      if (ssid.length() > 19) ssid = ssid.substring(0, 19);
+      printPadded(ssid, 21);
+      printPadded(String(summary.bssid), 19);
+      printPadded(String(summary.channel), 4);
+      printPadded(String(summary.signal.latestRssi), 8);
+      printPadded(String(summary.signal.minRssi), 5);
+      printPadded(String(summary.signal.maxRssi), 5);
+      String avg = summary.signal.samples ? String((float)summary.signal.rssiTotal / summary.signal.samples, 1) : "-";
+      printPadded(avg, 7);
+      printPadded(String(summary.signal.samples), 5);
+      printPadded(observationAgeLabel(summary.signal.firstSeenMs), 14);
+      Serial.println(observationAgeLabel(summary.signal.lastSeenMs));
+    }
+    Serial.println("* = currently connected infrastructure AP");
+  }
+
+  ChannelAnalysis a = analyzeLatestWifiScan();
+  if (a.valid) {
+    Serial.println();
+    Serial.print("Suggested 2.4 GHz channel: ");
+    Serial.println(a.suggestedChannel);
+    Serial.print("Scores 1/6/11:       ");
+    Serial.print(a.totalScore[1], 1); Serial.print(" / ");
+    Serial.print(a.totalScore[6], 1); Serial.print(" / ");
+    Serial.println(a.totalScore[11], 1);
+  }
+
+  Serial.println();
+  Serial.println("Wi-Fi commands:");
+  Serial.println("  scan                 - Scan now");
+  Serial.println("  wclear               - Clear Wi-Fi history");
+  Serial.println("  retention <records>  - Set logical retention limit");
+  Serial.println("  interval <seconds>   - Set automatic scan interval");
+  Serial.println("  auto on|off          - Enable/disable automatic Wi-Fi scans");
+  Serial.println("  wifi-config          - Configure infrastructure Wi-Fi");
+  Serial.println("  wifi-clear           - Clear saved infrastructure credentials");
+  Serial.println("  0/back               - Main menu");
+  Serial.println();
+  Serial.print("> ");
+}
+
+void printBluetoothSurveySerial() {
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println(" Bluetooth Survey");
+  Serial.println("============================================================");
+  Serial.print("Bluetooth Survey:     ");
+  Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled (Wi-Fi-first mode)");
+  if (bleSurveyEnabled) {
+    Serial.print("BLE initialized:      ");
+    Serial.println(bleInitialized ? "Yes" : "No");
+    Serial.print("Automatic scanning:  ");
+    Serial.println(autoBleScanEnabled ? "Enabled" : "Disabled");
+    Serial.print("Scan interval:       ");
+    Serial.print(bleScanIntervalSeconds);
+    Serial.println(" s");
+    Serial.print("History:             ");
+    Serial.print(bleHistoryCount);
+    Serial.print(" / ");
+    Serial.println(bleHistoryCapacity);
+    Serial.println();
+    Serial.println("BLE commands:");
+    Serial.println("  blescan              - Scan now");
+    Serial.println("  bleclear             - Clear BLE history");
+    Serial.println("  bleinterval <sec>    - Set BLE automatic scan interval");
+    Serial.println("  bleauto on|off       - Enable/disable automatic BLE scans");
+    Serial.println("  ble off              - Disable BLE Survey and restart");
+  } else {
+    Serial.println();
+    Serial.println("BLE is not initialized, preserving approximately 83 KB of heap for Wi-Fi surveying.");
+    Serial.println("  ble on               - Enable BLE Survey and restart");
+  }
+  Serial.println("  0/back               - Main menu");
+  Serial.println();
+  Serial.print("> ");
+}
+
+void printSystemSerial() {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t minHeap = ESP.getMinFreeHeap();
+  uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  size_t appBytes = running ? running->size : 0;
+  size_t unused = appBytes > ESP.getSketchSize() ? appBytes - ESP.getSketchSize() : 0;
+
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println(" System");
+  Serial.println("============================================================");
+  Serial.print("Firmware:             "); Serial.print(FIRMWARE_FILE); Serial.print(" (V"); Serial.print(FIRMWARE_VERSION); Serial.println(")");
+  Serial.print("Built:                "); Serial.println(firmwareBuildTimestamp());
+  Serial.print("Arduino ESP32 core:   "); Serial.println(ESP_ARDUINO_VERSION_STR);
+  Serial.print("ESP-IDF:              "); Serial.println(esp_get_idf_version());
+  Serial.print("Uptime:               "); Serial.println(getUptimeString());
+  Serial.print("Last reset:           "); Serial.println(resetReasonLabel(esp_reset_reason()));
+  Serial.print("Chip:                 "); Serial.print(ESP.getChipModel()); Serial.print(" rev "); Serial.println(ESP.getChipRevision());
+  Serial.print("CPU / cores:          "); Serial.print(ESP.getCpuFreqMHz()); Serial.print(" MHz / "); Serial.println(ESP.getChipCores());
+  Serial.print("Flash size:           "); Serial.print(ESP.getFlashChipSize()/1024.0/1024.0, 2); Serial.println(" MB");
+  Serial.print("Sketch size:          "); Serial.print(ESP.getSketchSize()/1024.0, 1); Serial.println(" KB");
+  Serial.print("App partition:        "); Serial.print(appBytes/1024.0, 1); Serial.println(" KB");
+  Serial.print("Unused app partition: "); Serial.print(unused/1024.0, 1); Serial.println(" KB");
+  Serial.print("Free heap:            "); Serial.print(freeHeap/1024.0, 1); Serial.println(" KB");
+  Serial.print("Minimum free heap:    "); Serial.print(minHeap/1024.0, 1); Serial.println(" KB");
+  Serial.print("Largest free block:   "); Serial.print(largest/1024.0, 1); Serial.println(" KB");
+  Serial.print("STA MAC:              "); Serial.println(WiFi.macAddress());
+  Serial.print("AP MAC:               "); Serial.println(WiFi.softAPmacAddress());
+  Serial.print("Wi-Fi history:        "); Serial.print(historyCount); Serial.print(" / "); Serial.print(scanHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(scanHistoryCapacity); Serial.println(" physical");
+  Serial.print("Wi-Fi history RAM:    "); Serial.print(wifiHistoryAllocatedBytes()/1024.0, 1); Serial.println(" KB");
+  Serial.print("BLE history:          ");
+  if (bleSurveyEnabled) { Serial.print(bleHistoryCount); Serial.print(" / "); Serial.println(bleHistoryCapacity); }
+  else Serial.println("Disabled at boot");
+  Serial.print("Status LED:           "); Serial.println(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled by setting") : "Not available");
+  Serial.print("Web auto-refresh:     "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+
+  Serial.println();
+  Serial.println("Boot Heap Checkpoints:");
+  Serial.println("Stage                         Free KB   Min KB   Largest KB");
+  Serial.println("----------------------------  --------  -------  ----------");
+  for (size_t i=0; i<bootHeapCheckpointCount; i++) {
+    printPadded(String(bootHeapCheckpoints[i].stage), 30);
+    printPadded(String(bootHeapCheckpoints[i].freeHeap/1024.0,1), 10);
+    printPadded(String(bootHeapCheckpoints[i].minimumFreeHeap/1024.0,1), 9);
+    Serial.println(String(bootHeapCheckpoints[i].largestFreeBlock/1024.0,1));
+  }
+
+  Serial.println();
+  Serial.println("System commands:");
+  Serial.println("  selftest              - Run/report software self-tests");
+  Serial.println("  led test              - Run status LED self-test");
+  Serial.println("  version               - Firmware information");
+  Serial.println("  0/back                - Main menu");
+  Serial.println();
+  Serial.print("> ");
+}
+
+void printSoftwareSelfTestsSerial() {
+  bool wifiHistOk = scanHistory && wifiApTable && wifiScanMetadata &&
+                    scanHistoryCapacity >= MIN_SCAN_HISTORY_RECORDS;
+  bool bleOk = !bleSurveyEnabled || (bleInitialized && bleHistory != nullptr);
+  bool intervalsOk = scanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS &&
+                     scanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS &&
+                     (!bleSurveyEnabled || (bleScanIntervalSeconds >= MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds <= MAX_SCAN_INTERVAL_SECONDS));
+  bool initialDone = !initialWifiScanPending && (!bleSurveyEnabled || !initialBleScanPending);
+  bool autoOk = autoScanEnabled && (!bleSurveyEnabled || autoBleScanEnabled);
+  bool heapOk = ESP.getFreeHeap() >= HEAP_WARN_BYTES;
+
+  Serial.println();
+  Serial.println("Software Self-Tests");
+  Serial.println("-------------------");
+  Serial.print("Wi-Fi subsystem:            "); Serial.println(wifiSubsystemInitialized ? "PASS" : "FAIL");
+  Serial.print("BLE subsystem/mode:         "); Serial.println(bleOk ? "PASS" : "FAIL");
+  Serial.print("Wi-Fi history allocation:  "); Serial.println(wifiHistOk ? "PASS" : "FAIL");
+  Serial.print("Configuration ranges:      "); Serial.println(intervalsOk ? "PASS" : "WARN");
+  Serial.print("Initial boot scan(s):      "); Serial.println(initialDone ? "PASS" : "WARN");
+  Serial.print("Headless automatic survey: "); Serial.println(autoOk ? "PASS" : "WARN");
+  Serial.print("Heap reserve:              "); Serial.println(heapOk ? "PASS" : "WARN");
+  Serial.print("Boot/reset diagnostic:     "); Serial.println(resetReasonLabel(esp_reset_reason()));
+  Serial.println();
+}
+
+void printSettingsSerial() {
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println(" Settings");
+  Serial.println("============================================================");
+  Serial.print("Infrastructure Wi-Fi: "); Serial.println(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected");
+  if (WiFi.status()==WL_CONNECTED) { Serial.print("  SSID:              "); Serial.println(WiFi.SSID()); }
+  Serial.print("Survey AP:             "); Serial.println(apRunning ? "Running" : "Disabled");
+  Serial.print("  SSID:                "); Serial.println(apSSID);
+  Serial.print("Bluetooth Survey:      "); Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled");
+  Serial.print("Status LED:            "); Serial.println(statusLedEnabled ? "Enabled" : "Disabled");
+  Serial.print("Web auto-refresh:      "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+  Serial.println();
+  Serial.println("Settings commands:");
+  Serial.println("  wifi-config           - Configure infrastructure Wi-Fi");
+  Serial.println("  wifi-clear            - Clear saved infrastructure Wi-Fi");
+  Serial.println("  ble on|off            - Change BLE mode and restart");
+  Serial.println("  led on|off|test       - Status LED control/self-test");
+  Serial.println("  refresh on|off        - Wi-Fi web-page auto-refresh");
+  Serial.println("  ap on|off             - Enable/disable Survey AP and restart");
+  Serial.println("  apssid <name>         - Change Survey AP SSID and restart");
+  Serial.println("  appass <password>     - Change Survey AP password and restart");
+  Serial.println("  0/back                - Main menu");
+  Serial.println();
+  Serial.print("> ");
+}
+
+void printMenu() { printSerialMainMenu(); }
+
+String commandArgument(const String& command, const String& prefix) {
+  if (command.length() <= prefix.length()) return "";
+  String value = command.substring(prefix.length());
+  value.trim();
+  return value;
+}
 
 void handleSerialCommand() {
-  if (!Serial.available()) {
-    return;
-  }
+  if (!Serial.available()) return;
 
   String command = Serial.readStringUntil('\n');
   command.trim();
+  if (command.length() == 0) { printSerialMainMenu(); return; }
 
-  if (command.length() == 0) {
-    printMenu();
-    return;
+  if (command == "1" || command.equalsIgnoreCase("wifi-survey")) { printWifiSurveySerial(); return; }
+  if (command == "2" || command.equalsIgnoreCase("bluetooth") || command.equalsIgnoreCase("ble-survey")) { printBluetoothSurveySerial(); return; }
+  if (command == "3" || command.equalsIgnoreCase("system")) { printSystemSerial(); return; }
+  if (command == "4" || command.equalsIgnoreCase("settings")) { printSettingsSerial(); return; }
+  if (command == "0" || command.equalsIgnoreCase("back") || command.equalsIgnoreCase("h") || command.equalsIgnoreCase("help")) { printSerialMainMenu(); return; }
+
+  if (command.equalsIgnoreCase("scan")) { performLoggedScan(); WiFi.scanDelete(); printWifiSurveySerial(); return; }
+  if (command.equalsIgnoreCase("wclear")) { clearScanHistory(); Serial.println("Wi-Fi history cleared."); printWifiSurveySerial(); return; }
+  if (command.startsWith("retention ")) {
+    long n = commandArgument(command,"retention").toInt();
+    if (n < (long)MIN_SCAN_HISTORY_RECORDS || n > (long)scanHistoryCapacity) Serial.println("Invalid retention limit for current physical capacity.");
+    else { setWifiRetentionLimit((size_t)n); Serial.println("Wi-Fi retention limit updated."); }
+    printWifiSurveySerial(); return;
+  }
+  if (command.startsWith("interval ")) {
+    long n=commandArgument(command,"interval").toInt();
+    if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid Wi-Fi interval.");
+    else { scanIntervalSeconds=(unsigned long)n; lastAutoScanMs=millis(); Serial.println("Wi-Fi scan interval updated."); }
+    printWifiSurveySerial(); return;
+  }
+  if (command.equalsIgnoreCase("auto on")) { autoScanEnabled=true; lastAutoScanMs=millis(); Serial.println("Automatic Wi-Fi scanning enabled."); printWifiSurveySerial(); return; }
+  if (command.equalsIgnoreCase("auto off")) { autoScanEnabled=false; Serial.println("Automatic Wi-Fi scanning disabled."); printWifiSurveySerial(); return; }
+
+  if (command.equalsIgnoreCase("blescan")) {
+    if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled. Use 'ble on' to enable it and restart.");
+    else performLoggedBLEScan();
+    printBluetoothSurveySerial(); return;
+  }
+  if (command.equalsIgnoreCase("bleclear")) { if (bleSurveyEnabled) clearBleHistory(); Serial.println("BLE history cleared."); printBluetoothSurveySerial(); return; }
+  if (command.startsWith("bleinterval ")) {
+    long n=commandArgument(command,"bleinterval").toInt();
+    if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
+    else if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid BLE interval.");
+    else { bleScanIntervalSeconds=(unsigned long)n; lastAutoBleScanMs=millis(); Serial.println("BLE scan interval updated."); }
+    printBluetoothSurveySerial(); return;
+  }
+  if (command.equalsIgnoreCase("bleauto on")) { if (bleSurveyEnabled) { autoBleScanEnabled=true; lastAutoBleScanMs=millis(); } printBluetoothSurveySerial(); return; }
+  if (command.equalsIgnoreCase("bleauto off")) { if (bleSurveyEnabled) autoBleScanEnabled=false; printBluetoothSurveySerial(); return; }
+  if (command.equalsIgnoreCase("ble on") || command.equalsIgnoreCase("ble off")) {
+    bool requested=command.endsWith("on");
+    if (requested==bleSurveyEnabled) { Serial.println("Bluetooth Survey mode already set."); printSettingsSerial(); return; }
+    saveBleSurveyEnabled(requested);
+    Serial.print("Bluetooth Survey will be "); Serial.print(requested?"enabled":"disabled"); Serial.println(" after restart. Restarting...");
+    delay(500); ESP.restart(); return;
   }
 
-  if (
-    command == "1" ||
-    command.equalsIgnoreCase("status")
-  ) {
-    printWiFiStatus();
+  if (command.equalsIgnoreCase("selftest")) { printSoftwareSelfTestsSerial(); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("led test")) { Serial.println("Running status LED self-test..."); runStatusLedSelfTest(); Serial.println("LED self-test complete."); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("led on") || command.equalsIgnoreCase("led off")) {
+    bool requested=command.endsWith("on"); saveInterfaceSettings(requested,webAutoRefreshEnabled); if(!requested) stopScanLed();
+    Serial.print("Status LED "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
+  }
+  if (command.equalsIgnoreCase("refresh on") || command.equalsIgnoreCase("refresh off")) {
+    bool requested=command.endsWith("on"); saveInterfaceSettings(statusLedEnabled,requested);
+    Serial.print("Web auto-refresh "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
   }
 
-  else if (
-    command == "2" ||
-    command.equalsIgnoreCase("scan")
-  ) {
-    scanNetworks();
+  if (command.equalsIgnoreCase("wifi-config")) { configureWiFi(); printSettingsSerial(); return; }
+  if (command.equalsIgnoreCase("wifi-clear")) { eraseCredentials(); WiFi.disconnect(false); ensureWiFiStationMode(); Serial.println("Saved infrastructure Wi-Fi credentials cleared."); printSettingsSerial(); return; }
+
+  if (command.equalsIgnoreCase("ap on") || command.equalsIgnoreCase("ap off")) {
+    bool requested=command.endsWith("on"); saveAccessPointSettings(requested,apSSID,apPassword);
+    Serial.println("Survey AP setting saved. Restarting..."); delay(500); ESP.restart(); return;
+  }
+  if (command.startsWith("apssid ")) {
+    String requested=commandArgument(command,"apssid"); requested.trim();
+    if (requested.length()==0 || requested.length()>32) { Serial.println("AP SSID must be 1-32 characters."); printSettingsSerial(); return; }
+    saveAccessPointSettings(apEnabled,requested,apPassword); Serial.println("AP SSID saved. Restarting..."); delay(500); ESP.restart(); return;
+  }
+  if (command.startsWith("appass ")) {
+    String requested=commandArgument(command,"appass");
+    if (requested.length()<8 || requested.length()>63) { Serial.println("AP password must be 8-63 characters."); printSettingsSerial(); return; }
+    saveAccessPointSettings(apEnabled,apSSID,requested); Serial.println("AP password saved. Restarting..."); delay(500); ESP.restart(); return;
   }
 
-  else if (
-    command == "3" ||
-    command.equalsIgnoreCase("wifi")
-  ) {
-    configureWiFi();
+  if (command.equalsIgnoreCase("version") || command.equalsIgnoreCase("v")) { printFirmwareInfo(); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("mac")) { printMacAddress(); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("restart")) { Serial.println("Restarting ESP32..."); delay(500); ESP.restart(); return; }
 
-    if (
-      WiFi.status() == WL_CONNECTED &&
-      !webServerStarted
-    ) {
-      startWebServer();
-    }
-
-    Serial.println();
-    Serial.println("Returning to main menu...");
-    printMenu();
-    return;
-  }
-
-  else if (
-    command == "4" ||
-    command.equalsIgnoreCase("erase")
-  ) {
-    Serial.println();
-    Serial.println(
-      "This will erase the saved Wi-Fi credentials."
-    );
-
-    Serial.println("Type YES to confirm:");
-    Serial.print("> ");
-
-    String confirmation = readSerialLine();
-
-    if (confirmation.equalsIgnoreCase("YES")) {
-      eraseCredentials();
-
-      // Disconnect only the station interface; keep the survey AP running.
-      WiFi.disconnect(false);
-      delay(100);
-
-      Serial.println();
-      Serial.println("Credentials erased.");
-      Serial.println("Wi-Fi disconnected.");
-      Serial.println("Use option 3 to configure a network.");
-    } else {
-      Serial.println();
-      Serial.println("Erase cancelled.");
-    }
-  }
-
-  else if (
-    command == "5" ||
-    command.equalsIgnoreCase("restart")
-  ) {
-    Serial.println();
-    Serial.println("Restarting ESP32...");
-
-    delay(500);
-    ESP.restart();
-  }
-
-  else if (
-    command.equalsIgnoreCase("version") ||
-    command.equalsIgnoreCase("v")
-  ) {
-    printFirmwareInfo();
-  }
-
-  else if (command.equalsIgnoreCase("mac")) {
-    printMacAddress();
-  }
-
-  else if (
-    command.equalsIgnoreCase("h") ||
-    command.equalsIgnoreCase("help")
-  ) {
-    printMenu();
-    return;
-  }
-
-  else {
-    Serial.println();
-    Serial.print("Unknown command: ");
-    Serial.println(command);
-
-    Serial.println("Enter 'h' for help.");
-  }
-
-  Serial.println();
+  Serial.print("Unknown command: "); Serial.println(command);
+  Serial.println("Enter 'h' for the main menu.");
   Serial.print("> ");
 }
-
 
 // ============================================================
 // Setup
@@ -4280,6 +4535,8 @@ void setup() {
   delay(1500);
 
   captureBootHeapCheckpoint("Startup");
+  loadSurveyModeSettings();
+  captureBootHeapCheckpoint("Settings loaded");
   initializeStatusLed();
   captureBootHeapCheckpoint("Status LED initialized");
   indicateBootStarted();
@@ -4303,7 +4560,6 @@ void setup() {
   captureBootHeapCheckpoint("Wi-Fi initialized");
 
   loadAccessPointSettings();
-  loadSurveyModeSettings();
   Serial.print("Bluetooth Survey mode: ");
   Serial.println(bleSurveyEnabled ? "enabled" : "disabled (Wi-Fi-first)");
   if (apEnabled) startAccessPoint();
@@ -4318,7 +4574,7 @@ void setup() {
     if (apRunning) {
       Serial.println("The ESP32 access point remains available for surveying and web configuration.");
     } else {
-      Serial.println("Use serial menu option 3 to configure Wi-Fi.");
+      Serial.println("Use the serial 'wifi-config' command to configure infrastructure Wi-Fi.");
     }
   }
 
