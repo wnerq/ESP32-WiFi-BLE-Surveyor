@@ -1,4 +1,4 @@
-// WifiConnect25 - conservative dual-radio heap policy and compact Wi-Fi/BLE history
+// WifiConnect26 - responsive Wi-Fi surveying, incremental live web updates, and limited BLE mode
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -6,6 +6,7 @@
 #include <ESPmDNS.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <esp_mac.h>
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
 #include <esp_partition.h>
@@ -21,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect25_dual_radio_heap_margin.ino";
-const char* FIRMWARE_VERSION = "25";
+const char* FIRMWARE_FILE = "WifiConnect26_live_updates_async_wifi.ino";
+const char* FIRMWARE_VERSION = "26";
 
 
 Preferences preferences;
@@ -40,6 +41,7 @@ bool webServerStarted = false;
 const char* DEFAULT_MDNS_HOSTNAME = "surveyor";
 const size_t MAX_MDNS_HOSTNAME_LENGTH = 32;
 String mdnsHostname = DEFAULT_MDNS_HOSTNAME;
+bool mdnsHostnameUserConfigured = false;
 bool mdnsStarted = false;
 bool mdnsAttempted = false;
 String mdnsStatusMessage = "Not started";
@@ -505,16 +507,32 @@ void loadSurveyModeSettings() {
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
+  mdnsHostnameUserConfigured = preferences.isKey("hostname");
   mdnsHostname = normalizedMdnsHostname(preferences.getString("hostname", DEFAULT_MDNS_HOSTNAME));
   preferences.end();
 
   if (!isValidMdnsHostname(mdnsHostname)) {
     mdnsHostname = DEFAULT_MDNS_HOSTNAME;
+    mdnsHostnameUserConfigured = false;
   }
+}
+
+String generatedDefaultMdnsHostname() {
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char suffix[7];
+  snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+  return String("surveyor-") + suffix;
+}
+
+void applyGeneratedDefaultMdnsHostname() {
+  if (mdnsHostnameUserConfigured) return;
+  mdnsHostname = normalizedMdnsHostname(generatedDefaultMdnsHostname());
 }
 
 void saveMdnsHostname(const String& hostname) {
   mdnsHostname = normalizedMdnsHostname(hostname);
+  mdnsHostnameUserConfigured = true;
   preferences.begin("survey", false);
   preferences.putString("hostname", mdnsHostname);
   preferences.end();
@@ -558,6 +576,13 @@ void saveInterfaceSettings(bool ledEnabled, bool autoRefreshEnabled) {
   webAutoRefreshEnabled = autoRefreshEnabled;
   preferences.begin("survey", false);
   preferences.putBool("ledEnabled", statusLedEnabled);
+  preferences.putBool("webRefresh", webAutoRefreshEnabled);
+  preferences.end();
+}
+
+void saveWebLiveUpdates(bool enabled) {
+  webAutoRefreshEnabled = enabled;
+  preferences.begin("survey", false);
   preferences.putBool("webRefresh", webAutoRefreshEnabled);
   preferences.end();
 }
@@ -1017,13 +1042,11 @@ bool initializeCompactWifiHistory(size_t budgetBytes) {
   return true;
 }
 
-int performLoggedScan() {
-  ensureWiFiStationMode();
+bool wifiScanInProgress = false;
+bool wifiInitialScanCheckpointPending = false;
+String wifiScanStatusMessage = "Idle";
 
-  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
-  int networkCount = WiFi.scanNetworks();
-  stopScanLed();
-
+int processCompletedWifiScan(int networkCount) {
   scanCounter++;
   lastScanUptimeMs = millis();
 
@@ -1071,6 +1094,65 @@ int performLoggedScan() {
   }
 
   return networkCount;
+}
+
+int performLoggedScan() {
+  ensureWiFiStationMode();
+
+  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
+  int networkCount = WiFi.scanNetworks();
+  stopScanLed();
+
+  int result = processCompletedWifiScan(networkCount);
+  wifiScanStatusMessage = "Complete";
+  return result;
+}
+
+bool beginLoggedWifiScan(bool initialCheckpoint) {
+  if (wifiScanInProgress) return false;
+
+  ensureWiFiStationMode();
+  WiFi.scanDelete();
+
+  int result = WiFi.scanNetworks(true);
+  if (result == WIFI_SCAN_FAILED) {
+    wifiScanStatusMessage = "Failed to start";
+    return false;
+  }
+
+  wifiScanInProgress = true;
+  wifiInitialScanCheckpointPending =
+      wifiInitialScanCheckpointPending || initialCheckpoint;
+  wifiScanStatusMessage = "Scanning";
+  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
+  return true;
+}
+
+void serviceLoggedWifiScan() {
+  if (!wifiScanInProgress) return;
+
+  int result = WiFi.scanComplete();
+  if (result == WIFI_SCAN_RUNNING) return;
+
+  stopScanLed();
+  wifiScanInProgress = false;
+
+  if (result == WIFI_SCAN_FAILED) {
+    wifiScanStatusMessage = "Scan failed";
+    WiFi.scanDelete();
+    wifiInitialScanCheckpointPending = false;
+    return;
+  }
+
+  processCompletedWifiScan(result);
+  wifiScanStatusMessage = "Complete";
+  WiFi.scanDelete();
+  lastAutoScanMs = millis();
+
+  if (wifiInitialScanCheckpointPending) {
+    captureBootHeapCheckpoint("Initial Wi-Fi scan");
+    wifiInitialScanCheckpointPending = false;
+  }
 }
 
 // ============================================================
@@ -2300,10 +2382,31 @@ String pageStyles() {
     font-size: 1.05em;
   }
 
+  .header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+
   .nav {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+
+  .live-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    color: var(--text);
+    font-size: 0.92em;
+  }
+
+  .live-control input {
+    width: auto;
+    margin: 0;
   }
 
   .nav a {
@@ -2318,6 +2421,17 @@ String pageStyles() {
   .nav a.active {
     background: var(--button-bg);
     color: var(--button-text);
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 0.62em;
+    font-weight: normal;
+    vertical-align: middle;
+    color: var(--muted);
   }
 
   .status-pass { font-weight: bold; }
@@ -2364,6 +2478,14 @@ String csvEscape(const String& input) {
   return "\"" + output + "\"";
 }
 
+String jsEscape(String input) {
+  input.replace("\\", "\\\\");
+  input.replace("'", "\\'");
+  input.replace("\r", "");
+  input.replace("\n", "\\n");
+  return input;
+}
+
 void redirectToScanPage() {
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", "");
@@ -2371,14 +2493,30 @@ void redirectToScanPage() {
 
 void handleWifiScanStatus() {
   String json = "{\"scan\":" + String(scanCounter) +
-                ",\"records\":" + String(historyCount) + "}";
+                ",\"records\":" + String(historyCount) +
+                ",\"scanning\":" + String(wifiScanInProgress ? "true" : "false") +
+                ",\"live\":" + String(webAutoRefreshEnabled ? "true" : "false") + "}";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
 void handleWebScanNow() {
-  performLoggedScan();
-  WiFi.scanDelete();
+  if (!beginLoggedWifiScan(false)) {
+    wifiScanStatusMessage = wifiScanInProgress ? "Scan already in progress" : "Unable to start scan";
+  }
   redirectToScanPage();
+}
+
+void handleLiveUpdatesSetting() {
+  if (!server.hasArg("enabled")) {
+    server.send(400, "text/plain", "Missing enabled value.");
+    return;
+  }
+  bool enabled = server.arg("enabled") == "1";
+  saveWebLiveUpdates(enabled);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json",
+    String("{\"enabled\":") + (enabled ? "true" : "false") + "}");
 }
 
 void handleScanSettings() {
@@ -2958,15 +3096,27 @@ String activeNavClass(const String& active, const char* item) {
 
 void sendSiteNavigation(const String& active) {
   String nav;
-  nav.reserve(900);
-  nav += "<div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><nav class=\"nav\">";
+  nav.reserve(1300);
+  nav += "<div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><div class=\"header-actions\"><nav class=\"nav\">";
   nav += "<a href=\"/\"" + activeNavClass(active, "wifi") + ">Wi-Fi</a>";
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
   nav += "<a href=\"/settings\"" + activeNavClass(active, "settings") + ">Settings</a>";
-  nav += "</nav></div>";
+  nav += "</nav><label class=\"live-control\"><input id=\"live-updates-toggle\" type=\"checkbox\"";
+  if (webAutoRefreshEnabled) nav += " checked";
+  nav += "> Live updates</label></div></div>";
   server.sendContent(nav);
   sendThemeControl();
+  server.sendContent(
+    "<script>(function(){"
+    "const c=document.getElementById('live-updates-toggle');if(!c)return;"
+    "c.addEventListener('change',function(){"
+      "const v=c.checked?'1':'0';"
+      "fetch('/api/live-updates',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+v,cache:'no-store'})"
+      ".catch(function(){c.checked=!c.checked;});"
+    "});"
+    "})();</script>"
+  );
 }
 
 void sendThemeControl() {
@@ -3413,7 +3563,7 @@ void handleWebScan() {
   server.sendContent("</div>");
 
   server.sendContent(
-    "<div class=\"card\"><h2>Observed Networks</h2>"
+    "<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2>"
     "<div class=\"note\">"
     "One row is shown for each BSSID observed during this session. "
     "Click any column header to sort the table. Click an SSID or BSSID "
@@ -3432,29 +3582,31 @@ void handleWebScan() {
   sendSortableTableScript();
   sendThemeScript();
 
-  // Poll only for scan sequence changes when the persistent auto-refresh
-  // setting is enabled. Suppress reload while a form is being edited.
-  if (webAutoRefreshEnabled) {
-  String refreshScript =
-    "<script>(function(){"
-    "let scan=" + String(scanCounter) + ";"
-    "let dirty=false;"
-    "document.querySelectorAll('.settings-row input,.settings-row select,.settings-row textarea').forEach(function(e){"
-      "e.addEventListener('input',function(){dirty=true;});"
-      "e.addEventListener('change',function(){dirty=true;});"
-    "});"
-    "setInterval(function(){"
-      "fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
-        "if(s.scan!==scan){"
-          "scan=s.scan;"
-          "var a=document.activeElement;"
-          "var editing=a&&(a.tagName==='INPUT'||a.tagName==='SELECT'||a.tagName==='TEXTAREA');"
-          "if(!dirty&&!editing)location.reload();"
-        "}"
-      "}).catch(function(){});"
-    "},2500);"
-    "})();</script>";
-  server.sendContent(refreshScript);
+  // V26 live updates repaint only changing survey fragments; the document,
+  // scroll position, forms, and plot selection remain intact.
+  {
+    String refreshScript =
+      "<script>(function(){"
+      "let scan=" + String(scanCounter) + ";"
+      "const toggle=document.getElementById('live-updates-toggle');"
+      "const plotBssid='" + jsEscape(selectedBSSID) + "';"
+      "let updating=false;"
+      "async function repaint(){"
+        "if(updating)return;updating=true;"
+        "try{"
+          "const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;})];"
+          "if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}"
+          "await Promise.all(jobs);"
+        "}catch(e){}finally{updating=false;}"
+      "}"
+      "setInterval(function(){"
+        "if(!toggle||!toggle.checked)return;"
+        "fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
+          "if(s.scan!==scan){scan=s.scan;repaint();}"
+        "}).catch(function(){});"
+      "},2000);"
+      "})();</script>";
+    server.sendContent(refreshScript);
   }
 
   server.sendContent(
@@ -3464,6 +3616,46 @@ void handleWebScan() {
   server.sendContent("");
 }
 
+
+void handleWifiObservedFragment() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "");
+  server.sendContent(
+    "<h2>Observed Networks</h2><div class=\"note\">"
+    "One row is shown for each BSSID observed during this session. "
+    "Click any column header to sort the table. Click an SSID or BSSID "
+    "to redraw the RSSI plot for that access point.</div>"
+  );
+  sendNetworkSummaryTable();
+  server.sendContent("");
+}
+
+void handleWifiPlotFragment() {
+  String selectedBSSID = server.hasArg("bssid") ? server.arg("bssid") : "";
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "");
+  server.sendContent("<h2>RSSI History</h2>");
+
+  if (selectedBSSID.length() > 0) {
+    NetworkSummary summary = {};
+    if (buildNetworkSummary(selectedBSSID, summary)) {
+      server.sendContent(
+        "<div class=\"row\"><span class=\"label\">Selected Network</span><span class=\"value\">" +
+        htmlEscape(String(summary.ssid)) +
+        "</span></div><div class=\"row\"><span class=\"label\">Selected BSSID</span><span class=\"value\">" +
+        htmlEscape(selectedBSSID) + "</span></div>"
+      );
+      sendRssiHistoryPlot(selectedBSSID);
+    } else {
+      server.sendContent("<p>The selected network is no longer retained.</p>");
+    }
+  } else {
+    server.sendContent("<p>Select an SSID or BSSID below to display RSSI history.</p>");
+  }
+  server.sendContent("");
+}
 
 // ============================================================
 // BLE web survey
@@ -3694,7 +3886,7 @@ void handleBLESurvey() {
   server.sendContent(pageStyles());
   server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("ble");
-  server.sendContent("<h1>Bluetooth Survey</h1>"
+  server.sendContent("<h1>Bluetooth Survey <span class=\"badge\">Limited Mode</span></h1>"
     "<div class=\"card\"><h2>Scan Logging</h2>");
 
   if (!bleSurveyEnabled) {
@@ -3759,7 +3951,7 @@ void handleBLESurvey() {
     "<a class=\"button\" href=\"/ble-clear\">Clear History</a>"
     "<a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
     "<div class=\"note\">Automatic BLE scanning defaults to 300 seconds. "
-    "Physical capacity is allocated once at boot; the retention limit changes immediately without reallocating RAM.</div>";
+    "Physical capacity is allocated once at boot; the retention limit changes immediately without reallocating RAM. ""Combined BLE mode is intentionally a limited option on this ESP32 because the BLE stack substantially reduces heap and retained-history capacity. ""BLE scans still use the synchronous Arduino BLE API and may briefly pause web servicing while a BLE scan is active.</div>";
 
   if (bleHistoryResizeMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleHistoryResizeMessage) + "</strong></div>";
   if (bleStatusMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleStatusMessage) + "</strong></div>";
@@ -3780,28 +3972,59 @@ void handleBLESurvey() {
     server.sendContent("<p>No logged BLE devices are available to plot yet.</p>");
   }
 
-  server.sendContent("</div><div class=\"card\"><h2>Observed BLE Devices</h2>"
+  server.sendContent("</div><div class=\"card\" id=\"ble-observed-card\"><h2>Observed BLE Devices</h2>"
     "<div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
   sendBleSummaryTable();
   server.sendContent("</div><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
-  if (webAutoRefreshEnabled) {
+  {
     String refreshScript =
       "<script>(function(){"
-      "let scan=" + String(bleScanCounter) + ";let dirty=false;"
-      "document.querySelectorAll('.settings-row input,.settings-row select,.settings-row textarea').forEach(function(e){"
-        "e.addEventListener('input',function(){dirty=true;});"
-        "e.addEventListener('change',function(){dirty=true;});"
-      "});"
-      "setInterval(function(){fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
-        "if(s.scan!==scan){scan=s.scan;var a=document.activeElement;"
-        "var editing=a&&(a.tagName==='INPUT'||a.tagName==='SELECT'||a.tagName==='TEXTAREA');"
-        "if(!dirty&&!editing)location.reload();}"
-      "}).catch(function(){});},2500);})();</script>";
+      "let scan=" + String(bleScanCounter) + ";"
+      "const toggle=document.getElementById('live-updates-toggle');"
+      "const address='" + jsEscape(selectedAddress) + "';"
+      "let updating=false;"
+      "async function repaint(){if(updating)return;updating=true;try{"
+        "const jobs=[fetch('/api/ble/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('ble-observed-card');if(e)e.innerHTML=h;})];"
+        "if(address){jobs.push(fetch('/api/ble/plot?address='+encodeURIComponent(address),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}"
+        "await Promise.all(jobs);"
+      "}catch(e){}finally{updating=false;}}"
+      "setInterval(function(){if(!toggle||!toggle.checked)return;"
+        "fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(s.scan!==scan){scan=s.scan;repaint();}}).catch(function(){});"
+      "},2000);"
+      "})();</script>";
     server.sendContent(refreshScript);
   }
   server.sendContent("</div></body></html>");
+  server.sendContent("");
+}
+
+
+void handleBleObservedFragment() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "");
+  server.sendContent("<h2>Observed BLE Devices</h2><div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
+  sendBleSummaryTable();
+  server.sendContent("");
+}
+
+void handleBlePlotFragment() {
+  String selectedAddress = server.hasArg("address") ? server.arg("address") : "";
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "");
+  server.sendContent("<h2>RSSI History</h2>");
+  if (selectedAddress.length()) {
+    String selectedName = latestBleNameForAddress(selectedAddress);
+    server.sendContent("<div class=\"row\"><span class=\"label\">Selected Device</span><span class=\"value\">" +
+      htmlEscape(selectedName) + "</span></div><div class=\"row\"><span class=\"label\">BLE Address</span><span class=\"value\">" +
+      htmlEscape(selectedAddress) + "</span></div>");
+    sendBleRssiHistoryPlot(selectedAddress);
+  } else {
+    server.sendContent("<p>Select a BLE address below to display RSSI history.</p>");
+  }
   server.sendContent("");
 }
 
@@ -3894,7 +4117,7 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only") + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + BLE (limited)" : "Wi-Fi only") + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Target Heap Reserve</span><span class=\"value\">" + String((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024) + " KB at history allocation</span></div>";
   if (bleSurveyEnabled) {
     s += "<div class=\"row\"><span class=\"label\">Dual-Radio Low-Water Warning</span><span class=\"value\">" + String(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024) + " KB minimum free heap</span></div>";
@@ -4012,7 +4235,7 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of V24. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of this firmware. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -4053,17 +4276,16 @@ void handleSettingsPage() {
     "<form class=\"controls\" action=\"/ble-mode\" method=\"post\">"
     "<input type=\"hidden\" name=\"enabled\" value=\"" + String(bleSurveyEnabled ? "0" : "1") + "\">"
     "<button type=\"submit\">" + String(bleSurveyEnabled ? "Disable Bluetooth Survey" : "Enable Bluetooth Survey") + "</button></form>"
-    "<div class=\"note\">Bluetooth is disabled by default to maximize Wi-Fi history depth. Changing this setting is stored in NVS and restarts the ESP32. "
+    "<div class=\"note\">Bluetooth is disabled by default to maximize Wi-Fi history depth. Combined BLE surveying is a limited mode on this hardware because the BLE stack substantially reduces heap and retained-history capacity. Changing this setting is stored in NVS and restarts the ESP32. "
     "The restart is intentional: BLE uses a large persistent heap allocation, so survey histories must be sized after the selected radio mode is established.</div></div>";
   s += "<div class=\"card\"><h2>Interface &amp; Indicators</h2>"
     "<form class=\"controls\" action=\"/interface-settings\" method=\"post\">"
     "<div class=\"control\"><label><input type=\"checkbox\" name=\"ledEnabled\" value=\"1\" " + String(statusLedEnabled ? "checked" : "") + "> Enable status LED indicators</label></div>"
-    "<div class=\"control\"><label><input type=\"checkbox\" name=\"autoRefresh\" value=\"1\" " + String(webAutoRefreshEnabled ? "checked" : "") + "> Auto-refresh survey pages after a completed scan</label></div>"
     "<button type=\"submit\">Save Interface Settings</button></form>"
     "<form class=\"controls\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
     "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled on GPIO 2" : "Disabled by setting") : "Not available") + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Survey Page Auto-refresh</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
-    "<div class=\"note\">LED and auto-refresh settings are stored in NVS. The LED self-test temporarily overrides the disabled setting. Theme selection remains browser-local.</div></div>";
+    "<div class=\"row\"><span class=\"label\">Survey Page Live Updates</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
+    "<div class=\"note\">The LED setting is saved here. Live Updates are controlled immediately from the checkbox in the page header and are also stored in NVS. Theme selection remains browser-local.</div></div>";
   server.sendContent(s);
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
@@ -4100,9 +4322,10 @@ void handleHostnameSave() {
 }
 
 void handleInterfaceSettings() {
+  // V26 moves Live Updates to the persistent header control. Saving the LED
+  // setting must not silently overwrite that independently managed preference.
   bool requestedLed = server.hasArg("ledEnabled");
-  bool requestedRefresh = server.hasArg("autoRefresh");
-  saveInterfaceSettings(requestedLed, requestedRefresh);
+  saveInterfaceSettings(requestedLed, webAutoRefreshEnabled);
   if (!statusLedEnabled) stopScanLed();
   server.sendHeader("Location", "/settings");
   server.send(303, "text/plain", "Interface settings saved.");
@@ -4152,7 +4375,11 @@ void handleBleModeChange() {
     themeBootstrapScript() + pageStyles() +
     "</head><body><div class=\"container\"><div class=\"card\"><h1>Bluetooth Survey Mode Updated</h1><p>Bluetooth Survey will be " +
     String(requested ? "enabled" : "disabled") +
-    " after restart.</p><p>The ESP32 is restarting now so radio and history memory can be allocated safely.</p></div></div></body></html>");
+    " after restart.</p><p>The ESP32 is restarting now. This page will reconnect automatically.</p>"
+    "<p id=\"reconnect-status\">Waiting for the surveyor...</p></div></div>"
+    "<script>(function(){setTimeout(function retry(){fetch('/ble',{cache:'no-store'}).then(function(r){"
+    "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
+    "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
 
   delay(750);
   ESP.restart();
@@ -4412,11 +4639,16 @@ void startWebServer() {
   server.on("/led-test", HTTP_POST, handleLedSelfTest);
   server.on("/scan-now", handleWebScanNow);
   server.on("/api/wifi/status", HTTP_GET, handleWifiScanStatus);
+  server.on("/api/wifi/observed", HTTP_GET, handleWifiObservedFragment);
+  server.on("/api/wifi/plot", HTTP_GET, handleWifiPlotFragment);
+  server.on("/api/live-updates", HTTP_POST, handleLiveUpdatesSetting);
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
   server.on("/ble", HTTP_GET, handleBLESurvey);
   server.on("/api/ble/status", HTTP_GET, handleBleScanStatus);
+  server.on("/api/ble/observed", HTTP_GET, handleBleObservedFragment);
+  server.on("/api/ble/plot", HTTP_GET, handleBlePlotFragment);
   server.on("/ble-mode", HTTP_POST, handleBleModeChange);
   server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
   server.on("/ble-settings", HTTP_GET, handleBLESettings);
@@ -4622,7 +4854,7 @@ void printSystemSerial() {
   Serial.print("Free heap:            "); Serial.print(freeHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Minimum free heap:    "); Serial.print(minHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Largest free block:   "); Serial.print(largest/1024.0, 1); Serial.println(" KB");
-  Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE (balanced)" : "Wi-Fi only");
+  Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE (limited)" : "Wi-Fi only");
   Serial.print("History reserve target:"); Serial.print(" "); Serial.print((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024); Serial.println(" KB at allocation");
   if (bleSurveyEnabled) {
     Serial.print("Low-water WARN below: "); Serial.print(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024); Serial.println(" KB minimum free heap");
@@ -4635,7 +4867,7 @@ void printSystemSerial() {
   if (bleSurveyEnabled) { Serial.print(bleHistoryCount); Serial.print(" / "); Serial.print(bleHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(bleHistoryCapacity); Serial.println(" physical"); }
   else Serial.println("Disabled at boot");
   Serial.print("Status LED:           "); Serial.println(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled by setting") : "Not available");
-  Serial.print("Web auto-refresh:     "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+  Serial.print("Web live updates:     "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
   Serial.print("mDNS hostname:        "); Serial.print(mdnsHostname); Serial.println(".local");
   Serial.print("Friendly web address:"); Serial.print(" "); Serial.println(mdnsWebAddress());
   Serial.print("mDNS status:          "); Serial.println(mdnsStatusMessage);
@@ -4707,7 +4939,7 @@ void printSettingsSerial() {
   Serial.print("  SSID:                "); Serial.println(apSSID);
   Serial.print("Bluetooth Survey:      "); Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled");
   Serial.print("Status LED:            "); Serial.println(statusLedEnabled ? "Enabled" : "Disabled");
-  Serial.print("Web auto-refresh:      "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
+  Serial.print("Web live updates:      "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
   Serial.print("mDNS hostname:         "); Serial.print(mdnsHostname); Serial.println(".local");
   Serial.print("Friendly web address: "); Serial.println(mdnsWebAddress());
   Serial.println();
@@ -4716,7 +4948,7 @@ void printSettingsSerial() {
   Serial.println("  wifi-clear            - Clear saved infrastructure Wi-Fi");
   Serial.println("  ble on|off            - Change BLE mode and restart");
   Serial.println("  led on|off|test       - Status LED control/self-test");
-  Serial.println("  refresh on|off        - Survey web-page auto-refresh");
+  Serial.println("  refresh on|off        - Survey web-page live updates");
   Serial.println("  hostname <name>       - Set mDNS hostname and restart");
   Serial.println("  ap on|off             - Enable/disable Survey AP and restart");
   Serial.println("  apssid <name>         - Change Survey AP SSID and restart");
@@ -4803,7 +5035,7 @@ void handleSerialCommand() {
   }
   if (command.equalsIgnoreCase("refresh on") || command.equalsIgnoreCase("refresh off")) {
     bool requested=command.endsWith("on"); saveInterfaceSettings(statusLedEnabled,requested);
-    Serial.print("Web auto-refresh "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
+    Serial.print("Web live updates "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
   }
 
   if (command.equalsIgnoreCase("wifi-config")) { configureWiFi(); printSettingsSerial(); return; }
@@ -4879,6 +5111,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   delay(WIFI_STARTUP_SETTLE_MS);
   wifiSubsystemInitialized = (WiFi.getMode() != WIFI_MODE_NULL);
+  applyGeneratedDefaultMdnsHostname();
   captureBootHeapCheckpoint("Wi-Fi initialized");
 
   loadAccessPointSettings();
@@ -4980,22 +5213,26 @@ void setup() {
 void serviceInitialSurveyScans() {
   unsigned long elapsed = millis() - surveyServicesReadyMs;
 
-  if (initialWifiScanPending && elapsed >= INITIAL_WIFI_SCAN_DELAY_MS) {
+  if (
+    initialWifiScanPending &&
+    elapsed >= INITIAL_WIFI_SCAN_DELAY_MS &&
+    !wifiScanInProgress
+  ) {
     initialWifiScanPending = false;
     Serial.println("Initial headless Wi-Fi survey scan...");
-    performLoggedScan();
-    WiFi.scanDelete();
-    lastAutoScanMs = millis();
-    captureBootHeapCheckpoint("Initial Wi-Fi scan");
+    if (!beginLoggedWifiScan(true)) {
+      Serial.println("Unable to start initial asynchronous Wi-Fi scan.");
+    }
   }
 
   if (
     bleSurveyEnabled &&
     initialBleScanPending &&
-    elapsed >= INITIAL_BLE_SCAN_DELAY_MS
+    elapsed >= INITIAL_BLE_SCAN_DELAY_MS &&
+    !wifiScanInProgress
   ) {
     initialBleScanPending = false;
-    Serial.println("Initial headless BLE survey scan...");
+    Serial.println("Initial headless BLE survey scan (limited mode)...");
     performLoggedBLEScan();
     lastAutoBleScanMs = millis();
     captureBootHeapCheckpoint("Initial BLE scan");
@@ -5003,18 +5240,16 @@ void serviceInitialSurveyScans() {
 }
 
 void serviceAutomaticScan() {
-  if (!autoScanEnabled) return;
+  if (!autoScanEnabled || wifiScanInProgress) return;
 
   unsigned long intervalMs = scanIntervalSeconds * 1000UL;
   if (millis() - lastAutoScanMs < intervalMs) return;
 
-  lastAutoScanMs = millis();
-  performLoggedScan();
-  WiFi.scanDelete();
+  beginLoggedWifiScan(false);
 }
 
 void serviceAutomaticBLEScan() {
-  if (!bleSurveyEnabled || !autoBleScanEnabled) return;
+  if (!bleSurveyEnabled || !autoBleScanEnabled || wifiScanInProgress) return;
 
   unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
   if (millis() - lastAutoBleScanMs < intervalMs) return;
@@ -5033,6 +5268,7 @@ void loop() {
     server.handleClient();
   }
 
+  serviceLoggedWifiScan();
   serviceInitialSurveyScans();
   serviceAutomaticScan();
   serviceAutomaticBLEScan();
