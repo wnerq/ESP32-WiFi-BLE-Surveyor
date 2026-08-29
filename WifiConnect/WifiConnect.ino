@@ -1,8 +1,10 @@
-// WifiConnect32d - full-history web performance and infrastructure reconnect robustness
+// WifiConnect33 - session checkpoint/restore, history test tools, scan timing, and reconnect diagnostics
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <ESPmDNS.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -22,8 +24,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect32d_full_history_reconnect.ino";
-const char* FIRMWARE_VERSION = "32d";
+const char* FIRMWARE_FILE = "WifiConnect33b_session_checkpoint_test_tools.ino";
+const char* FIRMWARE_VERSION = "33b";
 
 
 Preferences preferences;
@@ -227,6 +229,7 @@ BleScanRecord bleHistoryRecord(size_t logicalIndex);
 void appendBleObservation(const BleObservation& observation);
 int findWifiApByTextBssid(const String& bssid);
 bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
+void serviceLoggedWifiScan();
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
@@ -276,6 +279,9 @@ bool explicitUserInteractionHandled = false;
 bool userInteractionDeferArmed = false;
 uint32_t userInteractionDeferStartedMs = 0;
 bool csvExportInProgress = false;
+// Declared with the other global survey state so V33 checkpoint/test helpers
+// defined earlier in this sketch can safely reference the active scan state.
+bool wifiScanInProgress = false;
 
 uint32_t wifiCsvExportCount = 0;
 size_t wifiCsvLastRows = 0;
@@ -292,6 +298,23 @@ size_t wifiApCount = 0;
 WifiScanMetadata* wifiScanMetadata = nullptr;
 size_t wifiScanMetadataCapacity = 0;
 size_t wifiApTableFullDrops = 0;
+
+// V33 session checkpoint / restore and test-tool diagnostics.
+const char* SESSION_CHECKPOINT_PATH = "/survey_session.bin";
+const uint32_t SESSION_CHECKPOINT_MAGIC = 0x53565233; // "SVR3"
+const uint16_t SESSION_CHECKPOINT_VERSION = 1;
+bool spiffsMounted = false;
+bool sessionRestoredThisBoot = false;
+String sessionCheckpointStatus = "Filesystem not initialized";
+uint32_t syntheticPrefillRuns = 0;
+size_t syntheticPrefillLastTarget = 0;
+
+// Native station reconnect is preferred over issuing competing WiFi.begin()
+// calls from the survey scheduler. These counters observe link transitions.
+bool nativeReconnectStateInitialized = false;
+bool nativeReconnectSawDisconnect = false;
+bool nativeReconnectWasConnected = false;
+uint32_t nativeReconnectObservedCount = 0;
 
 BleObservation* bleHistory = nullptr;
 size_t bleHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
@@ -780,6 +803,326 @@ float averageSignal(const SignalStats& stats) {
 
 
 // ============================================================
+// V33 session checkpoint / restore
+// ============================================================
+
+struct SessionCheckpointHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t headerBytes;
+  uint32_t payloadBytes;
+  uint32_t crc32;
+  uint32_t savedUptimeMs;
+  uint32_t scanCounter;
+  uint32_t lastScanUptimeMs;
+  uint32_t wifiObservationCount;
+  uint32_t wifiApCount;
+  uint32_t wifiMetadataCount;
+  uint32_t bleObservationCount;
+  uint32_t bleAddressCount;
+  uint32_t bleMetadataCount;
+};
+
+uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
+  crc = ~crc;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)-(int32_t)(crc & 1));
+  }
+  return ~crc;
+}
+
+bool checkpointWriteChunk(File& file, uint32_t& crc, const void* data, size_t bytes) {
+  if (bytes == 0) return true;
+  if (file.write((const uint8_t*)data, bytes) != bytes) return false;
+  crc = crc32Update(crc, (const uint8_t*)data, bytes);
+  return true;
+}
+
+bool saveSurveySessionCheckpoint(String& detail) {
+  if (!spiffsMounted) {
+    detail = "SPIFFS is not mounted.";
+    return false;
+  }
+  if (wifiScanInProgress || csvExportInProgress) {
+    detail = "Wait for the active Wi-Fi scan or CSV export to finish.";
+    return false;
+  }
+
+  SessionCheckpointHeader h = {};
+  h.magic = SESSION_CHECKPOINT_MAGIC;
+  h.version = SESSION_CHECKPOINT_VERSION;
+  h.headerBytes = sizeof(SessionCheckpointHeader);
+  h.savedUptimeMs = millis();
+  h.scanCounter = scanCounter;
+  h.lastScanUptimeMs = lastScanUptimeMs;
+  h.wifiObservationCount = historyCount;
+  h.wifiApCount = wifiApCount;
+  h.wifiMetadataCount = wifiScanMetadataCapacity;
+  h.bleObservationCount = bleSurveyEnabled ? bleHistoryCount : 0;
+  h.bleAddressCount = bleSurveyEnabled ? bleAddressCount : 0;
+  h.bleMetadataCount = bleSurveyEnabled ? bleScanMetadataCapacity : 0;
+  h.payloadBytes =
+      h.wifiObservationCount * sizeof(WifiObservation) +
+      h.wifiApCount * sizeof(WifiApEntry) +
+      h.wifiMetadataCount * sizeof(WifiScanMetadata) +
+      h.bleObservationCount * sizeof(BleObservation) +
+      h.bleAddressCount * sizeof(BleAddressEntry) +
+      h.bleMetadataCount * sizeof(SurveyScanMetadata);
+
+  File f = SPIFFS.open(SESSION_CHECKPOINT_PATH, FILE_WRITE);
+  if (!f) { detail = "Unable to create checkpoint file."; return false; }
+  h.crc32 = 0;
+  if (f.write((const uint8_t*)&h, sizeof(h)) != sizeof(h)) {
+    f.close(); SPIFFS.remove(SESSION_CHECKPOINT_PATH);
+    detail = "Unable to write checkpoint header."; return false;
+  }
+
+  uint32_t crc = 0;
+  bool ok = true;
+  for (size_t i = 0; ok && i < historyCount; i++) {
+    const WifiObservation& o = compactHistoryRecord(i);
+    ok = checkpointWriteChunk(f, crc, &o, sizeof(o));
+  }
+  if (ok) ok = checkpointWriteChunk(f, crc, wifiApTable, h.wifiApCount * sizeof(WifiApEntry));
+  if (ok) ok = checkpointWriteChunk(f, crc, wifiScanMetadata, h.wifiMetadataCount * sizeof(WifiScanMetadata));
+  if (bleSurveyEnabled) {
+    for (size_t i = 0; ok && i < bleHistoryCount; i++) {
+      const BleObservation& o = compactBleHistoryRecord(i);
+      ok = checkpointWriteChunk(f, crc, &o, sizeof(o));
+    }
+    if (ok) ok = checkpointWriteChunk(f, crc, bleAddressTable, h.bleAddressCount * sizeof(BleAddressEntry));
+    if (ok) ok = checkpointWriteChunk(f, crc, bleScanMetadata, h.bleMetadataCount * sizeof(SurveyScanMetadata));
+  }
+  if (!ok) { f.close(); SPIFFS.remove(SESSION_CHECKPOINT_PATH); detail = "Checkpoint write failed."; return false; }
+  h.crc32 = crc;
+  if (!f.seek(0)) { f.close(); SPIFFS.remove(SESSION_CHECKPOINT_PATH); detail = "Unable to seek checkpoint header."; return false; }
+  size_t rewritten = f.write((const uint8_t*)&h, sizeof(h));
+  f.close();
+  if (rewritten != sizeof(h)) { SPIFFS.remove(SESSION_CHECKPOINT_PATH); detail = "Unable to finalize checkpoint CRC."; return false; }
+
+  detail = "Saved " + String(historyCount) + " Wi-Fi observation(s)";
+  if (bleSurveyEnabled) detail += " and " + String(bleHistoryCount) + " BLE observation(s)";
+  detail += ".";
+  sessionCheckpointStatus = detail;
+  return true;
+}
+
+bool discardSurveySessionCheckpoint(String& detail) {
+  if (!spiffsMounted) { detail = "SPIFFS is not mounted."; return false; }
+  if (!SPIFFS.exists(SESSION_CHECKPOINT_PATH)) {
+    detail = "No saved session exists.";
+    sessionCheckpointStatus = detail;
+    return true;
+  }
+  bool ok = SPIFFS.remove(SESSION_CHECKPOINT_PATH);
+  detail = ok ? "Saved session discarded." : "Unable to remove saved session.";
+  sessionCheckpointStatus = detail;
+  return ok;
+}
+
+bool restoreSurveySessionCheckpoint(String& detail) {
+  if (!spiffsMounted || !SPIFFS.exists(SESSION_CHECKPOINT_PATH)) {
+    detail = "No saved session found.";
+    sessionCheckpointStatus = detail;
+    return false;
+  }
+  File f = SPIFFS.open(SESSION_CHECKPOINT_PATH, FILE_READ);
+  if (!f) { detail = "Unable to open saved session."; return false; }
+  SessionCheckpointHeader h = {};
+  if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) ||
+      h.magic != SESSION_CHECKPOINT_MAGIC ||
+      h.version != SESSION_CHECKPOINT_VERSION ||
+      h.headerBytes != sizeof(SessionCheckpointHeader)) {
+    f.close(); detail = "Saved session header is invalid or incompatible."; sessionCheckpointStatus = detail; return false;
+  }
+  if (h.wifiApCount > wifiApTableCapacity || h.wifiMetadataCount > wifiScanMetadataCapacity ||
+      (bleSurveyEnabled && (h.bleAddressCount > bleAddressTableCapacity || h.bleMetadataCount > bleScanMetadataCapacity))) {
+    f.close(); detail = "Saved session tables do not fit the current survey mode."; sessionCheckpointStatus = detail; return false;
+  }
+  uint32_t expectedPayload =
+      h.wifiObservationCount * sizeof(WifiObservation) + h.wifiApCount * sizeof(WifiApEntry) +
+      h.wifiMetadataCount * sizeof(WifiScanMetadata) + h.bleObservationCount * sizeof(BleObservation) +
+      h.bleAddressCount * sizeof(BleAddressEntry) + h.bleMetadataCount * sizeof(SurveyScanMetadata);
+  if (expectedPayload != h.payloadBytes || f.size() != (size_t)sizeof(h) + h.payloadBytes) {
+    f.close(); detail = "Saved session length check failed."; sessionCheckpointStatus = detail; return false;
+  }
+
+  uint32_t crc = 0;
+  uint8_t buf[256];
+  size_t remaining = h.payloadBytes;
+  while (remaining) {
+    size_t n = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+    int got = f.read(buf, n);
+    if (got != (int)n) { f.close(); detail = "Saved session read failed."; sessionCheckpointStatus = detail; return false; }
+    crc = crc32Update(crc, buf, n);
+    remaining -= n;
+  }
+  if (crc != h.crc32) { f.close(); detail = "Saved session CRC check failed."; sessionCheckpointStatus = detail; return false; }
+  f.seek(sizeof(h));
+
+  clearScanHistory();
+  size_t skipWifi = h.wifiObservationCount > scanHistoryRetentionLimit
+      ? h.wifiObservationCount - scanHistoryRetentionLimit : 0;
+  WifiObservation o = {};
+  for (size_t i = 0; i < h.wifiObservationCount; i++) {
+    if (f.read((uint8_t*)&o, sizeof(o)) != sizeof(o)) { f.close(); detail = "Wi-Fi observation restore failed."; return false; }
+    if (i >= skipWifi) appendWifiObservation(o);
+  }
+  if (f.read((uint8_t*)wifiApTable, h.wifiApCount * sizeof(WifiApEntry)) != (int)(h.wifiApCount * sizeof(WifiApEntry))) { f.close(); detail = "Wi-Fi AP table restore failed."; return false; }
+  wifiApCount = h.wifiApCount;
+  memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
+  if (f.read((uint8_t*)wifiScanMetadata, h.wifiMetadataCount * sizeof(WifiScanMetadata)) != (int)(h.wifiMetadataCount * sizeof(WifiScanMetadata))) { f.close(); detail = "Wi-Fi metadata restore failed."; return false; }
+  uint32_t restoreNow = millis();
+  for (size_t i = 0; i < h.wifiMetadataCount; i++) {
+    if (wifiScanMetadata[i].scanNumber != 0) {
+      uint32_t ageAtSave = h.savedUptimeMs - wifiScanMetadata[i].uptimeMs;
+      wifiScanMetadata[i].uptimeMs = restoreNow - ageAtSave;
+    }
+  }
+  scanCounter = h.scanCounter;
+  lastScanUptimeMs = restoreNow - (h.savedUptimeMs - h.lastScanUptimeMs);
+
+  if (h.bleObservationCount || h.bleAddressCount || h.bleMetadataCount) {
+    if (bleSurveyEnabled && bleHistory && bleAddressTable && bleScanMetadata) {
+      clearBleHistory();
+      size_t skipBle = h.bleObservationCount > bleHistoryRetentionLimit
+          ? h.bleObservationCount - bleHistoryRetentionLimit : 0;
+      BleObservation bo = {};
+      for (size_t i = 0; i < h.bleObservationCount; i++) {
+        if (f.read((uint8_t*)&bo, sizeof(bo)) != sizeof(bo)) { f.close(); detail = "BLE observation restore failed."; return false; }
+        if (i >= skipBle) appendBleObservation(bo);
+      }
+      if (f.read((uint8_t*)bleAddressTable, h.bleAddressCount * sizeof(BleAddressEntry)) != (int)(h.bleAddressCount * sizeof(BleAddressEntry))) { f.close(); detail = "BLE address restore failed."; return false; }
+      bleAddressCount = h.bleAddressCount;
+      memset(bleScanMetadata, 0, bleScanMetadataCapacity * sizeof(SurveyScanMetadata));
+      if (f.read((uint8_t*)bleScanMetadata, h.bleMetadataCount * sizeof(SurveyScanMetadata)) != (int)(h.bleMetadataCount * sizeof(SurveyScanMetadata))) { f.close(); detail = "BLE metadata restore failed."; return false; }
+      uint32_t bleRestoreNow = millis();
+      for (size_t i = 0; i < h.bleMetadataCount; i++) {
+        if (bleScanMetadata[i].scanNumber != 0) {
+          uint32_t ageAtSave = h.savedUptimeMs - bleScanMetadata[i].uptimeMs;
+          bleScanMetadata[i].uptimeMs = bleRestoreNow - ageAtSave;
+        }
+      }
+    } else {
+      size_t skipBytes = h.bleObservationCount * sizeof(BleObservation) +
+          h.bleAddressCount * sizeof(BleAddressEntry) + h.bleMetadataCount * sizeof(SurveyScanMetadata);
+      if (!f.seek(f.position() + skipBytes)) { f.close(); detail = "Unable to skip saved BLE payload."; return false; }
+    }
+  }
+  f.close();
+  sessionRestoredThisBoot = true;
+  detail = "Restored " + String(historyCount) + " Wi-Fi observation(s) from checkpoint.";
+  sessionCheckpointStatus = detail;
+  return true;
+}
+
+void initializeSessionStorageAndRestore() {
+  spiffsMounted = SPIFFS.begin(false);
+  if (!spiffsMounted) {
+    sessionCheckpointStatus = "SPIFFS mount failed; checkpoint features unavailable.";
+    return;
+  }
+  String detail;
+  if (SPIFFS.exists(SESSION_CHECKPOINT_PATH)) restoreSurveySessionCheckpoint(detail);
+  else sessionCheckpointStatus = "No saved session.";
+}
+
+bool checkpointBeforeControlledRestart() {
+  if (historyCount == 0 && (!bleSurveyEnabled || bleHistoryCount == 0)) return true;
+  uint32_t waitStarted = millis();
+  while (wifiScanInProgress && (uint32_t)(millis() - waitStarted) < 10000) {
+    serviceLoggedWifiScan();
+    delay(10);
+  }
+  String detail;
+  return saveSurveySessionCheckpoint(detail);
+}
+
+// ============================================================
+// V33 synthetic Wi-Fi history test tools
+// ============================================================
+
+bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
+  if (percent != 50 && percent != 75 && percent != 95) { detail = "Unsupported target."; return false; }
+  if (!scanHistory || !wifiApTable || !wifiScanMetadata || wifiScanInProgress || csvExportInProgress) {
+    detail = "History storage is unavailable or busy."; return false;
+  }
+  size_t target = (scanHistoryRetentionLimit * percent) / 100;
+  if (historyCount >= target) { detail = "History is already at or above the requested target."; return true; }
+
+  const uint8_t syntheticApCount = 16;
+  uint16_t apIndexes[syntheticApCount];
+  for (uint8_t a = 0; a < syntheticApCount; a++) {
+    uint8_t bssid[6] = {0x02, 0x53, 0x59, 0x4E, 0x00, a};
+    String ssid = "TEST-PREFILL-" + String(a + 1);
+    int idx = findOrCreateWifiAp(bssid, ssid, (uint8_t)(1 + (a % 11)), WIFI_AUTH_OPEN);
+    if (idx < 0) { detail = "AP table has no room for synthetic test identities."; return false; }
+    apIndexes[a] = (uint16_t)idx;
+  }
+
+  while (historyCount < target) {
+    scanCounter++;
+    uint16_t slot = (uint16_t)(scanCounter % wifiScanMetadataCapacity);
+    if (wifiScanMetadata[slot].scanNumber != 0 && wifiScanMetadata[slot].scanNumber != scanCounter)
+      discardObservationsForScanSlot(slot);
+    wifiScanMetadata[slot].scanNumber = scanCounter;
+    wifiScanMetadata[slot].uptimeMs = millis();
+    lastScanUptimeMs = wifiScanMetadata[slot].uptimeMs;
+    for (uint8_t a = 0; a < syntheticApCount && historyCount < target; a++) {
+      WifiObservation test = {};
+      test.apIndex = apIndexes[a];
+      test.scanSlot = slot;
+      test.rssi = (int8_t)(-35 - ((scanCounter + a * 7) % 55));
+      test.reserved = 0xA5; // explicit synthetic marker for future diagnostics/export use
+      appendWifiObservation(test);
+    }
+  }
+  syntheticPrefillRuns++;
+  syntheticPrefillLastTarget = target;
+  detail = "Synthetic test data filled history to " + String(percent) + "% (" + String(historyCount) + " observations).";
+  return true;
+}
+
+void handleHistoryPrefill() {
+  markExplicitUserInteraction();
+  if (!server.hasArg("percent")) { server.send(400, "text/plain", "Missing target percent."); return; }
+  int percent = server.arg("percent").toInt();
+  String detail;
+  bool ok = prefillWifiHistoryToPercent((uint8_t)percent, detail);
+  server.sendHeader("Location", "/system");
+  server.send(ok ? 303 : 409, "text/plain", detail);
+}
+
+void handleSessionCheckpointSave() {
+  markExplicitUserInteraction();
+  String detail; bool ok = saveSurveySessionCheckpoint(detail);
+  server.sendHeader("Location", "/system"); server.send(ok ? 303 : 409, "text/plain", detail);
+}
+
+void handleSessionCheckpointDiscard() {
+  markExplicitUserInteraction();
+  String detail; bool ok = discardSurveySessionCheckpoint(detail);
+  server.sendHeader("Location", "/system"); server.send(ok ? 303 : 500, "text/plain", detail);
+}
+
+void serviceNativeReconnectDiagnostics() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (!nativeReconnectStateInitialized) {
+    nativeReconnectStateInitialized = true;
+    nativeReconnectWasConnected = connected;
+    return;
+  }
+  if (nativeReconnectWasConnected && !connected) nativeReconnectSawDisconnect = true;
+  if (!nativeReconnectWasConnected && connected && nativeReconnectSawDisconnect) {
+    nativeReconnectObservedCount++;
+    nativeReconnectSawDisconnect = false;
+  }
+  nativeReconnectWasConnected = connected;
+}
+
+// ============================================================
 // BLE helpers
 // ============================================================
 
@@ -1088,7 +1431,6 @@ bool initializeCompactWifiHistory(size_t budgetBytes) {
   return true;
 }
 
-bool wifiScanInProgress = false;
 bool wifiInitialScanCheckpointPending = false;
 String wifiScanStatusMessage = "Idle";
 
@@ -1104,7 +1446,7 @@ uint32_t infrastructureReconnectSuccessCount = 0;
 
 bool loadCredentials(String& ssid, String& password);
 void considerInfrastructureReconnectAfterScan(int networkCount);
-void serviceInfrastructureReconnect();
+void serviceNativeReconnectDiagnostics();
 
 int processCompletedWifiScan(int networkCount) {
   scanCounter++;
@@ -1188,7 +1530,7 @@ int performLoggedScan() {
   stopScanLed();
 
   int result = processCompletedWifiScan(networkCount);
-  recordWifiScanDuration(scanDurationMs);
+  if (networkCount >= 0) recordWifiScanDuration(scanDurationMs);
   lastAutoScanMs = millis();
   wifiAutoScanRetryPending = false;
   wifiScanStatusMessage = "Complete";
@@ -1251,7 +1593,6 @@ void serviceLoggedWifiScan() {
 
   processCompletedWifiScan(result);
   recordWifiScanDuration(scanDurationMs);
-  considerInfrastructureReconnectAfterScan(result);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
     lastWifiAutoScanCompletionMs = lastScanUptimeMs;
@@ -4695,10 +5036,8 @@ void handleSystemStatus() {
   String reconnectState = infrastructureReconnectAttemptActive
       ? "attempting"
       : (infrastructureReconnectPending ? "pending" : "idle");
-  s += "<div class=\"row\"><span class=\"label\">Infrastructure Auto-Reconnect</span><span class=\"value\">Scan-assisted; " +
-       String(infrastructureReconnectAttemptCount) + " attempt(s), " +
-       String(infrastructureReconnectSuccessCount) + " success(es); " +
-       reconnectState + "</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Infrastructure Auto-Reconnect</span><span class=\"value\">ESP32 native auto-reconnect enabled; " +
+       String(nativeReconnectObservedCount) + " reconnect transition(s) observed</span></div>";
   if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
@@ -4763,6 +5102,8 @@ void handleSystemStatus() {
     ", completion failures " + String(wifiAutoScanCompletionFailureCount)));
   server.sendContent(selfTestRow("Wi-Fi scan timing", wifiScanDurationCount > 0 ? "PASS" : "WARN",
     wifiScanDurationSummaryLabel()));
+  server.sendContent(selfTestRow("Session checkpoint storage", spiffsMounted ? "PASS" : "WARN",
+    spiffsMounted ? sessionCheckpointStatus : "SPIFFS unavailable"));
   server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
     mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
   {
@@ -4787,7 +5128,21 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
   bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
   server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. No filesystem self-test is included because persistent logging/filesystem support is intentionally not part of this firmware. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
+  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. SPIFFS is used only for explicit/controlled-reboot session checkpoints; continuous persistent logging is not enabled. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
+  server.sendContent(
+    "<div class=\"card\"><h2>Session &amp; History Test Tools</h2>"
+    "<div class=\"row\"><span class=\"label\">Session Checkpoint</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
+    "<div class=\"buttons\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save / Checkpoint Session</button></form>"
+    "<form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Saved Session</button></form></div>"
+    "<div class=\"note\">Checkpoint storage is intended for controlled reboots, not continuous logging. A valid saved checkpoint is restored automatically at boot.</div>"
+    "<h3>Developer History Prefill</h3>"
+    "<div class=\"buttons\">"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
+    "</div><div class=\"note\"><strong>TEST FEATURE:</strong> adds synthetic TEST-PREFILL networks directly to the compact Wi-Fi history. Synthetic data is not a substitute for radio/endurance testing and will appear in CSV/UI until cleared or rolled out.</div></div>"
+  );
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -5291,6 +5646,11 @@ void handleConfigImport() {
     restartReason += "access point";
   }
 
+  if (restartRequired) {
+    String checkpointDetail;
+    saveSurveySessionCheckpoint(checkpointDetail);
+  }
+
   server.sendHeader("Cache-Control", "no-store");
   server.send(
     200,
@@ -5385,6 +5745,8 @@ void handleStatusJsonExport() {
     String(infrastructureReconnectAttemptCount));
   server.sendContent(",\"autoReconnectSuccesses\":" +
     String(infrastructureReconnectSuccessCount));
+  server.sendContent(",\"nativeAutoReconnectEnabled\":true");
+  server.sendContent(",\"nativeReconnectTransitions\":" + String(nativeReconnectObservedCount));
   server.sendContent(",\"accessPointRunning\":");
   server.sendContent(apRunning ? "true" : "false");
   server.sendContent(",\"accessPointSSID\":" + jsonQuoted(apSSID));
@@ -5439,6 +5801,9 @@ void handleStatusJsonExport() {
   server.sendContent(",\"lastCsvRows\":" + String(wifiCsvLastRows));
   server.sendContent(",\"lastCsvBytes\":" + String(wifiCsvLastBytes));
   server.sendContent(",\"lastCsvDurationMs\":" + String(wifiCsvLastDurationMs));
+  server.sendContent(",\"syntheticPrefillRuns\":" + String(syntheticPrefillRuns));
+  server.sendContent(",\"sessionRestoredThisBoot\":");
+  server.sendContent(sessionRestoredThisBoot ? "true" : "false");
   server.sendContent("},\n");
 
   server.sendContent("  \"bluetoothSurvey\":{");
@@ -5610,6 +5975,7 @@ void handleHostnameSave() {
     themeBootstrapScript() + pageStyles() +
     "</head><body><div class=\"container\"><div class=\"card\"><h1>Hostname Updated</h1><p>The ESP32 will advertise as <strong>" +
     htmlEscape(mdnsHostname) + ".local</strong> after restart.</p><p>The ESP32 is restarting now.</p></div></div></body></html>");
+  checkpointBeforeControlledRestart();
   delay(750);
   ESP.restart();
 }
@@ -5678,6 +6044,7 @@ void handleBleModeChange() {
     "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
     "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
 
+  checkpointBeforeControlledRestart();
   delay(750);
   ESP.restart();
 }
@@ -5914,6 +6281,7 @@ void handleSaveAccessPointSettings() {
     "</body></html>"
   );
 
+  checkpointBeforeControlledRestart();
   delay(750);
   ESP.restart();
 }
@@ -5949,6 +6317,9 @@ void startWebServer() {
   server.on("/scan-settings", handleScanSettings);
   server.on("/scan-clear", handleClearScanHistory);
   server.on("/scanlog.csv", handleScanCsv);
+  server.on("/history-prefill", HTTP_POST, handleHistoryPrefill);
+  server.on("/session-save", HTTP_POST, handleSessionCheckpointSave);
+  server.on("/session-discard", HTTP_POST, handleSessionCheckpointDiscard);
   server.on("/ble", HTTP_GET, handleBLESurvey);
   server.on("/api/ble/status", HTTP_GET, handleBleScanStatus);
   server.on("/api/ble/observed", HTTP_GET, handleBleObservedFragment);
@@ -6342,7 +6713,7 @@ void handleSerialCommand() {
     if (requested==bleSurveyEnabled) { Serial.println("Bluetooth Survey mode already set."); printSettingsSerial(); return; }
     saveBleSurveyEnabled(requested);
     Serial.print("Bluetooth Survey will be "); Serial.print(requested?"enabled":"disabled"); Serial.println(" after restart. Restarting...");
-    delay(500); ESP.restart(); return;
+    checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
 
   if (command.equalsIgnoreCase("selftest")) { printSoftwareSelfTestsSerial(); Serial.print("> "); return; }
@@ -6371,27 +6742,27 @@ void handleSerialCommand() {
     }
     saveMdnsHostname(requested);
     Serial.print("mDNS hostname saved as "); Serial.print(mdnsHostname); Serial.println(".local. Restarting...");
-    delay(500); ESP.restart(); return;
+    checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
 
   if (command.equalsIgnoreCase("ap on") || command.equalsIgnoreCase("ap off")) {
     bool requested=command.endsWith("on"); saveAccessPointSettings(requested,apSSID,apPassword);
-    Serial.println("Survey AP setting saved. Restarting..."); delay(500); ESP.restart(); return;
+    Serial.println("Survey AP setting saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
   if (command.startsWith("apssid ")) {
     String requested=commandArgument(command,"apssid"); requested.trim();
     if (requested.length()==0 || requested.length()>32) { Serial.println("AP SSID must be 1-32 characters."); printSettingsSerial(); return; }
-    saveAccessPointSettings(apEnabled,requested,apPassword); Serial.println("AP SSID saved. Restarting..."); delay(500); ESP.restart(); return;
+    saveAccessPointSettings(apEnabled,requested,apPassword); Serial.println("AP SSID saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
   if (command.startsWith("appass ")) {
     String requested=commandArgument(command,"appass");
     if (requested.length()<8 || requested.length()>63) { Serial.println("AP password must be 8-63 characters."); printSettingsSerial(); return; }
-    saveAccessPointSettings(apEnabled,apSSID,requested); Serial.println("AP password saved. Restarting..."); delay(500); ESP.restart(); return;
+    saveAccessPointSettings(apEnabled,apSSID,requested); Serial.println("AP password saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
 
   if (command.equalsIgnoreCase("version") || command.equalsIgnoreCase("v")) { printFirmwareInfo(); Serial.print("> "); return; }
   if (command.equalsIgnoreCase("mac")) { printMacAddress(); Serial.print("> "); return; }
-  if (command.equalsIgnoreCase("restart")) { Serial.println("Restarting ESP32..."); delay(500); ESP.restart(); return; }
+  if (command.equalsIgnoreCase("restart")) { Serial.println("Restarting ESP32..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return; }
 
   Serial.print("Unknown command: "); Serial.println(command);
   Serial.println("Enter 'h' for the main menu.");
@@ -6427,6 +6798,7 @@ void setup() {
   Serial.println();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   delay(WIFI_STARTUP_SETTLE_MS);
   wifiSubsystemInitialized = (WiFi.getMode() != WIFI_MODE_NULL);
   applyGeneratedDefaultMdnsHostname();
@@ -6465,6 +6837,7 @@ void setup() {
 
   initializeAutoSizedHistories();
   captureBootHeapCheckpoint("Histories allocated");
+  initializeSessionStorageAndRestore();
 
   Serial.print("Auto-sized Wi-Fi history: ");
   Serial.print(scanHistoryCapacity);
@@ -6602,7 +6975,7 @@ void loop() {
   }
 
   serviceLoggedWifiScan();
-  serviceInfrastructureReconnect();
+  serviceNativeReconnectDiagnostics();
   serviceInitialSurveyScans();
   serviceAutomaticScan();
   serviceAutomaticBLEScan();
