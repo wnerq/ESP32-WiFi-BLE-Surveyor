@@ -1,4 +1,4 @@
-// WifiConnect31 - Standard/Advanced progressive diagnostic UI
+// WifiConnect32d - full-history web performance and infrastructure reconnect robustness
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect31_standard_advanced_ui.ino";
-const char* FIRMWARE_VERSION = "31";
+const char* FIRMWARE_FILE = "WifiConnect32d_full_history_reconnect.ino";
+const char* FIRMWARE_VERSION = "32d";
 
 
 Preferences preferences;
@@ -31,6 +31,8 @@ WebServer server(80);
 
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
+const uint32_t INFRA_RECONNECT_BACKOFF_MS = 30000;
+const uint32_t INFRA_RECONNECT_ATTEMPT_WINDOW_MS = WIFI_TIMEOUT_MS;
 
 bool webServerStarted = false;
 
@@ -223,6 +225,8 @@ void appendWifiObservation(const WifiObservation& observation);
 const BleObservation& compactBleHistoryRecord(size_t logicalIndex);
 BleScanRecord bleHistoryRecord(size_t logicalIndex);
 void appendBleObservation(const BleObservation& observation);
+int findWifiApByTextBssid(const String& bssid);
+bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
@@ -1088,6 +1092,20 @@ bool wifiScanInProgress = false;
 bool wifiInitialScanCheckpointPending = false;
 String wifiScanStatusMessage = "Idle";
 
+// Saved infrastructure Wi-Fi reconnects opportunistically from survey results.
+// No extra scan is started just for connectivity recovery.
+bool infrastructureReconnectPending = false;
+bool infrastructureReconnectAttemptActive = false;
+bool infrastructureReconnectAttempted = false;
+uint32_t infrastructureReconnectAttemptStartedMs = 0;
+uint32_t lastInfrastructureReconnectAttemptMs = 0;
+uint32_t infrastructureReconnectAttemptCount = 0;
+uint32_t infrastructureReconnectSuccessCount = 0;
+
+bool loadCredentials(String& ssid, String& password);
+void considerInfrastructureReconnectAfterScan(int networkCount);
+void serviceInfrastructureReconnect();
+
 int processCompletedWifiScan(int networkCount) {
   scanCounter++;
   lastScanUptimeMs = millis();
@@ -1233,6 +1251,7 @@ void serviceLoggedWifiScan() {
 
   processCompletedWifiScan(result);
   recordWifiScanDuration(scanDurationMs);
+  considerInfrastructureReconnectAfterScan(result);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
     lastWifiAutoScanCompletionMs = lastScanUptimeMs;
@@ -1935,6 +1954,105 @@ bool connectUsingSavedCredentials() {
   Serial.println(ssid);
 
   return connectToWiFi(ssid, password);
+}
+
+
+void considerInfrastructureReconnectAfterScan(int networkCount) {
+  if (WiFi.status() == WL_CONNECTED || networkCount <= 0) {
+    if (WiFi.status() == WL_CONNECTED) infrastructureReconnectPending = false;
+    return;
+  }
+
+  String savedSsid;
+  String savedPassword;
+  if (!loadCredentials(savedSsid, savedPassword) || savedSsid.length() == 0) {
+    infrastructureReconnectPending = false;
+    return;
+  }
+
+  bool seen = false;
+  for (int i = 0; i < networkCount; i++) {
+    if (WiFi.SSID(i) == savedSsid) {
+      seen = true;
+      break;
+    }
+  }
+
+  if (!seen) {
+    infrastructureReconnectPending = false;
+    return;
+  }
+
+  // Presence in the most recently completed survey scan is the trigger. The
+  // actual WiFi.begin() call is
+  // deferred until after scan result cleanup so reconnect does not add a scan
+  // or block the completed-scan processing path.
+  infrastructureReconnectPending = true;
+}
+
+
+void serviceInfrastructureReconnect() {
+  if (WiFi.status() == WL_CONNECTED) {
+    infrastructureReconnectPending = false;
+    if (infrastructureReconnectAttemptActive) {
+      infrastructureReconnectAttemptActive = false;
+      infrastructureReconnectSuccessCount++;
+      Serial.print("Infrastructure Wi-Fi reconnected automatically: ");
+      Serial.println(WiFi.SSID());
+    }
+    return;
+  }
+
+  uint32_t now = millis();
+
+  if (
+    infrastructureReconnectAttemptActive &&
+    (uint32_t)(now - infrastructureReconnectAttemptStartedMs) >=
+      INFRA_RECONNECT_ATTEMPT_WINDOW_MS
+  ) {
+    infrastructureReconnectAttemptActive = false;
+  }
+
+  if (
+    !infrastructureReconnectPending ||
+    wifiScanInProgress ||
+    csvExportInProgress ||
+    userInteractionDeferActive()
+  ) {
+    return;
+  }
+
+  if (
+    infrastructureReconnectAttempted &&
+    (uint32_t)(now - lastInfrastructureReconnectAttemptMs) <
+      INFRA_RECONNECT_BACKOFF_MS
+  ) {
+    return;
+  }
+
+  String savedSsid;
+  String savedPassword;
+  if (!loadCredentials(savedSsid, savedPassword) || savedSsid.length() == 0) {
+    infrastructureReconnectPending = false;
+    return;
+  }
+
+  infrastructureReconnectPending = false;
+  infrastructureReconnectAttemptActive = true;
+  infrastructureReconnectAttempted = true;
+  infrastructureReconnectAttemptStartedMs = now;
+  lastInfrastructureReconnectAttemptMs = now;
+  infrastructureReconnectAttemptCount++;
+
+  Serial.print("Saved infrastructure network observed; reconnect attempt #");
+  Serial.print(infrastructureReconnectAttemptCount);
+  Serial.print(" to ");
+  Serial.println(savedSsid);
+
+  // WiFi.begin() is asynchronous here. Survey scanning remains the primary
+  // activity; no blocking wait loop and no extra reconnect-specific scan.
+  ensureWiFiStationMode();
+  WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
 }
 
 
@@ -2988,22 +3106,28 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
   const int RSSI_TOP = -30;
   const int RSSI_BOTTOM = -100;
 
+  int selectedApIndex = findWifiApByTextBssid(selectedBssid);
+  if (selectedApIndex < 0) {
+    server.sendContent(
+      "<p>No logged RSSI samples are available for the selected BSSID.</p>"
+    );
+    return;
+  }
+
   uint32_t firstMs = 0;
   uint32_t lastMs = 0;
   size_t pointCount = 0;
 
   for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& record = historyRecord(i);
+    const WifiObservation& observation = compactHistoryRecord(i);
+    if (observation.apIndex != (uint16_t)selectedApIndex) continue;
+    if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
 
-    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
-      continue;
-    }
+    const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
+    if (scan.scanNumber == 0) continue;
 
-    if (pointCount == 0) {
-      firstMs = record.uptimeMs;
-    }
-
-    lastMs = record.uptimeMs;
+    if (pointCount == 0) firstMs = scan.uptimeMs;
+    lastMs = scan.uptimeMs;
     pointCount++;
   }
 
@@ -3063,17 +3187,18 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
   points.reserve(pointCount * 14);
 
   for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& record = historyRecord(i);
+    const WifiObservation& observation = compactHistoryRecord(i);
+    if (observation.apIndex != (uint16_t)selectedApIndex) continue;
+    if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
 
-    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
-      continue;
-    }
+    const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
+    if (scan.scanNumber == 0) continue;
 
     int x = LEFT +
-      (uint64_t)(record.uptimeMs - firstMs) * plotWidth /
+      (uint64_t)(scan.uptimeMs - firstMs) * plotWidth /
       (lastMs - firstMs);
 
-    int clippedRssi = record.rssi;
+    int clippedRssi = observation.rssi;
 
     if (clippedRssi > RSSI_TOP) {
       clippedRssi = RSSI_TOP;
@@ -3105,19 +3230,24 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 
   server.sendContent(polyline);
 
-  // Individual samples.
-  for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& record = historyRecord(i);
+  // Individual samples. Buffer several SVG circles per send so a dense plot
+  // does not turn into hundreds of tiny TCP writes.
+  String dotBuffer;
+  dotBuffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
 
-    if (!String(record.bssid).equalsIgnoreCase(selectedBssid)) {
-      continue;
-    }
+  for (size_t i = 0; i < historyCount; i++) {
+    const WifiObservation& observation = compactHistoryRecord(i);
+    if (observation.apIndex != (uint16_t)selectedApIndex) continue;
+    if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
+
+    const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
+    if (scan.scanNumber == 0) continue;
 
     int x = LEFT +
-      (uint64_t)(record.uptimeMs - firstMs) * plotWidth /
+      (uint64_t)(scan.uptimeMs - firstMs) * plotWidth /
       (lastMs - firstMs);
 
-    int clippedRssi = record.rssi;
+    int clippedRssi = observation.rssi;
 
     if (clippedRssi > RSSI_TOP) {
       clippedRssi = RSSI_TOP;
@@ -3140,15 +3270,25 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
     dot += String(y);
     dot += "\" r=\"4\" class=\"plot-point\">";
     dot += "<title>Scan #";
-    dot += String(record.scanNumber);
+    dot += String(scan.scanNumber);
     dot += " | ";
-    dot += htmlEscape(formatUptime(record.uptimeMs));
+    dot += htmlEscape(formatUptime(scan.uptimeMs));
     dot += " | ";
-    dot += String(record.rssi);
+    dot += String(observation.rssi);
     dot += " dBm</title></circle>";
 
-    server.sendContent(dot);
+    if (
+      dotBuffer.length() > 0 &&
+      dotBuffer.length() + dot.length() > CSV_STREAM_BUFFER_BYTES
+    ) {
+      server.sendContent(dotBuffer);
+      dotBuffer = "";
+    }
+
+    dotBuffer += dot;
   }
+
+  if (dotBuffer.length() > 0) server.sendContent(dotBuffer);
 
   String labels;
   labels.reserve(400);
@@ -3178,97 +3318,84 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 }
 
 
-bool hasNewerObservationForBSSID(
-  size_t logicalIndex,
-  const String& bssid
-) {
-  for (
-    size_t i = logicalIndex + 1;
-    i < historyCount;
-    i++
-  ) {
-    if (
-      String(historyRecord(i).bssid)
-        .equalsIgnoreCase(bssid)
-    ) {
-      return true;
-    }
+int findWifiApByTextBssid(const String& bssid) {
+  char textBssid[18];
+
+  for (size_t i = 0; i < wifiApCount; i++) {
+    formatBssid(wifiApTable[i].bssid, textBssid);
+    if (bssid.equalsIgnoreCase(textBssid)) return (int)i;
   }
 
-  return false;
+  return -1;
 }
 
-bool buildNetworkSummary(
-  const String& bssid,
+
+bool buildNetworkSummaryByApIndex(
+  uint16_t apIndex,
   NetworkSummary& summary
 ) {
   summary = {};
   resetSignalStats(summary.signal);
 
-  bool found = false;
-  String newestKnownSSID = "";
-
-  // Walk oldest -> newest so SignalStats.latestRssi and lastSeenMs naturally
-  // become the newest retained values.
-  for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& record = historyRecord(i);
-
-    if (
-      !String(record.bssid)
-        .equalsIgnoreCase(bssid)
-    ) {
-      continue;
-    }
-
-    found = true;
-
-    addSignalObservation(
-      summary.signal,
-      record.rssi,
-      record.uptimeMs
-    );
-
-    // Channel and security use the newest retained observation.
-    summary.channel = record.channel;
-    summary.authMode = record.authMode;
-
-    // Preserve the newest known non-hidden SSID for this BSSID.
-    if (
-      !record.hidden &&
-      String(record.ssid).length() > 0
-    ) {
-      newestKnownSSID = String(record.ssid);
-    }
-  }
-
-  if (!found) {
+  if (
+    wifiApTable == nullptr ||
+    wifiScanMetadata == nullptr ||
+    scanHistory == nullptr ||
+    apIndex >= wifiApCount
+  ) {
     return false;
   }
 
-  bssid.toCharArray(
-    summary.bssid,
-    sizeof(summary.bssid)
-  );
+  bool found = false;
 
-  if (newestKnownSSID.length() > 0) {
-    newestKnownSSID.toCharArray(
-      summary.ssid,
-      sizeof(summary.ssid)
+  // Compact observations already contain the AP-table index. Walking them
+  // directly avoids synthesizing ScanRecord/String objects for every history
+  // comparison, which was the dominant full-history Wi-Fi page cost.
+  for (size_t i = 0; i < historyCount; i++) {
+    const WifiObservation& observation = compactHistoryRecord(i);
+    if (observation.apIndex != apIndex) continue;
+    if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
+
+    const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
+    if (scan.scanNumber == 0) continue;
+
+    found = true;
+    addSignalObservation(
+      summary.signal,
+      observation.rssi,
+      scan.uptimeMs
     );
-
-    summary.hidden = false;
-  } else {
-    summary.ssid[0] = '\0';
-    summary.hidden = true;
   }
 
-  // "Connected" is a live state, not a historical property. This avoids
-  // highlighting an AP simply because it was connected during an older scan.
-  summary.connected =
-      WiFi.status() == WL_CONNECTED &&
-      WiFi.BSSIDstr().equalsIgnoreCase(bssid);
+  if (!found) return false;
+
+  const WifiApEntry& ap = wifiApTable[apIndex];
+
+  memcpy(summary.ssid, ap.ssid, sizeof(summary.ssid));
+  formatBssid(ap.bssid, summary.bssid);
+  summary.channel = ap.channel;
+  summary.authMode = ap.authMode;
+  summary.hidden = (ap.ssid[0] == '\0');
+
+  summary.connected = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    const uint8_t* connectedBssid = WiFi.BSSID();
+    summary.connected =
+      connectedBssid != nullptr &&
+      memcmp(connectedBssid, ap.bssid, 6) == 0;
+  }
 
   return true;
+}
+
+
+bool buildNetworkSummary(
+  const String& bssid,
+  NetworkSummary& summary
+) {
+  int apIndex = findWifiApByTextBssid(bssid);
+  if (apIndex < 0) return false;
+  return buildNetworkSummaryByApIndex((uint16_t)apIndex, summary);
 }
 
 void sendNetworkSummaryTable() {
@@ -3296,9 +3423,13 @@ void sendNetworkSummaryTable() {
     "</tr></thead><tbody>"
   );
 
-  // Iterate newest -> oldest. Only the newest retained observation for each
-  // BSSID emits a row. This eliminates the large temporary NetworkSummary
-  // array used previously and keeps page generation memory-bounded.
+  // Iterate newest -> oldest and use the compact observation's AP index as
+  // the deduplication key. This removes the former O(n^2) "is there a newer
+  // BSSID?" history search while keeping newest-observed row ordering.
+  bool emittedAp[256] = {};
+  String tableBuffer;
+  tableBuffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
+
   for (
     size_t offset = 0;
     offset < historyCount;
@@ -3307,24 +3438,17 @@ void sendNetworkSummaryTable() {
     size_t logicalIndex =
         historyCount - 1 - offset;
 
-    const ScanRecord& latestRecord =
-        historyRecord(logicalIndex);
+    const WifiObservation& latestObservation =
+        compactHistoryRecord(logicalIndex);
+    uint16_t apIndex = latestObservation.apIndex;
 
-    String bssid =
-        String(latestRecord.bssid);
-
-    if (
-      hasNewerObservationForBSSID(
-        logicalIndex,
-        bssid
-      )
-    ) {
-      continue;
-    }
+    if (apIndex >= wifiApCount || apIndex >= 256) continue;
+    if (emittedAp[apIndex]) continue;
+    emittedAp[apIndex] = true;
 
     NetworkSummary summary = {};
 
-    if (!buildNetworkSummary(bssid, summary)) {
+    if (!buildNetworkSummaryByApIndex(apIndex, summary)) {
       continue;
     }
 
@@ -3432,9 +3556,18 @@ void sendNetworkSummaryTable() {
 
     row += "</tr>";
 
-    server.sendContent(row);
+    if (
+      tableBuffer.length() > 0 &&
+      tableBuffer.length() + row.length() > CSV_STREAM_BUFFER_BYTES
+    ) {
+      server.sendContent(tableBuffer);
+      tableBuffer = "";
+    }
+
+    tableBuffer += row;
   }
 
+  if (tableBuffer.length() > 0) server.sendContent(tableBuffer);
   server.sendContent("</tbody></table></div>");
 }
 
@@ -4559,6 +4692,13 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">STA MAC</span><span class=\"value\">" + WiFi.macAddress() + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">AP MAC</span><span class=\"value\">" + WiFi.softAPmacAddress() + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Infrastructure Wi-Fi</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
+  String reconnectState = infrastructureReconnectAttemptActive
+      ? "attempting"
+      : (infrastructureReconnectPending ? "pending" : "idle");
+  s += "<div class=\"row\"><span class=\"label\">Infrastructure Auto-Reconnect</span><span class=\"value\">Scan-assisted; " +
+       String(infrastructureReconnectAttemptCount) + " attempt(s), " +
+       String(infrastructureReconnectSuccessCount) + " success(es); " +
+       reconnectState + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
@@ -4654,6 +4794,708 @@ void handleSystemStatus() {
   server.sendContent("");
 }
 
+
+// ============================================================
+// V32 status export and configuration backup / restore
+// ============================================================
+
+const uint32_t STATUS_SCHEMA_VERSION = 1;
+const uint32_t CONFIG_SCHEMA_VERSION = 1;
+const size_t MAX_CONFIG_IMPORT_BYTES = 4096;
+
+String jsonEscape(String input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char escaped[7];
+          snprintf(escaped, sizeof(escaped), "\\u%04X", (unsigned int)(uint8_t)c);
+          out += escaped;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+String jsonQuoted(const String& value) {
+  return String("\"") + jsonEscape(value) + "\"";
+}
+
+struct PortableConfig {
+  unsigned long wifiScanIntervalSeconds;
+  bool bluetoothSurveyEnabled;
+  bool statusLedEnabled;
+  bool liveUpdatesEnabled;
+  bool mdnsHostnameAutomatic;
+  String mdnsHostname;
+  bool accessPointEnabled;
+  bool accessPointSSIDAutomatic;
+  String accessPointSSID;
+};
+
+// Explicit prototypes avoid Arduino 1.8.x auto-prototype placement issues
+// with custom types in .ino sketches.
+PortableConfig readPersistedPortableConfig();
+String portableConfigJson(const PortableConfig& c);
+
+PortableConfig readPersistedPortableConfig() {
+  PortableConfig c = {};
+
+  preferences.begin("survey", true);
+  c.wifiScanIntervalSeconds =
+      preferences.getULong("wifiInterval", scanIntervalSeconds);
+  c.bluetoothSurveyEnabled =
+      preferences.getBool("bleEnabled", bleSurveyEnabled);
+  c.statusLedEnabled =
+      preferences.getBool("ledEnabled", statusLedEnabled);
+  c.liveUpdatesEnabled =
+      preferences.getBool("webRefresh", webAutoRefreshEnabled);
+  c.mdnsHostnameAutomatic = !preferences.isKey("hostname");
+  c.mdnsHostname = c.mdnsHostnameAutomatic
+      ? String("")
+      : normalizedMdnsHostname(
+          preferences.getString("hostname", "")
+        );
+  preferences.end();
+
+  if (c.wifiScanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS)
+    c.wifiScanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
+  if (c.wifiScanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS)
+    c.wifiScanIntervalSeconds = MAX_SCAN_INTERVAL_SECONDS;
+
+  preferences.begin("ap", true);
+  c.accessPointEnabled = preferences.getBool("enabled", true);
+  c.accessPointSSIDAutomatic = !preferences.isKey("ssid");
+  c.accessPointSSID = c.accessPointSSIDAutomatic
+      ? String("")
+      : preferences.getString("ssid", "");
+  preferences.end();
+
+  return c;
+}
+
+String portableConfigJson(const PortableConfig& c) {
+  String json;
+  json.reserve(700);
+  json += "{\n";
+  json += "  \"configVersion\":" + String(CONFIG_SCHEMA_VERSION) + ",\n";
+  json += "  \"wifiScanIntervalSeconds\":" + String(c.wifiScanIntervalSeconds) + ",\n";
+  json += "  \"bluetoothSurveyEnabled\":" + String(c.bluetoothSurveyEnabled ? "true" : "false") + ",\n";
+  json += "  \"statusLedEnabled\":" + String(c.statusLedEnabled ? "true" : "false") + ",\n";
+  json += "  \"liveUpdatesEnabled\":" + String(c.liveUpdatesEnabled ? "true" : "false") + ",\n";
+  json += "  \"mdnsHostnameAutomatic\":" + String(c.mdnsHostnameAutomatic ? "true" : "false") + ",\n";
+  json += "  \"mdnsHostname\":" + jsonQuoted(c.mdnsHostname) + ",\n";
+  json += "  \"accessPointEnabled\":" + String(c.accessPointEnabled ? "true" : "false") + ",\n";
+  json += "  \"accessPointSSIDAutomatic\":" + String(c.accessPointSSIDAutomatic ? "true" : "false") + ",\n";
+  json += "  \"accessPointSSID\":" + jsonQuoted(c.accessPointSSID) + ",\n";
+  json += "  \"credentialsIncluded\":false\n";
+  json += "}\n";
+  return json;
+}
+
+void handleConfigExport() {
+  markExplicitUserInteraction();
+  PortableConfig c = readPersistedPortableConfig();
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=\"wireless_surveyor_config.json\""
+  );
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", portableConfigJson(c));
+}
+
+class FlatConfigJsonParser {
+public:
+  FlatConfigJsonParser(const String& source)
+      : s(source), pos(0), errorMessage("") {}
+
+  bool parse(PortableConfig& out) {
+    bool seenVersion = false;
+    bool seenInterval = false;
+    bool seenBle = false;
+    bool seenLed = false;
+    bool seenLive = false;
+    bool seenHostnameAuto = false;
+    bool seenHostname = false;
+    bool seenApEnabled = false;
+    bool seenApSsidAuto = false;
+    bool seenApSsid = false;
+    bool seenCredentials = false;
+
+    skipWs();
+    if (!consume('{')) return fail("Configuration must be a JSON object.");
+    skipWs();
+    if (peek('}')) {
+      consume('}');
+      return fail("Configuration object is empty.");
+    }
+
+    while (true) {
+      String key;
+      if (!parseString(key)) return fail("Expected a quoted configuration key.");
+      skipWs();
+      if (!consume(':')) return fail("Expected ':' after configuration key.");
+      skipWs();
+
+      if (key == "configVersion") {
+        if (seenVersion) return fail("Duplicate configVersion.");
+        seenVersion = true;
+        unsigned long value = 0;
+        if (!parseUnsigned(value)) return fail("configVersion must be an integer.");
+        if (value != CONFIG_SCHEMA_VERSION)
+          return fail("Unsupported configVersion.");
+      } else if (key == "wifiScanIntervalSeconds") {
+        if (seenInterval) return fail("Duplicate wifiScanIntervalSeconds.");
+        seenInterval = true;
+        unsigned long value = 0;
+        if (!parseUnsigned(value))
+          return fail("wifiScanIntervalSeconds must be an integer.");
+        out.wifiScanIntervalSeconds = value;
+      } else if (key == "bluetoothSurveyEnabled") {
+        if (seenBle) return fail("Duplicate bluetoothSurveyEnabled.");
+        seenBle = true;
+        if (!parseBool(out.bluetoothSurveyEnabled))
+          return fail("bluetoothSurveyEnabled must be true or false.");
+      } else if (key == "statusLedEnabled") {
+        if (seenLed) return fail("Duplicate statusLedEnabled.");
+        seenLed = true;
+        if (!parseBool(out.statusLedEnabled))
+          return fail("statusLedEnabled must be true or false.");
+      } else if (key == "liveUpdatesEnabled") {
+        if (seenLive) return fail("Duplicate liveUpdatesEnabled.");
+        seenLive = true;
+        if (!parseBool(out.liveUpdatesEnabled))
+          return fail("liveUpdatesEnabled must be true or false.");
+      } else if (key == "mdnsHostnameAutomatic") {
+        if (seenHostnameAuto) return fail("Duplicate mdnsHostnameAutomatic.");
+        seenHostnameAuto = true;
+        if (!parseBool(out.mdnsHostnameAutomatic))
+          return fail("mdnsHostnameAutomatic must be true or false.");
+      } else if (key == "mdnsHostname") {
+        if (seenHostname) return fail("Duplicate mdnsHostname.");
+        seenHostname = true;
+        if (!parseString(out.mdnsHostname))
+          return fail("mdnsHostname must be a string.");
+      } else if (key == "accessPointEnabled") {
+        if (seenApEnabled) return fail("Duplicate accessPointEnabled.");
+        seenApEnabled = true;
+        if (!parseBool(out.accessPointEnabled))
+          return fail("accessPointEnabled must be true or false.");
+      } else if (key == "accessPointSSIDAutomatic") {
+        if (seenApSsidAuto) return fail("Duplicate accessPointSSIDAutomatic.");
+        seenApSsidAuto = true;
+        if (!parseBool(out.accessPointSSIDAutomatic))
+          return fail("accessPointSSIDAutomatic must be true or false.");
+      } else if (key == "accessPointSSID") {
+        if (seenApSsid) return fail("Duplicate accessPointSSID.");
+        seenApSsid = true;
+        if (!parseString(out.accessPointSSID))
+          return fail("accessPointSSID must be a string.");
+      } else if (key == "credentialsIncluded") {
+        if (seenCredentials) return fail("Duplicate credentialsIncluded.");
+        seenCredentials = true;
+        bool included = false;
+        if (!parseBool(included))
+          return fail("credentialsIncluded must be true or false.");
+        if (included)
+          return fail("Credential-bearing configuration imports are not supported.");
+      } else {
+        return fail("Unsupported configuration key: " + key);
+      }
+
+      skipWs();
+      if (consume('}')) break;
+      if (!consume(','))
+        return fail("Expected ',' or '}' after configuration value.");
+      skipWs();
+    }
+
+    skipWs();
+    if (pos != s.length())
+      return fail("Unexpected content after the JSON object.");
+
+    if (!seenVersion || !seenInterval || !seenBle || !seenLed ||
+        !seenLive || !seenHostnameAuto || !seenHostname ||
+        !seenApEnabled || !seenApSsidAuto || !seenApSsid ||
+        !seenCredentials)
+      return fail("Configuration is missing one or more required fields.");
+
+    out.mdnsHostname = normalizedMdnsHostname(out.mdnsHostname);
+    out.accessPointSSID.trim();
+
+    if (out.wifiScanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS ||
+        out.wifiScanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS)
+      return fail(
+        "wifiScanIntervalSeconds must be between " +
+        String(MIN_SCAN_INTERVAL_SECONDS) + " and " +
+        String(MAX_SCAN_INTERVAL_SECONDS) + "."
+      );
+
+    if (!out.mdnsHostnameAutomatic &&
+        !isValidMdnsHostname(out.mdnsHostname))
+      return fail("mdnsHostname is invalid.");
+
+    if (!out.accessPointSSIDAutomatic) {
+      if (out.accessPointSSID.length() < 1 ||
+          out.accessPointSSID.length() > 32)
+        return fail("accessPointSSID must contain 1 to 32 characters.");
+      for (size_t i = 0; i < out.accessPointSSID.length(); i++) {
+        if ((uint8_t)out.accessPointSSID[i] < 0x20)
+          return fail("accessPointSSID contains a control character.");
+      }
+    }
+
+    return true;
+  }
+
+  String error() const { return errorMessage; }
+
+private:
+  const String& s;
+  size_t pos;
+  String errorMessage;
+
+  void skipWs() {
+    while (pos < s.length()) {
+      char c = s[pos];
+      if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+      pos++;
+    }
+  }
+
+  bool peek(char c) const {
+    return pos < s.length() && s[pos] == c;
+  }
+
+  bool consume(char c) {
+    skipWs();
+    if (!peek(c)) return false;
+    pos++;
+    return true;
+  }
+
+  bool fail(const String& message) {
+    errorMessage = message;
+    return false;
+  }
+
+  bool parseBool(bool& value) {
+    skipWs();
+    if (s.substring(pos, pos + 4) == "true") {
+      pos += 4;
+      value = true;
+      return true;
+    }
+    if (s.substring(pos, pos + 5) == "false") {
+      pos += 5;
+      value = false;
+      return true;
+    }
+    return false;
+  }
+
+  bool parseUnsigned(unsigned long& value) {
+    skipWs();
+    if (pos >= s.length() || s[pos] < '0' || s[pos] > '9') return false;
+    unsigned long result = 0;
+    while (pos < s.length() && s[pos] >= '0' && s[pos] <= '9') {
+      unsigned long digit = (unsigned long)(s[pos] - '0');
+      if (result > (0xFFFFFFFFUL - digit) / 10UL) return false;
+      result = result * 10UL + digit;
+      pos++;
+    }
+    value = result;
+    return true;
+  }
+
+  bool parseString(String& value) {
+    skipWs();
+    if (pos >= s.length() || s[pos] != '"') return false;
+    pos++;
+    value = "";
+    while (pos < s.length()) {
+      char c = s[pos++];
+      if (c == '"') return true;
+      if ((uint8_t)c < 0x20) return false;
+      if (c != '\\') {
+        value += c;
+        continue;
+      }
+
+      if (pos >= s.length()) return false;
+      char e = s[pos++];
+      switch (e) {
+        case '"': value += '"'; break;
+        case '\\': value += '\\'; break;
+        case '/': value += '/'; break;
+        case 'b': value += '\b'; break;
+        case 'f': value += '\f'; break;
+        case 'n': value += '\n'; break;
+        case 'r': value += '\r'; break;
+        case 't': value += '\t'; break;
+        default:
+          // V32 intentionally rejects \u escapes. Its own exported
+          // configuration is ASCII field names plus UTF-8 string content.
+          return false;
+      }
+    }
+    return false;
+  }
+};
+
+String configImportResultJson(
+  bool ok,
+  const String& message,
+  uint32_t appliedCount,
+  bool restartRequired,
+  const String& restartReason
+) {
+  String json;
+  json.reserve(500);
+  json += "{\"ok\":";
+  json += ok ? "true" : "false";
+  json += ",\"message\":" + jsonQuoted(message);
+  json += ",\"applied\":" + String(appliedCount);
+  json += ",\"restartRequired\":";
+  json += restartRequired ? "true" : "false";
+  json += ",\"restartReason\":" + jsonQuoted(restartReason);
+  json += "}";
+  return json;
+}
+
+void handleConfigImport() {
+  markExplicitUserInteraction();
+
+  if (!server.hasArg("plain")) {
+    server.send(
+      400,
+      "application/json",
+      configImportResultJson(
+        false, "Missing JSON request body.", 0, false, ""
+      )
+    );
+    return;
+  }
+
+  String body = server.arg("plain");
+  if (body.length() == 0 || body.length() > MAX_CONFIG_IMPORT_BYTES) {
+    server.send(
+      413,
+      "application/json",
+      configImportResultJson(
+        false,
+        "Configuration must be between 1 and " +
+          String(MAX_CONFIG_IMPORT_BYTES) + " bytes.",
+        0, false, ""
+      )
+    );
+    return;
+  }
+
+  PortableConfig requested = {};
+  FlatConfigJsonParser parser(body);
+  if (!parser.parse(requested)) {
+    server.send(
+      400,
+      "application/json",
+      configImportResultJson(
+        false, parser.error(), 0, false, ""
+      )
+    );
+    return;
+  }
+
+  // Validation is complete before this point. No NVS writes occur until the
+  // entire supported configuration has been parsed and range-checked.
+  PortableConfig previous = readPersistedPortableConfig();
+  uint32_t appliedCount = 0;
+  bool restartRequired = false;
+  String restartReason;
+
+  if (requested.wifiScanIntervalSeconds != previous.wifiScanIntervalSeconds) {
+    preferences.begin("survey", false);
+    preferences.putULong("wifiInterval", requested.wifiScanIntervalSeconds);
+    preferences.end();
+    scanIntervalSeconds = requested.wifiScanIntervalSeconds;
+    lastAutoScanMs = millis();
+    appliedCount++;
+  }
+
+  if (requested.statusLedEnabled != previous.statusLedEnabled) {
+    preferences.begin("survey", false);
+    preferences.putBool("ledEnabled", requested.statusLedEnabled);
+    preferences.end();
+    statusLedEnabled = requested.statusLedEnabled;
+    if (!statusLedEnabled) stopScanLed();
+    appliedCount++;
+  }
+
+  if (requested.liveUpdatesEnabled != previous.liveUpdatesEnabled) {
+    saveWebLiveUpdates(requested.liveUpdatesEnabled);
+    appliedCount++;
+  }
+
+  if (requested.bluetoothSurveyEnabled != previous.bluetoothSurveyEnabled) {
+    saveBleSurveyEnabled(requested.bluetoothSurveyEnabled);
+    appliedCount++;
+    restartRequired = true;
+    restartReason += "Bluetooth survey mode";
+  }
+
+  bool hostnameChanged =
+      requested.mdnsHostnameAutomatic != previous.mdnsHostnameAutomatic ||
+      (!requested.mdnsHostnameAutomatic &&
+       requested.mdnsHostname != previous.mdnsHostname);
+  if (hostnameChanged) {
+    preferences.begin("survey", false);
+    if (requested.mdnsHostnameAutomatic)
+      preferences.remove("hostname");
+    else
+      preferences.putString("hostname", requested.mdnsHostname);
+    preferences.end();
+    appliedCount++;
+    restartRequired = true;
+    if (restartReason.length()) restartReason += ", ";
+    restartReason += "mDNS hostname";
+  }
+
+  bool apChanged =
+      requested.accessPointEnabled != previous.accessPointEnabled ||
+      requested.accessPointSSIDAutomatic != previous.accessPointSSIDAutomatic ||
+      (!requested.accessPointSSIDAutomatic &&
+       requested.accessPointSSID != previous.accessPointSSID);
+  if (apChanged) {
+    preferences.begin("ap", false);
+    preferences.putBool("enabled", requested.accessPointEnabled);
+    if (requested.accessPointSSIDAutomatic)
+      preferences.remove("ssid");
+    else
+      preferences.putString("ssid", requested.accessPointSSID);
+    // The existing AP password is intentionally left untouched.
+    preferences.end();
+    appliedCount++;
+    restartRequired = true;
+    if (restartReason.length()) restartReason += ", ";
+    restartReason += "access point";
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(
+    200,
+    "application/json",
+    configImportResultJson(
+      true,
+      appliedCount == 0
+        ? String("Configuration already matched this device.")
+        : String("Configuration validated and applied."),
+      appliedCount,
+      restartRequired,
+      restartReason
+    )
+  );
+}
+
+void handleStatusJsonExport() {
+  markExplicitUserInteraction();
+  ChannelAnalysis channel = analyzeLatestWifiScan();
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  size_t largestBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+  size_t appPartitionBytes = runningPartition ? runningPartition->size : 0;
+  size_t unusedAppBytes =
+      appPartitionBytes > ESP.getSketchSize()
+        ? appPartitionBytes - ESP.getSketchSize()
+        : 0;
+  PortableConfig persisted = readPersistedPortableConfig();
+
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=\"wireless_surveyor_status.json\""
+  );
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  server.sendContent("{\n");
+  server.sendContent(
+    "  \"statusSchemaVersion\":" + String(STATUS_SCHEMA_VERSION) + ",\n"
+  );
+
+  server.sendContent("  \"firmware\":{");
+  server.sendContent("\"file\":" + jsonQuoted(FIRMWARE_FILE));
+  server.sendContent(",\"version\":" + jsonQuoted(FIRMWARE_VERSION));
+  server.sendContent(",\"arduinoEsp32\":" + jsonQuoted(ESP_ARDUINO_VERSION_STR));
+  server.sendContent(",\"espIdf\":" + jsonQuoted(String(esp_get_idf_version())));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"runtime\":{");
+  server.sendContent("\"uptimeMs\":" + String(millis()));
+  server.sendContent(",\"uptime\":" + jsonQuoted(formatUptime(millis())));
+  server.sendContent(",\"lastReset\":" + jsonQuoted(resetReasonLabel(resetReason)));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"hardware\":{");
+  server.sendContent("\"chip\":" + jsonQuoted(String(ESP.getChipModel())));
+  server.sendContent(",\"revision\":" + String(ESP.getChipRevision()));
+  server.sendContent(",\"cores\":" + String(ESP.getChipCores()));
+  server.sendContent(",\"cpuMHz\":" + String(ESP.getCpuFreqMHz()));
+  server.sendContent(",\"flashBytes\":" + String(ESP.getFlashChipSize()));
+  server.sendContent(",\"sketchBytes\":" + String(ESP.getSketchSize()));
+  server.sendContent(",\"appPartitionBytes\":" + String(appPartitionBytes));
+  server.sendContent(",\"unusedAppBytes\":" + String(unusedAppBytes));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"memory\":{");
+  server.sendContent("\"heapBytes\":" + String(ESP.getHeapSize()));
+  server.sendContent(",\"freeHeapBytes\":" + String(ESP.getFreeHeap()));
+  server.sendContent(",\"minimumFreeHeapBytes\":" + String(ESP.getMinFreeHeap()));
+  server.sendContent(",\"largestFreeBlockBytes\":" + String(largestBlock));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"network\":{");
+  server.sendContent("\"stationConnected\":");
+  server.sendContent(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  server.sendContent(",\"stationMac\":" + jsonQuoted(WiFi.macAddress()));
+  server.sendContent(",\"stationSSID\":" +
+    jsonQuoted(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("")));
+  server.sendContent(",\"stationIP\":" +
+    jsonQuoted(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")));
+  server.sendContent(",\"stationRssiDbm\":" +
+    String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0));
+  server.sendContent(",\"stationChannel\":" +
+    String(WiFi.status() == WL_CONNECTED ? WiFi.channel() : 0));
+  server.sendContent(",\"autoReconnectPending\":");
+  server.sendContent(infrastructureReconnectPending ? "true" : "false");
+  server.sendContent(",\"autoReconnectAttemptActive\":");
+  server.sendContent(infrastructureReconnectAttemptActive ? "true" : "false");
+  server.sendContent(",\"autoReconnectAttempts\":" +
+    String(infrastructureReconnectAttemptCount));
+  server.sendContent(",\"autoReconnectSuccesses\":" +
+    String(infrastructureReconnectSuccessCount));
+  server.sendContent(",\"accessPointRunning\":");
+  server.sendContent(apRunning ? "true" : "false");
+  server.sendContent(",\"accessPointSSID\":" + jsonQuoted(apSSID));
+  server.sendContent(",\"accessPointIP\":" +
+    jsonQuoted(apRunning ? WiFi.softAPIP().toString() : String("")));
+  server.sendContent(",\"accessPointClients\":" +
+    String(apRunning ? WiFi.softAPgetStationNum() : 0));
+  server.sendContent(",\"mdnsHostname\":" + jsonQuoted(mdnsHostname));
+  server.sendContent(",\"mdnsStarted\":");
+  server.sendContent(mdnsStarted ? "true" : "false");
+  server.sendContent("},\n");
+
+  server.sendContent("  \"wifiSurvey\":{");
+  server.sendContent("\"scanIntervalSeconds\":" + String(scanIntervalSeconds));
+  server.sendContent(",\"scanCounter\":" + String(scanCounter));
+  server.sendContent(",\"scanInProgress\":");
+  server.sendContent(wifiScanInProgress ? "true" : "false");
+  server.sendContent(",\"scanStatus\":" + jsonQuoted(wifiScanStatusMessage));
+  server.sendContent(",\"observationsRetained\":" + String(historyCount));
+  server.sendContent(",\"observationCapacity\":" + String(scanHistoryCapacity));
+  server.sendContent(",\"scanGroupsRetained\":" + String(countRetainedScanGroups()));
+  server.sendContent(",\"historyAllocatedBytes\":" + String(wifiHistoryAllocatedBytes()));
+  server.sendContent(",\"observationRecordBytes\":" + String(sizeof(WifiObservation)));
+  server.sendContent(",\"scanMetadataSlots\":" + String(wifiScanMetadataCapacity));
+  if (historyCount > 0) {
+    const ScanRecord& oldest = historyRecord(0);
+    const ScanRecord& newest = historyRecord(historyCount - 1);
+    server.sendContent(",\"oldestRecordUptimeMs\":" + String(oldest.uptimeMs));
+    server.sendContent(",\"newestRecordUptimeMs\":" + String(newest.uptimeMs));
+    server.sendContent(",\"retainedTimeWindowMs\":" +
+      String((uint32_t)(newest.uptimeMs - oldest.uptimeMs)));
+  }
+  server.sendContent(",\"apTableUsed\":" + String(wifiApCount));
+  server.sendContent(",\"apTableCapacity\":" + String(wifiApTableCapacity));
+  server.sendContent(",\"apTableDrops\":" + String(wifiApTableFullDrops));
+  server.sendContent(",\"autoDiagnostic\":" + jsonQuoted(wifiAutoScanDiagnosticLabel()));
+  server.sendContent(",\"automaticStarts\":" + String(wifiAutoScanStartCount));
+  server.sendContent(",\"automaticCompletions\":" + String(wifiAutoScanCompletionCount));
+  server.sendContent(",\"automaticStartFailures\":" + String(wifiAutoScanStartFailureCount));
+  server.sendContent(",\"automaticCompletionFailures\":" + String(wifiAutoScanCompletionFailureCount));
+  server.sendContent(",\"automaticRetryPending\":");
+  server.sendContent(wifiAutoScanRetryPending ? "true" : "false");
+  server.sendContent(",\"interactionDeferred\":");
+  server.sendContent(userInteractionDeferActive() ? "true" : "false");
+  server.sendContent(",\"csvExportInProgress\":");
+  server.sendContent(csvExportInProgress ? "true" : "false");
+  server.sendContent(",\"scanDurationLastMs\":" + String(wifiLastScanDurationMs));
+  server.sendContent(",\"scanDurationAverageMs\":" + String(wifiAverageScanDurationMs()));
+  server.sendContent(",\"scanDurationMinimumMs\":" + String(wifiMinScanDurationMs));
+  server.sendContent(",\"scanDurationMaximumMs\":" + String(wifiMaxScanDurationMs));
+  server.sendContent(",\"csvExports\":" + String(wifiCsvExportCount));
+  server.sendContent(",\"lastCsvRows\":" + String(wifiCsvLastRows));
+  server.sendContent(",\"lastCsvBytes\":" + String(wifiCsvLastBytes));
+  server.sendContent(",\"lastCsvDurationMs\":" + String(wifiCsvLastDurationMs));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"bluetoothSurvey\":{");
+  server.sendContent("\"enabled\":");
+  server.sendContent(bleSurveyEnabled ? "true" : "false");
+  server.sendContent(",\"initialized\":");
+  server.sendContent(bleInitialized ? "true" : "false");
+  server.sendContent(",\"automaticScanningEnabled\":");
+  server.sendContent(autoBleScanEnabled ? "true" : "false");
+  server.sendContent(",\"scanIntervalSeconds\":" + String(bleScanIntervalSeconds));
+  server.sendContent(",\"scanCounter\":" + String(bleScanCounter));
+  server.sendContent(",\"scanStatus\":" + jsonQuoted(bleStatusMessage));
+  server.sendContent(",\"lastScanUptimeMs\":" + String(lastBleScanUptimeMs));
+  server.sendContent(",\"observationsRetained\":" + String(bleHistoryCount));
+  server.sendContent(",\"observationCapacity\":" + String(bleHistoryCapacity));
+  server.sendContent(",\"historyAllocatedBytes\":" + String(bleHistoryAllocatedBytes()));
+  server.sendContent(",\"observationRecordBytes\":" + String(sizeof(BleObservation)));
+  server.sendContent(",\"scanMetadataSlots\":" + String(bleScanMetadataCapacity));
+  server.sendContent(",\"addressTableUsed\":" + String(bleAddressCount));
+  server.sendContent(",\"addressTableCapacity\":" + String(bleAddressTableCapacity));
+  server.sendContent(",\"addressTableDrops\":" + String(bleAddressTableFullDrops));
+  server.sendContent(",\"csvExports\":" + String(bleCsvExportCount));
+  server.sendContent(",\"lastCsvRows\":" + String(bleCsvLastRows));
+  server.sendContent(",\"lastCsvBytes\":" + String(bleCsvLastBytes));
+  server.sendContent(",\"lastCsvDurationMs\":" + String(bleCsvLastDurationMs));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"bootHeapCheckpoints\":[");
+  for (size_t i = 0; i < bootHeapCheckpointCount; i++) {
+    const BootHeapCheckpoint& cp = bootHeapCheckpoints[i];
+    if (i) server.sendContent(",");
+    server.sendContent("{\"stage\":" + jsonQuoted(String(cp.stage)));
+    server.sendContent(",\"freeHeapBytes\":" + String(cp.freeHeap));
+    server.sendContent(",\"minimumFreeHeapBytes\":" + String(cp.minimumFreeHeap));
+    server.sendContent(",\"largestFreeBlockBytes\":" + String(cp.largestFreeBlock));
+    server.sendContent("}");
+  }
+  server.sendContent("],\n");
+
+  server.sendContent("  \"channelAnalysis\":{");
+  server.sendContent("\"valid\":");
+  server.sendContent(channel.valid ? "true" : "false");
+  server.sendContent(",\"sourceScan\":" + String(channel.scanNumber));
+  server.sendContent(",\"suggestedChannel\":" + String(channel.suggestedChannel));
+  server.sendContent(",\"channel1Score\":" + String(channel.totalScore[1], 2));
+  server.sendContent(",\"channel6Score\":" + String(channel.totalScore[6], 2));
+  server.sendContent(",\"channel11Score\":" + String(channel.totalScore[11], 2));
+  server.sendContent("},\n");
+
+  server.sendContent("  \"configuration\":");
+  String compactConfig = portableConfigJson(persisted);
+  compactConfig.trim();
+  server.sendContent(compactConfig);
+  server.sendContent("\n}\n");
+  server.sendContent("");
+}
+
 void handleSettingsPage() {
   markExplicitUserInteraction();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -4700,6 +5542,43 @@ void handleSettingsPage() {
     "<div class=\"row\"><span class=\"label\">Survey Page Live Updates</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
     "<div class=\"note\">The LED setting is saved here. Live Updates are controlled immediately from the checkbox in the page header and are also stored in NVS. Theme and Standard/Advanced View selections remain browser-local.</div></div>";
   server.sendContent(s);
+  server.sendContent(
+    "<div class=\"card\"><h2>Export &amp; Configuration</h2>"
+    "<div class=\"buttons\">"
+    "<a class=\"button\" href=\"/status.json\">Download Status JSON</a>"
+    "<a class=\"button\" href=\"/config.json\">Download Configuration JSON</a>"
+    "</div>"
+    "<div class=\"note\">Status JSON is a current diagnostic snapshot and does not contain the retained observation rows. "
+    "Configuration JSON contains supported non-secret settings only. Infrastructure Wi-Fi and access-point passwords are deliberately excluded.</div>"
+    "<div class=\"control\"><label for=\"config-import-file\">Restore configuration</label>"
+    "<input id=\"config-import-file\" type=\"file\" accept=\"application/json,.json\"></div>"
+    "<div class=\"buttons\"><button id=\"config-import-button\" type=\"button\" onclick=\"importConfiguration()\">Validate &amp; Apply Configuration</button></div>"
+    "<div id=\"config-import-result\" class=\"note\">Import validates the complete supported schema before writing NVS. "
+    "Settings that require restart are saved but are not silently restarted.</div>"
+    "</div>"
+  );
+  server.sendContent(
+    "<script>"
+    "async function importConfiguration(){"
+      "const f=document.getElementById('config-import-file');"
+      "const o=document.getElementById('config-import-result');"
+      "if(!f.files||!f.files.length){o.textContent='Choose a configuration JSON file first.';return;}"
+      "const file=f.files[0];"
+      "if(file.size>4096){o.textContent='Configuration file is larger than the 4096-byte import limit.';return;}"
+      "o.textContent='Validating configuration...';"
+      "try{"
+        "const body=await file.text();"
+        "const r=await fetch('/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'});"
+        "const j=await r.json();"
+        "if(!j.ok){o.textContent='Import rejected: '+j.message;return;}"
+        "let msg=j.message+' '+j.applied+' setting group(s) changed.';"
+        "if(j.restartRequired){msg+=' Restart required for: '+j.restartReason+'.';}"
+        "else{msg+=' No restart required.';}"
+        "o.textContent=msg;"
+      "}catch(e){o.textContent='Configuration import failed: '+e;}"
+    "}"
+    "</script>"
+  );
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
   server.sendContent("</div></body></html>");
@@ -5053,6 +5932,9 @@ void startWebServer() {
   server.on("/scan", handleWebScan);
   server.on("/system", HTTP_GET, handleSystemStatus);
   server.on("/settings", HTTP_GET, handleSettingsPage);
+  server.on("/status.json", HTTP_GET, handleStatusJsonExport);
+  server.on("/config.json", HTTP_GET, handleConfigExport);
+  server.on("/config/import", HTTP_POST, handleConfigImport);
   server.on("/wifi-save", HTTP_POST, handleSaveStationSettings);
   server.on("/wifi-clear", HTTP_POST, handleClearStationSettings);
   server.on("/hostname-save", HTTP_POST, handleHostnameSave);
@@ -5720,6 +6602,7 @@ void loop() {
   }
 
   serviceLoggedWifiScan();
+  serviceInfrastructureReconnect();
   serviceInitialSurveyScans();
   serviceAutomaticScan();
   serviceAutomaticBLEScan();
