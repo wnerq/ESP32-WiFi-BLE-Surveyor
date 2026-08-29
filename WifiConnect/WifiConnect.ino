@@ -1,4 +1,4 @@
-// WifiConnect29 - Wi-Fi auto-scan diagnostics and scheduler cleanup
+// WifiConnect30 - scheduler interaction priority, scan timing, and CSV robustness
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect29_autoscan_diagnostics.ino";
-const char* FIRMWARE_VERSION = "29";
+const char* FIRMWARE_FILE = "WifiConnect30_scheduler_csv_robustness.ino";
+const char* FIRMWARE_VERSION = "30";
 
 
 Preferences preferences;
@@ -244,9 +244,43 @@ unsigned long lastAutoScanMs = 0;
 uint32_t wifiAutoScanStartCount = 0;
 uint32_t wifiAutoScanCompletionCount = 0;
 uint32_t wifiAutoScanStartFailureCount = 0;
+uint32_t wifiAutoScanCompletionFailureCount = 0;
 uint32_t lastWifiAutoScanStartMs = 0;
 uint32_t lastWifiAutoScanCompletionMs = 0;
 bool wifiCurrentScanAutomatic = false;
+bool wifiScanCompletedSinceBoot = false;
+uint32_t wifiCurrentScanStartMs = 0;
+uint32_t wifiScanDurationCount = 0;
+uint32_t wifiLastScanDurationMs = 0;
+uint32_t wifiMinScanDurationMs = 0;
+uint32_t wifiMaxScanDurationMs = 0;
+uint64_t wifiTotalScanDurationMs = 0;
+bool wifiAutoScanRetryPending = false;
+uint32_t lastWifiAutoScanFailureMs = 0;
+
+// Interaction-priority policy:
+// - Never abort a Wi-Fi scan that has already started.
+// - Explicit web actions arm a short defer only after their handler returns.
+// - Background live-update/status requests do not arm the defer.
+// - CSV export is serviced before any new automatic scan; scheduler timing is preserved.
+const uint32_t USER_INTERACTION_DEFER_MS = 2000;
+const uint32_t WIFI_AUTOSCAN_RETRY_BACKOFF_MS = 2000;
+const uint32_t WIFI_AUTOSCAN_DIAG_GRACE_MS = USER_INTERACTION_DEFER_MS + 1000;
+const size_t CSV_STREAM_BUFFER_BYTES = 2048;
+
+bool explicitUserInteractionHandled = false;
+bool userInteractionDeferArmed = false;
+uint32_t userInteractionDeferStartedMs = 0;
+bool csvExportInProgress = false;
+
+uint32_t wifiCsvExportCount = 0;
+size_t wifiCsvLastRows = 0;
+size_t wifiCsvLastBytes = 0;
+uint32_t wifiCsvLastDurationMs = 0;
+uint32_t bleCsvExportCount = 0;
+size_t bleCsvLastRows = 0;
+size_t bleCsvLastBytes = 0;
+uint32_t bleCsvLastDurationMs = 0;
 
 WifiApEntry* wifiApTable = nullptr;
 size_t wifiApTableCapacity = 0;
@@ -1057,6 +1091,7 @@ String wifiScanStatusMessage = "Idle";
 int processCompletedWifiScan(int networkCount) {
   scanCounter++;
   lastScanUptimeMs = millis();
+  wifiScanCompletedSinceBoot = true;
 
   if (wifiScanMetadata == nullptr || wifiScanMetadataCapacity == 0)
     return networkCount;
@@ -1104,14 +1139,40 @@ int processCompletedWifiScan(int networkCount) {
   return networkCount;
 }
 
+void recordWifiScanDuration(uint32_t durationMs) {
+  wifiLastScanDurationMs = durationMs;
+  wifiTotalScanDurationMs += durationMs;
+  wifiScanDurationCount++;
+
+  if (wifiScanDurationCount == 1 || durationMs < wifiMinScanDurationMs)
+    wifiMinScanDurationMs = durationMs;
+  if (durationMs > wifiMaxScanDurationMs)
+    wifiMaxScanDurationMs = durationMs;
+}
+
+uint32_t wifiAverageScanDurationMs() {
+  if (wifiScanDurationCount == 0) return 0;
+  return (uint32_t)(wifiTotalScanDurationMs / wifiScanDurationCount);
+}
+
+void noteAutomaticScanFailure() {
+  wifiAutoScanRetryPending = true;
+  lastWifiAutoScanFailureMs = millis();
+}
+
 int performLoggedScan() {
   ensureWiFiStationMode();
 
   startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
+  uint32_t scanStartMs = millis();
   int networkCount = WiFi.scanNetworks();
+  uint32_t scanDurationMs = millis() - scanStartMs;
   stopScanLed();
 
   int result = processCompletedWifiScan(networkCount);
+  recordWifiScanDuration(scanDurationMs);
+  lastAutoScanMs = millis();
+  wifiAutoScanRetryPending = false;
   wifiScanStatusMessage = "Complete";
   return result;
 }
@@ -1125,14 +1186,19 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   int result = WiFi.scanNetworks(true);
   if (result == WIFI_SCAN_FAILED) {
     wifiScanStatusMessage = "Failed to start";
-    if (automaticTrigger) wifiAutoScanStartFailureCount++;
+    if (automaticTrigger) {
+      wifiAutoScanStartFailureCount++;
+      noteAutomaticScanFailure();
+    }
     return false;
   }
 
   wifiCurrentScanAutomatic = automaticTrigger;
+  wifiCurrentScanStartMs = millis();
   if (automaticTrigger) {
     wifiAutoScanStartCount++;
-    lastWifiAutoScanStartMs = millis();
+    lastWifiAutoScanStartMs = wifiCurrentScanStartMs;
+    wifiAutoScanRetryPending = false;
   }
 
   wifiScanInProgress = true;
@@ -1149,6 +1215,7 @@ void serviceLoggedWifiScan() {
   int result = WiFi.scanComplete();
   if (result == WIFI_SCAN_RUNNING) return;
 
+  uint32_t scanDurationMs = millis() - wifiCurrentScanStartMs;
   stopScanLed();
   wifiScanInProgress = false;
 
@@ -1156,11 +1223,16 @@ void serviceLoggedWifiScan() {
     wifiScanStatusMessage = "Scan failed";
     WiFi.scanDelete();
     wifiInitialScanCheckpointPending = false;
+    if (wifiCurrentScanAutomatic) {
+      wifiAutoScanCompletionFailureCount++;
+      noteAutomaticScanFailure();
+    }
     wifiCurrentScanAutomatic = false;
     return;
   }
 
   processCompletedWifiScan(result);
+  recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
     lastWifiAutoScanCompletionMs = lastScanUptimeMs;
@@ -1168,6 +1240,7 @@ void serviceLoggedWifiScan() {
   wifiScanStatusMessage = "Complete";
   WiFi.scanDelete();
   lastAutoScanMs = millis();
+  wifiAutoScanRetryPending = false;
 
   if (wifiInitialScanCheckpointPending) {
     captureBootHeapCheckpoint("Initial Wi-Fi scan");
@@ -1696,36 +1769,97 @@ String observationAgeLabel(uint32_t observationMs) {
   return formatUptime(now - observationMs) + " ago";
 }
 
+void markExplicitUserInteraction() {
+  explicitUserInteractionHandled = true;
+}
+
+void armUserInteractionDeferAfterWebService() {
+  if (!explicitUserInteractionHandled) return;
+  explicitUserInteractionHandled = false;
+  userInteractionDeferStartedMs = millis();
+  userInteractionDeferArmed = true;
+}
+
+bool userInteractionDeferActive() {
+  if (!userInteractionDeferArmed) return false;
+  return (uint32_t)(millis() - userInteractionDeferStartedMs) < USER_INTERACTION_DEFER_MS;
+}
+
+String millisecondsLabel(uint32_t durationMs) {
+  if (durationMs < 1000) return String(durationMs) + " ms";
+  return String(durationMs / 1000.0f, 2) + " s";
+}
+
+String wifiScanDurationSummaryLabel() {
+  if (wifiScanDurationCount == 0) return "No completed scan timing yet";
+  return "last " + millisecondsLabel(wifiLastScanDurationMs) +
+         "; avg " + millisecondsLabel(wifiAverageScanDurationMs()) +
+         "; min " + millisecondsLabel(wifiMinScanDurationMs) +
+         "; max " + millisecondsLabel(wifiMaxScanDurationMs);
+}
+
+String csvThroughputLabel(size_t bytes, uint32_t durationMs) {
+  if (durationMs == 0) return "n/a";
+  float kibPerSecond = ((float)bytes / 1024.0f) / ((float)durationMs / 1000.0f);
+  return String(kibPerSecond, 1) + " KB/s";
+}
+
+String csvExportSummaryLabel(size_t rows, size_t bytes, uint32_t durationMs) {
+  return String(rows) + " rows; " +
+         String(bytes / 1024.0f, 1) + " KB; " +
+         millisecondsLabel(durationMs) + "; " +
+         csvThroughputLabel(bytes, durationMs);
+}
+
 bool wifiAutoScanCadenceOverdue() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
 
-  if (wifiScanInProgress) return false;
-  if (scanCounter == 0)
-    return !initialWifiScanPending;
+  if (csvExportInProgress || userInteractionDeferActive() || wifiScanInProgress)
+    return false;
 
-  return (uint32_t)(now - lastScanUptimeMs) > intervalMs;
+  if (!wifiScanCompletedSinceBoot)
+    return !initialWifiScanPending && !wifiScanInProgress;
+
+  if (wifiAutoScanRetryPending) return true;
+
+  uint32_t schedulerAgeMs = now - lastAutoScanMs;
+  return schedulerAgeMs > intervalMs + WIFI_AUTOSCAN_DIAG_GRACE_MS;
 }
 
 String wifiAutoScanDiagnosticLabel() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
 
+  if (csvExportInProgress)
+    return "PAUSED - CSV export in progress";
+
+  if (userInteractionDeferActive())
+    return "DEFERRED - user interaction priority";
+
   if (wifiScanInProgress && wifiCurrentScanAutomatic)
     return "OK - automatic scan in progress";
 
-  if (scanCounter == 0) {
-    if (initialWifiScanPending || wifiScanInProgress)
+  if (wifiScanInProgress)
+    return "OK - manual scan in progress";
+
+  if (!wifiScanCompletedSinceBoot) {
+    if (initialWifiScanPending)
       return "STARTING - waiting for first completed scan";
+    if (wifiAutoScanRetryPending)
+      return "WARN - automatic scan retry pending";
     return "WARN - no completed Wi-Fi scan";
   }
 
-  uint32_t ageMs = now - lastScanUptimeMs;
-  if (ageMs <= intervalMs)
+  if (wifiAutoScanRetryPending)
+    return "WARN - automatic scan retry pending";
+
+  uint32_t schedulerAgeMs = now - lastAutoScanMs;
+  if (schedulerAgeMs <= intervalMs)
     return "OK - last scan completed within interval";
 
-  if (wifiScanInProgress)
-    return "OK - scan in progress after interval elapsed";
+  if (schedulerAgeMs <= intervalMs + WIFI_AUTOSCAN_DIAG_GRACE_MS)
+    return "DUE - automatic scan awaiting scheduler";
 
   return "WARN - scan overdue; automatic scan not in progress";
 }
@@ -1739,7 +1873,6 @@ String wifiAutoScanLastCompletionLabel() {
   if (wifiAutoScanCompletionCount == 0) return "Never";
   return observationAgeLabel(lastWifiAutoScanCompletionMs);
 }
-
 
 // ============================================================
 // Wi-Fi connection
@@ -2588,6 +2721,31 @@ String csvEscape(const String& input) {
   return "\"" + output + "\"";
 }
 
+void appendCsvBuffered(String& buffer, const String& text, size_t& bytesSent) {
+  if (buffer.length() > 0 && buffer.length() + text.length() > CSV_STREAM_BUFFER_BYTES) {
+    size_t pendingBytes = buffer.length();
+    server.sendContent(buffer);
+    bytesSent += pendingBytes;
+    buffer.remove(0);
+  }
+
+  if (text.length() > CSV_STREAM_BUFFER_BYTES) {
+    server.sendContent(text);
+    bytesSent += text.length();
+    return;
+  }
+
+  buffer += text;
+}
+
+void flushCsvBuffer(String& buffer, size_t& bytesSent) {
+  if (buffer.length() == 0) return;
+  size_t pendingBytes = buffer.length();
+  server.sendContent(buffer);
+  bytesSent += pendingBytes;
+  buffer.remove(0);
+}
+
 String jsEscape(String input) {
   input.replace("\\", "\\\\");
   input.replace("'", "\\'");
@@ -2609,12 +2767,19 @@ void handleWifiScanStatus() {
                 ",\"autoStarts\":" + String(wifiAutoScanStartCount) +
                 ",\"autoCompletions\":" + String(wifiAutoScanCompletionCount) +
                 ",\"autoStartFailures\":" + String(wifiAutoScanStartFailureCount) +
+                ",\"autoCompletionFailures\":" + String(wifiAutoScanCompletionFailureCount) +
+                ",\"autoRetryPending\":" + String(wifiAutoScanRetryPending ? "true" : "false") +
+                ",\"interactionDeferred\":" + String(userInteractionDeferActive() ? "true" : "false") +
+                ",\"csvExportInProgress\":" + String(csvExportInProgress ? "true" : "false") +
+                ",\"scanDurationLastMs\":" + String(wifiLastScanDurationMs) +
+                ",\"scanDurationAverageMs\":" + String(wifiAverageScanDurationMs()) +
                 ",\"live\":" + String(webAutoRefreshEnabled ? "true" : "false") + "}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
 void handleWebScanNow() {
+  markExplicitUserInteraction();
   bool started = beginLoggedWifiScan(false, false);
   if (!started) {
     wifiScanStatusMessage = wifiScanInProgress ? "Scan already in progress" : "Unable to start scan";
@@ -2627,6 +2792,7 @@ void handleWebScanNow() {
 }
 
 void handleLiveUpdatesSetting() {
+  markExplicitUserInteraction();
   if (!server.hasArg("enabled")) {
     server.send(400, "text/plain", "Missing enabled value.");
     return;
@@ -2658,11 +2824,13 @@ bool applyWifiScanIntervalFromRequest() {
 }
 
 void handleScanSettings() {
+  markExplicitUserInteraction();
   applyWifiScanIntervalFromRequest();
   redirectToScanPage();
 }
 
 void handleWifiIntervalSetting() {
+  markExplicitUserInteraction();
   bool accepted = applyWifiScanIntervalFromRequest();
 
   server.sendHeader("Cache-Control", "no-store");
@@ -2679,11 +2847,19 @@ void handleWifiIntervalSetting() {
 }
 
 void handleClearScanHistory() {
+  markExplicitUserInteraction();
   clearScanHistory();
   redirectToScanPage();
 }
 
 void handleScanCsv() {
+  markExplicitUserInteraction();
+  csvExportInProgress = true;
+
+  const size_t exportCount = historyCount;
+  const uint32_t exportStartMs = millis();
+  size_t bytesSent = 0;
+
   server.sendHeader(
     "Content-Disposition",
     "attachment; filename=\"wifi_scan_log.csv\""
@@ -2692,15 +2868,18 @@ void handleScanCsv() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
 
-  server.sendContent(
-    "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n"
+  String buffer;
+  buffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
+  appendCsvBuffered(
+    buffer,
+    "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n",
+    bytesSent
   );
 
-  for (size_t i = 0; i < historyCount; i++) {
+  for (size_t i = 0; i < exportCount; i++) {
     const ScanRecord& record = historyRecord(i);
 
     String line;
-
     line.reserve(180);
 
     line += String(record.scanNumber);
@@ -2726,10 +2905,17 @@ void handleScanCsv() {
     line += record.hidden ? "YES" : "NO";
     line += "\r\n";
 
-    server.sendContent(line);
+    appendCsvBuffered(buffer, line, bytesSent);
   }
 
+  flushCsvBuffer(buffer, bytesSent);
   server.sendContent("");
+
+  wifiCsvExportCount++;
+  wifiCsvLastRows = exportCount;
+  wifiCsvLastBytes = bytesSent;
+  wifiCsvLastDurationMs = millis() - exportStartMs;
+  csvExportInProgress = false;
 }
 
 void sendRssiHistoryPlot(const String& selectedBssid) {
@@ -3405,6 +3591,7 @@ void sendWifiChannelAnalysis() {
 }
 
 void handleWebScan() {
+  markExplicitUserInteraction();
   ensureWiFiStationMode();
 
   bool connected = WiFi.status() == WL_CONNECTED;
@@ -3616,7 +3803,7 @@ void handleWebScan() {
   server.sendContent("</div>");
 
   String surveyDetails;
-  surveyDetails.reserve(1800);
+  surveyDetails.reserve(2800);
   surveyDetails +=
     "<div class=\"card\"><h2>Survey Details</h2>"
     "<div class=\"row\"><span class=\"label\">History Capacity</span><span class=\"value\">" +
@@ -3643,10 +3830,23 @@ void handleWebScan() {
     String(wifiAutoScanCompletionCount) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Automatic Start Failures</span><span class=\"value\">" +
     String(wifiAutoScanStartFailureCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Completion Failures</span><span class=\"value\">" +
+    String(wifiAutoScanCompletionFailureCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Retry Backoff</span><span class=\"value\">" +
+    String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + " s; " +
+    String(wifiAutoScanRetryPending ? "retry pending" : "idle") + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Automatic Start</span><span class=\"value\">" +
     htmlEscape(wifiAutoScanLastStartLabel()) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Last Automatic Completion</span><span class=\"value\">" +
     htmlEscape(wifiAutoScanLastCompletionLabel()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Duration</span><span class=\"value\">" +
+    htmlEscape(wifiScanDurationSummaryLabel()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">User Interaction Defer</span><span class=\"value\">" +
+    String(USER_INTERACTION_DEFER_MS / 1000.0f, 1) + " s after explicit web requests; background polling excluded</span></div>"
+    "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" +
+    String(wifiCsvExportCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" +
+    (wifiCsvExportCount == 0 ? String("Never") : htmlEscape(csvExportSummaryLabel(wifiCsvLastRows, wifiCsvLastBytes, wifiCsvLastDurationMs))) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
     String(wifiHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>"
     "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">" +
@@ -3767,6 +3967,7 @@ void redirectToBLEPage() {
 }
 
 void handleBLESettings() {
+  markExplicitUserInteraction();
   if (!bleSurveyEnabled) {
     bleStatusMessage =
       "BLE settings are unavailable because BLE is disabled at boot.";
@@ -3787,17 +3988,32 @@ void handleBLESettings() {
 }
 
 void handleClearBLEHistory() {
+  markExplicitUserInteraction();
   clearBleHistory();
   redirectToBLEPage();
 }
 
 void handleBLEScanCsv() {
+  markExplicitUserInteraction();
+  csvExportInProgress = true;
+
+  const size_t exportCount = bleHistoryCount;
+  const uint32_t exportStartMs = millis();
+  size_t bytesSent = 0;
+
   server.sendHeader("Content-Disposition", "attachment; filename=\"ble_scan_log.csv\"");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  server.sendContent("scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n");
 
-  for (size_t i = 0; i < bleHistoryCount; i++) {
+  String buffer;
+  buffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
+  appendCsvBuffered(
+    buffer,
+    "scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n",
+    bytesSent
+  );
+
+  for (size_t i = 0; i < exportCount; i++) {
     const BleScanRecord& record = bleHistoryRecord(i);
 
     String line;
@@ -3809,10 +4025,17 @@ void handleBLEScanCsv() {
     line += csvEscape(String(record.address)) + ",";
     line += csvEscape(bleAddressTypeLabel(record.addressType)) + ",";
     line += String(record.rssi) + "\r\n";
-    server.sendContent(line);
+    appendCsvBuffered(buffer, line, bytesSent);
   }
 
+  flushCsvBuffer(buffer, bytesSent);
   server.sendContent("");
+
+  bleCsvExportCount++;
+  bleCsvLastRows = exportCount;
+  bleCsvLastBytes = bytesSent;
+  bleCsvLastDurationMs = millis() - exportStartMs;
+  csvExportInProgress = false;
 }
 
 void sendBleRssiHistoryPlot(const String& selectedAddress) {
@@ -3956,6 +4179,7 @@ void handleBleScanStatus() {
 }
 
 void handleBLESurvey() {
+  markExplicitUserInteraction();
   String selectedAddress = "";
 
   if (server.hasArg("plot")) {
@@ -4022,6 +4246,11 @@ void handleBLESurvey() {
   status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
   status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
   status += "</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" +
+    String(bleCsvExportCount) + "</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" +
+    (bleCsvExportCount == 0 ? String("Never") : htmlEscape(csvExportSummaryLabel(bleCsvLastRows, bleCsvLastBytes, bleCsvLastDurationMs))) +
+    "</span></div>";
 
   status += "<form class=\"settings-row\" action=\"/ble-settings\" method=\"get\">"
     "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
@@ -4118,6 +4347,7 @@ void handleBlePlotFragment() {
 }
 
 void handleBLEScanNow() {
+  markExplicitUserInteraction();
   if (!bleSurveyEnabled) {
     bleStatusMessage =
       "BLE scan not started because Bluetooth Survey is disabled in Settings.";
@@ -4166,6 +4396,7 @@ String selfTestRow(const String& name, const String& state, const String& detail
 }
 
 void handleSystemStatus() {
+  markExplicitUserInteraction();
   uint8_t primaryChannel = 0;
   wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
   esp_err_t channelResult = esp_wifi_get_channel(&primaryChannel, &secondary);
@@ -4303,7 +4534,10 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Wi-Fi auto-scan cadence", wifiCadenceOverdue ? "WARN" : "PASS",
     wifiAutoScanDiagnosticLabel() + "; starts " + String(wifiAutoScanStartCount) +
     ", completions " + String(wifiAutoScanCompletionCount) +
-    ", start failures " + String(wifiAutoScanStartFailureCount)));
+    ", start failures " + String(wifiAutoScanStartFailureCount) +
+    ", completion failures " + String(wifiAutoScanCompletionFailureCount)));
+  server.sendContent(selfTestRow("Wi-Fi scan timing", wifiScanDurationCount > 0 ? "PASS" : "WARN",
+    wifiScanDurationSummaryLabel()));
   server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
     mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
   {
@@ -4336,6 +4570,7 @@ void handleSystemStatus() {
 }
 
 void handleSettingsPage() {
+  markExplicitUserInteraction();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Settings</title>");
@@ -4387,6 +4622,7 @@ void handleSettingsPage() {
 }
 
 void handleHostnameSave() {
+  markExplicitUserInteraction();
   if (!server.hasArg("hostname")) {
     server.send(400, "text/plain", "Hostname is required.");
     return;
@@ -4415,6 +4651,7 @@ void handleHostnameSave() {
 }
 
 void handleInterfaceSettings() {
+  markExplicitUserInteraction();
   // Live Updates are managed by the persistent header control. Saving the LED
   // setting must not silently overwrite that independently managed preference.
   bool requestedLed = server.hasArg("ledEnabled");
@@ -4425,12 +4662,14 @@ void handleInterfaceSettings() {
 }
 
 void handleLedSelfTest() {
+  markExplicitUserInteraction();
   runStatusLedSelfTest();
   server.sendHeader("Location", "/settings");
   server.send(303, "text/plain", "Status LED self-test complete.");
 }
 
 void handleSaveStationSettings() {
+  markExplicitUserInteraction();
   if (!server.hasArg("ssid")) {
     server.send(400, "text/plain", "SSID is required.");
     return;
@@ -4449,6 +4688,7 @@ void handleSaveStationSettings() {
 }
 
 void handleBleModeChange() {
+  markExplicitUserInteraction();
   if (!server.hasArg("enabled")) {
     server.send(400, "text/plain", "Missing Bluetooth mode value.");
     return;
@@ -4479,6 +4719,7 @@ void handleBleModeChange() {
 }
 
 void handleClearStationSettings() {
+  markExplicitUserInteraction();
   eraseCredentials();
   WiFi.disconnect(false);
   ensureWiFiStationMode();
@@ -4492,6 +4733,7 @@ void handleClearStationSettings() {
 // ============================================================
 
 void handleAccessPointSettingsPage() {
+  markExplicitUserInteraction();
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -4651,6 +4893,7 @@ void handleAccessPointSettingsPage() {
 }
 
 void handleSaveAccessPointSettings() {
+  markExplicitUserInteraction();
   bool requestedEnabled = server.hasArg("enabled");
 
   String requestedSSID =
@@ -4817,6 +5060,17 @@ void printWifiSurveySerial() {
   Serial.println(wifiAutoScanCompletionCount);
   Serial.print("Auto start failures:  ");
   Serial.println(wifiAutoScanStartFailureCount);
+  Serial.print("Auto completion fails:");
+  Serial.print(" ");
+  Serial.println(wifiAutoScanCompletionFailureCount);
+  Serial.print("Auto retry pending:    ");
+  Serial.println(wifiAutoScanRetryPending ? "Yes" : "No");
+  Serial.print("Wi-Fi scan duration:   ");
+  Serial.println(wifiScanDurationSummaryLabel());
+  Serial.print("CSV exports served:    ");
+  Serial.println(wifiCsvExportCount);
+  Serial.print("Last CSV export:       ");
+  Serial.println(wifiCsvExportCount == 0 ? String("Never") : csvExportSummaryLabel(wifiCsvLastRows, wifiCsvLastBytes, wifiCsvLastDurationMs));
   Serial.print("Last auto start:       ");
   Serial.println(wifiAutoScanLastStartLabel());
   Serial.print("Last auto completion:  ");
@@ -5313,7 +5567,9 @@ void serviceInitialSurveyScans() {
   if (
     initialWifiScanPending &&
     elapsed >= INITIAL_WIFI_SCAN_DELAY_MS &&
-    !wifiScanInProgress
+    !wifiScanInProgress &&
+    !csvExportInProgress &&
+    !userInteractionDeferActive()
   ) {
     initialWifiScanPending = false;
     Serial.println("Initial headless Wi-Fi survey scan...");
@@ -5326,7 +5582,9 @@ void serviceInitialSurveyScans() {
     bleSurveyEnabled &&
     initialBleScanPending &&
     elapsed >= INITIAL_BLE_SCAN_DELAY_MS &&
-    !wifiScanInProgress
+    !wifiScanInProgress &&
+    !csvExportInProgress &&
+    !userInteractionDeferActive()
   ) {
     initialBleScanPending = false;
     Serial.println("Initial headless BLE survey scan (limited mode)...");
@@ -5337,16 +5595,26 @@ void serviceInitialSurveyScans() {
 }
 
 void serviceAutomaticScan() {
-  if (wifiScanInProgress) return;
+  if (wifiScanInProgress || csvExportInProgress || userInteractionDeferActive()) return;
+
+  uint32_t now = millis();
+
+  if (wifiAutoScanRetryPending) {
+    if ((uint32_t)(now - lastWifiAutoScanFailureMs) < WIFI_AUTOSCAN_RETRY_BACKOFF_MS) return;
+    wifiAutoScanRetryPending = false;
+    beginLoggedWifiScan(false, true);
+    return;
+  }
 
   unsigned long intervalMs = scanIntervalSeconds * 1000UL;
-  if (millis() - lastAutoScanMs < intervalMs) return;
+  if ((uint32_t)(now - lastAutoScanMs) < intervalMs) return;
 
   beginLoggedWifiScan(false, true);
 }
 
 void serviceAutomaticBLEScan() {
-  if (!bleSurveyEnabled || !autoBleScanEnabled || wifiScanInProgress) return;
+  if (!bleSurveyEnabled || !autoBleScanEnabled || wifiScanInProgress ||
+      csvExportInProgress || userInteractionDeferActive()) return;
 
   unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
   if (millis() - lastAutoBleScanMs < intervalMs) return;
@@ -5363,6 +5631,7 @@ void serviceAutomaticBLEScan() {
 void loop() {
   if (webServerStarted) {
     server.handleClient();
+    armUserInteractionDeferAfterWebService();
   }
 
   serviceLoggedWifiScan();
