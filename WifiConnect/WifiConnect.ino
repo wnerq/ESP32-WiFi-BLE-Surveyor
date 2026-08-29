@@ -1,4 +1,4 @@
-// WifiConnect30 - scheduler interaction priority, scan timing, and CSV robustness
+// WifiConnect31 - Standard/Advanced progressive diagnostic UI
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect30_scheduler_csv_robustness.ino";
-const char* FIRMWARE_VERSION = "30";
+const char* FIRMWARE_FILE = "WifiConnect31_standard_advanced_ui.ino";
+const char* FIRMWARE_VERSION = "31";
 
 
 Preferences preferences;
@@ -2681,7 +2681,61 @@ String pageStyles() {
   .status-warn { font-weight: bold; }
   .status-fail { font-weight: bold; }
 
-  .theme-control select {
+  .interface-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+
+  .view-control, .theme-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 0;
+    color: var(--muted);
+    font-size: 0.9em;
+  }
+
+  .diagnostic-details {
+    margin-top: 14px;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+  }
+
+  .diagnostic-details > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text);
+    list-style-position: outside;
+  }
+
+  .diagnostic-details > summary .diagnostic-summary {
+    margin-left: 8px;
+    color: var(--muted);
+    font-weight: normal;
+    font-size: 0.9em;
+  }
+
+  .diagnostic-details[open] > summary {
+    margin-bottom: 8px;
+  }
+
+  .diagnostic-body {
+    margin-top: 4px;
+  }
+
+  .diagnostic-warning {
+    margin-top: 10px;
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-weight: 600;
+  }
+
+  .theme-control select, .view-control select {
     min-width: 110px;
     padding: 7px;
     border: 1px solid var(--input-border);
@@ -3396,6 +3450,8 @@ String themeBootstrapScript() {
           "?(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)"
           ":(v==='dark');"
         "document.documentElement.dataset.theme=d?'dark':'light';"
+        "var w=localStorage.getItem('esp32-view')||'standard';"
+        "document.documentElement.dataset.view=(w==='advanced')?'advanced':'standard';"
       "}catch(e){}"
     "})();"
     "</script>";
@@ -3436,13 +3492,20 @@ void sendSiteNavigation(const String& active) {
 
 void sendThemeControl() {
   server.sendContent(
+    "<div class=\"interface-controls\">"
+    "<div class=\"view-control\">"
+    "<label for=\"view-select\">View</label>"
+    "<select id=\"view-select\" class=\"view-select\" onchange=\"setViewMode(this.value)\">"
+    "<option value=\"standard\">Standard</option>"
+    "<option value=\"advanced\">Advanced</option>"
+    "</select></div>"
     "<div class=\"theme-control\">"
     "<label for=\"theme-select\">Theme</label>"
     "<select id=\"theme-select\" class=\"theme-select\" onchange=\"setTheme(this.value)\">"
     "<option value=\"system\">System</option>"
     "<option value=\"light\">Light</option>"
     "<option value=\"dark\">Dark</option>"
-    "</select></div>"
+    "</select></div></div>"
   );
 }
 
@@ -3461,9 +3524,22 @@ void sendThemeScript() {
       "applyTheme(v);"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
     "}"
+    "function applyViewMode(v,force){"
+      "v=(v==='advanced')?'advanced':'standard';"
+      "document.documentElement.dataset.view=v;"
+      "document.querySelectorAll('.view-select').forEach(s=>s.value=v);"
+      "if(force){document.querySelectorAll('details.diagnostic-details').forEach(d=>d.open=(v==='advanced'));}"
+    "}"
+    "function setViewMode(v){"
+      "v=(v==='advanced')?'advanced':'standard';"
+      "localStorage.setItem('esp32-view',v);"
+      "applyViewMode(v,true);"
+    "}"
     "document.addEventListener('DOMContentLoaded',()=>{"
       "const v=localStorage.getItem('esp32-theme')||'system';"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
+      "const w=localStorage.getItem('esp32-view')||'standard';"
+      "applyViewMode(w,true);"
       "if(window.matchMedia){"
         "window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{"
           "if((localStorage.getItem('esp32-theme')||'system')==='system')applyTheme('system');"
@@ -3732,6 +3808,11 @@ void handleWebScan() {
     "Changing the interval saves immediately. Scan history is RAM-only and is cleared by reset or power cycle."
     "</div>";
 
+  String autoScanHealth = wifiAutoScanDiagnosticLabel();
+  if (autoScanHealth.startsWith("WARN")) {
+    loggingCard += "<div class=\"diagnostic-warning\">" + htmlEscape(autoScanHealth) + "</div>";
+  }
+
   if (wifiApTableFullDrops > 0) {
     loggingCard += "<div class=\"note\"><strong>Warning:</strong> ";
     loggingCard += String(wifiApTableFullDrops);
@@ -3805,7 +3886,10 @@ void handleWebScan() {
   String surveyDetails;
   surveyDetails.reserve(2800);
   surveyDetails +=
-    "<div class=\"card\"><h2>Survey Details</h2>"
+    "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Survey Diagnostics"
+    "<span class=\"diagnostic-summary\">" + String(scanCounter) + " scans &middot; " +
+    String(historyCount) + " observations &middot; " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB free heap</span></summary>"
+    "<div class=\"diagnostic-body\">"
     "<div class=\"row\"><span class=\"label\">History Capacity</span><span class=\"value\">" +
     String(scanHistoryCapacity) + " observations (automatic maximum)</span></div>"
     "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span><span class=\"value\">" +
@@ -3862,7 +3946,7 @@ void handleWebScan() {
     String(ESP.getFreeHeap() / 1024.0, 1) + " KB</span></div>"
     "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" +
     String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0, 1) + " KB</span></div>"
-    "</div>";
+    "</div></details></div>";
   server.sendContent(surveyDetails);
 
   sendWifiChannelAnalysis();
@@ -4231,6 +4315,10 @@ void handleBLESurvey() {
   status += "<div class=\"row\"><span class=\"label\">Stored Records</span><span class=\"value\">" +
     String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) +
     " retained; " + String(bleHistoryCapacity) + " physical</span></div>";
+  status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
+  status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
+  status += "</span></div>";
+  status += "<details class=\"diagnostic-details\"><summary>Diagnostics<span class=\"diagnostic-summary\">memory, tables, drops, CSV</span></summary><div class=\"diagnostic-body\">";
   status += "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
     String(bleHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>";
   status += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" +
@@ -4243,14 +4331,11 @@ void handleBLESurvey() {
     String(bleScanMetadataPeakUsed) + "; " + String(bleScanMetadataCapacity*sizeof(SurveyScanMetadata)/1024.0,1) + " KB allocated</span></div>";
   status += "<div class=\"row\"><span class=\"label\">Dropped BLE Observations</span><span class=\"value\">" +
     String(bleAddressTableFullDrops) + " (address table full)</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
-  status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
-  status += "</span></div>";
   status += "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" +
     String(bleCsvExportCount) + "</span></div>";
   status += "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" +
     (bleCsvExportCount == 0 ? String("Never") : htmlEscape(csvExportSummaryLabel(bleCsvLastRows, bleCsvLastBytes, bleCsvLastDurationMs))) +
-    "</span></div>";
+    "</span></div></div></details>";
 
   status += "<form class=\"settings-row\" action=\"/ble-settings\" method=\"get\">"
     "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
@@ -4425,7 +4510,7 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Last Reset</span><span class=\"value\">" + htmlEscape(resetReasonLabel(rr)) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Chip</span><span class=\"value\">" + String(ESP.getChipModel()) + ", rev " + String(ESP.getChipRevision()) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">CPU</span><span class=\"value\">" + String(ESP.getCpuFreqMHz()) + " MHz, " + String(ESP.getChipCores()) + " cores</span></div></div>";
-  s += "<div class=\"card\"><h2>Flash & Memory</h2>";
+  s += "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Flash &amp; Memory<span class=\"diagnostic-summary\">heap, partitions, survey allocations</span></summary><div class=\"diagnostic-body\">";
   s += "<div class=\"row\"><span class=\"label\">Flash Size</span><span class=\"value\">" + String(ESP.getFlashChipSize()/1024.0/1024.0, 2) + " MB</span></div>";
   s += "<div class=\"row\"><span class=\"label\">Sketch Size</span><span class=\"value\">" + String(ESP.getSketchSize()/1024.0, 1) + " KB</span></div>";
   const esp_partition_t* runningPartition = esp_ota_get_running_partition();
@@ -4468,8 +4553,8 @@ void handleSystemStatus() {
   } else {
     s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">Disabled at boot; 0 KB history allocated</span></div>";
   }
-  s += "</div>";
-  s += "<div class=\"card\"><h2>Radio Status</h2>";
+  s += "</div></details></div>";
+  s += "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Radio Diagnostics<span class=\"diagnostic-summary\">mode, MACs, channel, radio state</span></summary><div class=\"diagnostic-body\">";
   s += "<div class=\"row\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">STA MAC</span><span class=\"value\">" + WiFi.macAddress() + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">AP MAC</span><span class=\"value\">" + WiFi.softAPmacAddress() + "</span></div>";
@@ -4481,7 +4566,7 @@ void handleSystemStatus() {
   s += "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\"><a href=\"" + htmlEscape(mdnsWebAddress()) + "\">" + htmlEscape(mdnsWebAddress()) + "</a></span></div>";
   s += "<div class=\"row\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>";
   s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled (maximum Wi-Fi history)") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_AVAILABLE ? (statusLedEnabled ? String("GPIO ") + String(STATUS_LED_PIN) + String(" enabled") : String("Disabled by setting")) : String("Not available")) + "</span></div></div>";
+  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_AVAILABLE ? (statusLedEnabled ? String("GPIO ") + String(STATUS_LED_PIN) + String(" enabled") : String("Disabled by setting")) : String("Not available")) + "</span></div></div></details></div>";
   server.sendContent(s);
 
   server.sendContent("<div class=\"card\"><h2>Boot Heap Checkpoints</h2>"
@@ -4613,7 +4698,7 @@ void handleSettingsPage() {
     "<form class=\"controls\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
     "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled on GPIO 2" : "Disabled by setting") : "Not available") + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Survey Page Live Updates</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
-    "<div class=\"note\">The LED setting is saved here. Live Updates are controlled immediately from the checkbox in the page header and are also stored in NVS. Theme selection remains browser-local.</div></div>";
+    "<div class=\"note\">The LED setting is saved here. Live Updates are controlled immediately from the checkbox in the page header and are also stored in NVS. Theme and Standard/Advanced View selections remain browser-local.</div></div>";
   server.sendContent(s);
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript();
