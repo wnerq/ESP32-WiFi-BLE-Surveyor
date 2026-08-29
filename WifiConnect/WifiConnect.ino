@@ -1,4 +1,4 @@
-// WifiConnect28 - streamlined Wi-Fi survey controls and page layout
+// WifiConnect29 - Wi-Fi auto-scan diagnostics and scheduler cleanup
 // memory allocation, web/serial interface parity, LED controls, and mDNS
 #include <WiFi.h>
 #include <WebServer.h>
@@ -22,8 +22,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect28_survey_ui_cleanup.ino";
-const char* FIRMWARE_VERSION = "28";
+const char* FIRMWARE_FILE = "WifiConnect29_autoscan_diagnostics.ino";
+const char* FIRMWARE_VERSION = "29";
 
 
 Preferences preferences;
@@ -239,9 +239,14 @@ size_t historyCount = 0;
 String historyResizeMessage = "";
 uint32_t scanCounter = 0;
 uint32_t lastScanUptimeMs = 0;
-bool autoScanEnabled = true;  // Wi-Fi automatic surveying is intentionally always on.
 unsigned long scanIntervalSeconds = 300;
 unsigned long lastAutoScanMs = 0;
+uint32_t wifiAutoScanStartCount = 0;
+uint32_t wifiAutoScanCompletionCount = 0;
+uint32_t wifiAutoScanStartFailureCount = 0;
+uint32_t lastWifiAutoScanStartMs = 0;
+uint32_t lastWifiAutoScanCompletionMs = 0;
+bool wifiCurrentScanAutomatic = false;
 
 WifiApEntry* wifiApTable = nullptr;
 size_t wifiApTableCapacity = 0;
@@ -1111,7 +1116,7 @@ int performLoggedScan() {
   return result;
 }
 
-bool beginLoggedWifiScan(bool initialCheckpoint) {
+bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   if (wifiScanInProgress) return false;
 
   ensureWiFiStationMode();
@@ -1120,7 +1125,14 @@ bool beginLoggedWifiScan(bool initialCheckpoint) {
   int result = WiFi.scanNetworks(true);
   if (result == WIFI_SCAN_FAILED) {
     wifiScanStatusMessage = "Failed to start";
+    if (automaticTrigger) wifiAutoScanStartFailureCount++;
     return false;
+  }
+
+  wifiCurrentScanAutomatic = automaticTrigger;
+  if (automaticTrigger) {
+    wifiAutoScanStartCount++;
+    lastWifiAutoScanStartMs = millis();
   }
 
   wifiScanInProgress = true;
@@ -1144,10 +1156,15 @@ void serviceLoggedWifiScan() {
     wifiScanStatusMessage = "Scan failed";
     WiFi.scanDelete();
     wifiInitialScanCheckpointPending = false;
+    wifiCurrentScanAutomatic = false;
     return;
   }
 
   processCompletedWifiScan(result);
+  if (wifiCurrentScanAutomatic) {
+    wifiAutoScanCompletionCount++;
+    lastWifiAutoScanCompletionMs = lastScanUptimeMs;
+  }
   wifiScanStatusMessage = "Complete";
   WiFi.scanDelete();
   lastAutoScanMs = millis();
@@ -1156,6 +1173,8 @@ void serviceLoggedWifiScan() {
     captureBootHeapCheckpoint("Initial Wi-Fi scan");
     wifiInitialScanCheckpointPending = false;
   }
+
+  wifiCurrentScanAutomatic = false;
 }
 
 // ============================================================
@@ -1675,6 +1694,50 @@ String observationAgeLabel(uint32_t observationMs) {
   uint32_t now = millis();
   if (now < observationMs) return "counter wrapped";
   return formatUptime(now - observationMs) + " ago";
+}
+
+bool wifiAutoScanCadenceOverdue() {
+  uint32_t now = millis();
+  uint32_t intervalMs = scanIntervalSeconds * 1000UL;
+
+  if (wifiScanInProgress) return false;
+  if (scanCounter == 0)
+    return !initialWifiScanPending;
+
+  return (uint32_t)(now - lastScanUptimeMs) > intervalMs;
+}
+
+String wifiAutoScanDiagnosticLabel() {
+  uint32_t now = millis();
+  uint32_t intervalMs = scanIntervalSeconds * 1000UL;
+
+  if (wifiScanInProgress && wifiCurrentScanAutomatic)
+    return "OK - automatic scan in progress";
+
+  if (scanCounter == 0) {
+    if (initialWifiScanPending || wifiScanInProgress)
+      return "STARTING - waiting for first completed scan";
+    return "WARN - no completed Wi-Fi scan";
+  }
+
+  uint32_t ageMs = now - lastScanUptimeMs;
+  if (ageMs <= intervalMs)
+    return "OK - last scan completed within interval";
+
+  if (wifiScanInProgress)
+    return "OK - scan in progress after interval elapsed";
+
+  return "WARN - scan overdue; automatic scan not in progress";
+}
+
+String wifiAutoScanLastStartLabel() {
+  if (wifiAutoScanStartCount == 0) return "Never";
+  return observationAgeLabel(lastWifiAutoScanStartMs);
+}
+
+String wifiAutoScanLastCompletionLabel() {
+  if (wifiAutoScanCompletionCount == 0) return "Never";
+  return observationAgeLabel(lastWifiAutoScanCompletionMs);
 }
 
 
@@ -2542,13 +2605,17 @@ void handleWifiScanStatus() {
   String json = "{\"scan\":" + String(scanCounter) +
                 ",\"records\":" + String(historyCount) +
                 ",\"scanning\":" + String(wifiScanInProgress ? "true" : "false") +
+                ",\"automaticScan\":" + String(wifiCurrentScanAutomatic ? "true" : "false") +
+                ",\"autoStarts\":" + String(wifiAutoScanStartCount) +
+                ",\"autoCompletions\":" + String(wifiAutoScanCompletionCount) +
+                ",\"autoStartFailures\":" + String(wifiAutoScanStartFailureCount) +
                 ",\"live\":" + String(webAutoRefreshEnabled ? "true" : "false") + "}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
 void handleWebScanNow() {
-  bool started = beginLoggedWifiScan(false);
+  bool started = beginLoggedWifiScan(false, false);
   if (!started) {
     wifiScanStatusMessage = wifiScanInProgress ? "Scan already in progress" : "Unable to start scan";
   }
@@ -2592,13 +2659,11 @@ bool applyWifiScanIntervalFromRequest() {
 
 void handleScanSettings() {
   applyWifiScanIntervalFromRequest();
-  autoScanEnabled = true;
   redirectToScanPage();
 }
 
 void handleWifiIntervalSetting() {
   bool accepted = applyWifiScanIntervalFromRequest();
-  autoScanEnabled = true;
 
   server.sendHeader("Cache-Control", "no-store");
   if (!accepted) {
@@ -3570,6 +3635,18 @@ void handleWebScan() {
   }
 
   surveyDetails +=
+    "<div class=\"row\"><span class=\"label\">Auto-Scan Diagnostic</span><span class=\"value\">" +
+    htmlEscape(wifiAutoScanDiagnosticLabel()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Scan Starts</span><span class=\"value\">" +
+    String(wifiAutoScanStartCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Scan Completions</span><span class=\"value\">" +
+    String(wifiAutoScanCompletionCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Start Failures</span><span class=\"value\">" +
+    String(wifiAutoScanStartFailureCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Automatic Start</span><span class=\"value\">" +
+    htmlEscape(wifiAutoScanLastStartLabel()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Automatic Completion</span><span class=\"value\">" +
+    htmlEscape(wifiAutoScanLastCompletionLabel()) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
     String(wifiHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>"
     "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">" +
@@ -4222,6 +4299,11 @@ void handleSystemStatus() {
   server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
     autos ? (bleSurveyEnabled ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; Bluetooth Survey disabled")
           : "BLE automatic scanning is disabled at runtime"));
+  bool wifiCadenceOverdue = wifiAutoScanCadenceOverdue();
+  server.sendContent(selfTestRow("Wi-Fi auto-scan cadence", wifiCadenceOverdue ? "WARN" : "PASS",
+    wifiAutoScanDiagnosticLabel() + "; starts " + String(wifiAutoScanStartCount) +
+    ", completions " + String(wifiAutoScanCompletionCount) +
+    ", start failures " + String(wifiAutoScanStartFailureCount)));
   server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
     mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
   {
@@ -4727,6 +4809,18 @@ void printWifiSurveySerial() {
   Serial.print("Scan interval:       ");
   Serial.print(scanIntervalSeconds);
   Serial.println(" s");
+  Serial.print("Auto-scan diagnostic: ");
+  Serial.println(wifiAutoScanDiagnosticLabel());
+  Serial.print("Auto starts/completes: ");
+  Serial.print(wifiAutoScanStartCount);
+  Serial.print(" / ");
+  Serial.println(wifiAutoScanCompletionCount);
+  Serial.print("Auto start failures:  ");
+  Serial.println(wifiAutoScanStartFailureCount);
+  Serial.print("Last auto start:       ");
+  Serial.println(wifiAutoScanLastStartLabel());
+  Serial.print("Last auto completion:  ");
+  Serial.println(wifiAutoScanLastCompletionLabel());
   Serial.print("Observations:        ");
   Serial.print(historyCount);
   Serial.print(" / ");
@@ -5223,7 +5317,7 @@ void serviceInitialSurveyScans() {
   ) {
     initialWifiScanPending = false;
     Serial.println("Initial headless Wi-Fi survey scan...");
-    if (!beginLoggedWifiScan(true)) {
+    if (!beginLoggedWifiScan(true, true)) {
       Serial.println("Unable to start initial asynchronous Wi-Fi scan.");
     }
   }
@@ -5248,7 +5342,7 @@ void serviceAutomaticScan() {
   unsigned long intervalMs = scanIntervalSeconds * 1000UL;
   if (millis() - lastAutoScanMs < intervalMs) return;
 
-  beginLoggedWifiScan(false);
+  beginLoggedWifiScan(false, true);
 }
 
 void serviceAutomaticBLEScan() {
