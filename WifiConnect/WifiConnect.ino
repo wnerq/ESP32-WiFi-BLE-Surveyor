@@ -1,5 +1,5 @@
-// WifiConnect33 - session checkpoint/restore, history test tools, scan timing, and reconnect diagnostics
-// memory allocation, web/serial interface parity, LED controls, and mDNS
+// ESP32 Wireless Surveyor V34 - web-interface information architecture refactor
+// Preserves V33e survey/checkpoint behavior while adding Standard/Advanced/Developer views and source-learning comments.
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -24,8 +24,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect33b_session_checkpoint_test_tools.ino";
-const char* FIRMWARE_VERSION = "33b";
+const char* FIRMWARE_FILE = "WifiConnect34b_sticky_navigation.ino";
+const char* FIRMWARE_VERSION = "34b";
 
 
 Preferences preferences;
@@ -306,6 +306,9 @@ const uint16_t SESSION_CHECKPOINT_VERSION = 1;
 bool spiffsMounted = false;
 bool sessionRestoredThisBoot = false;
 String sessionCheckpointStatus = "Filesystem not initialized";
+// History uses a continued survey-session timebase across checkpoint restores.
+// Scheduling and boot uptime continue to use raw millis().
+uint32_t sessionUptimeOffsetMs = 0;
 uint32_t syntheticPrefillRuns = 0;
 size_t syntheticPrefillLastTarget = 0;
 
@@ -350,6 +353,7 @@ size_t bootBleHistoryCapacity = 0;
 // Boot/resource diagnostics and status LED
 // ============================================================
 
+// Purpose: Records free/minimum/largest heap metrics at a named startup stage for later diagnostics.
 void captureBootHeapCheckpoint(const char* stage) {
   if (bootHeapCheckpointCount >= MAX_BOOT_HEAP_CHECKPOINTS) return;
 
@@ -361,6 +365,7 @@ void captureBootHeapCheckpoint(const char* stage) {
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
+// Purpose: Drives the status LED to the requested logical state while honoring whether LED output is available.
 void writeStatusLed(bool on) {
   if (!STATUS_LED_AVAILABLE) return;
   if (on && !statusLedEnabled && !statusLedSelfTestOverride) return;
@@ -371,10 +376,12 @@ void writeStatusLed(bool on) {
   digitalWrite(STATUS_LED_PIN, electricalHigh ? HIGH : LOW);
 }
 
+// Purpose: FreeRTOS timer callback used to toggle or advance status-LED scan indication.
 void statusLedTimerCallback(TimerHandle_t) {
   writeStatusLed(!statusLedState);
 }
 
+// Purpose: Configures the status LED pin and creates the timer used for nonblocking indications.
 void initializeStatusLed() {
   if (!STATUS_LED_AVAILABLE) return;
 
@@ -389,6 +396,7 @@ void initializeStatusLed() {
       statusLedTimerCallback);
 }
 
+// Purpose: Starts the periodic LED indication used while a radio scan is active.
 void startScanLed(TickType_t periodTicks) {
   if (!STATUS_LED_AVAILABLE || !statusLedEnabled || statusLedTimer == nullptr) return;
 
@@ -397,6 +405,7 @@ void startScanLed(TickType_t periodTicks) {
   xTimerChangePeriod(statusLedTimer, periodTicks, 0);
 }
 
+// Purpose: Stops scan indication and returns the status LED to its normal state.
 void stopScanLed() {
   if (!STATUS_LED_AVAILABLE) return;
 
@@ -419,6 +428,7 @@ void statusLedPulse(
   delay(offMs);
 }
 
+// Purpose: Shows the early-boot LED pattern before the web interface is ready.
 void indicateBootStarted() {
   if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
 
@@ -426,6 +436,7 @@ void indicateBootStarted() {
   statusLedPulse(90, 0);
 }
 
+// Purpose: Shows the final startup LED state based on detected failure or warning conditions.
 void indicateStartupStatus(bool failed, bool warning) {
   if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
 
@@ -442,6 +453,7 @@ void indicateStartupStatus(bool failed, bool warning) {
   statusLedPulse(650, 0);
 }
 
+// Purpose: Runs a short visible LED pattern so the user can verify the configured indicator hardware.
 void runStatusLedSelfTest() {
   if (!STATUS_LED_AVAILABLE) return;
 
@@ -461,6 +473,7 @@ void runStatusLedSelfTest() {
 // Serial helpers
 // ============================================================
 
+// Purpose: Reads one complete command line from Serial without changing the command parser itself.
 String readSerialLine() {
   while (!Serial.available()) {
     if (webServerStarted) {
@@ -479,6 +492,7 @@ String readSerialLine() {
 // Wi-Fi helpers
 // ============================================================
 
+// Purpose: Builds the short MAC-derived suffix used in generated default network names.
 String macSuffix() {
   String mac = WiFi.macAddress();
   mac.replace(":", "");
@@ -490,14 +504,17 @@ String macSuffix() {
   return "ESP32";
 }
 
+// Purpose: Returns the generated default SSID for the ESP32-hosted Device AP.
 String defaultApSSID() {
   return "ESP32-Surveyor-" + macSuffix();
 }
 
+// Purpose: Returns the default password used when no custom Device AP password is stored.
 String defaultApPassword() {
   return "survey-" + macSuffix();
 }
 
+// Purpose: Loads Device AP settings from NVS and applies validated defaults when values are missing or invalid.
 void loadAccessPointSettings() {
   preferences.begin("ap", true);
 
@@ -545,6 +562,7 @@ void saveAccessPointSettings(
   preferences.end();
 }
 
+// Purpose: Validates a proposed hostname against the firmware rules for length and allowed characters.
 bool isValidMdnsHostname(const String& value) {
   if (value.length() < 1 || value.length() > MAX_MDNS_HOSTNAME_LENGTH) return false;
   if (value[0] == '-' || value[value.length() - 1] == '-') return false;
@@ -558,16 +576,19 @@ bool isValidMdnsHostname(const String& value) {
   return true;
 }
 
+// Purpose: Normalizes user-entered hostname text before validation and storage.
 String normalizedMdnsHostname(String value) {
   value.trim();
   value.toLowerCase();
   return value;
 }
 
+// Purpose: Builds the friendly HTTP address derived from the configured device hostname.
 String mdnsWebAddress() {
   return "http://" + mdnsHostname + ".local/";
 }
 
+// Purpose: Loads persisted survey-mode, scan-interval, interface, and related runtime settings from NVS.
 void loadSurveyModeSettings() {
   preferences.begin("survey", true);
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
@@ -586,6 +607,7 @@ void loadSurveyModeSettings() {
   }
 }
 
+// Purpose: Builds a unique default hostname from the ESP32 identity.
 String generatedDefaultMdnsHostname() {
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -594,11 +616,13 @@ String generatedDefaultMdnsHostname() {
   return String("surveyor-") + suffix;
 }
 
+// Purpose: Applies a generated hostname when no valid saved hostname is available.
 void applyGeneratedDefaultMdnsHostname() {
   if (mdnsHostnameUserConfigured) return;
   mdnsHostname = normalizedMdnsHostname(generatedDefaultMdnsHostname());
 }
 
+// Purpose: Stores the validated device hostname in NVS and updates the in-memory copy.
 void saveMdnsHostname(const String& hostname) {
   mdnsHostname = normalizedMdnsHostname(hostname);
   mdnsHostnameUserConfigured = true;
@@ -607,6 +631,7 @@ void saveMdnsHostname(const String& hostname) {
   preferences.end();
 }
 
+// Purpose: Starts mDNS advertising for the configured device hostname and records diagnostic status.
 bool startMdnsService() {
   mdnsAttempted = true;
 
@@ -634,12 +659,14 @@ bool startMdnsService() {
   return true;
 }
 
+// Purpose: Persists whether Bluetooth Survey should be initialized on the next boot.
 void saveBleSurveyEnabled(bool enabled) {
   preferences.begin("survey", false);
   preferences.putBool("bleEnabled", enabled);
   preferences.end();
 }
 
+// Purpose: Persists interface preferences that are stored on the ESP32 rather than in the browser.
 void saveInterfaceSettings(bool ledEnabled, bool autoRefreshEnabled) {
   statusLedEnabled = ledEnabled;
   webAutoRefreshEnabled = autoRefreshEnabled;
@@ -649,6 +676,7 @@ void saveInterfaceSettings(bool ledEnabled, bool autoRefreshEnabled) {
   preferences.end();
 }
 
+// Purpose: Persists the global Live Updates preference.
 void saveWebLiveUpdates(bool enabled) {
   webAutoRefreshEnabled = enabled;
   preferences.begin("survey", false);
@@ -656,6 +684,7 @@ void saveWebLiveUpdates(bool enabled) {
   preferences.end();
 }
 
+// Purpose: Ensures the ESP32 Wi-Fi driver includes station capability without unnecessarily disrupting the Device AP.
 void ensureWiFiStationMode() {
   wifi_mode_t currentMode = WiFi.getMode();
 
@@ -672,6 +701,7 @@ void ensureWiFiStationMode() {
   }
 }
 
+// Purpose: Starts the ESP32-hosted Device AP using the currently configured SSID and password.
 bool startAccessPoint() {
   if (!apEnabled) {
     apRunning = false;
@@ -714,6 +744,7 @@ bool startAccessPoint() {
   return started;
 }
 
+// Purpose: Converts an ESP32 Wi-Fi authentication enum into a human-readable security label.
 String securityLabel(wifi_auth_mode_t authMode) {
   switch (authMode) {
     case WIFI_AUTH_OPEN:
@@ -750,6 +781,7 @@ String securityLabel(wifi_auth_mode_t authMode) {
 // Shared survey/statistics helpers
 // ============================================================
 
+// Purpose: Initializes an RSSI statistics accumulator before observations are added.
 void resetSignalStats(SignalStats& stats) {
   stats.samples = 0;
   stats.latestRssi = 0;
@@ -791,6 +823,7 @@ void addSignalObservation(
   stats.lastSeenMs = uptimeMs;
 }
 
+// Purpose: Calculates mean RSSI from an accumulated SignalStats structure.
 float averageSignal(const SignalStats& stats) {
   if (stats.samples == 0) {
     return 0.0f;
@@ -805,6 +838,11 @@ float averageSignal(const SignalStats& stats) {
 // ============================================================
 // V33 session checkpoint / restore
 // ============================================================
+
+// Purpose: Returns the logical survey-session timebase, which can continue across checkpoint restores.
+uint32_t surveySessionUptimeMs() {
+  return millis() + sessionUptimeOffsetMs;
+}
 
 struct SessionCheckpointHeader {
   uint32_t magic;
@@ -823,6 +861,7 @@ struct SessionCheckpointHeader {
   uint32_t bleMetadataCount;
 };
 
+// Purpose: Updates the CRC32 used to protect serialized session-checkpoint data.
 uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
   crc = ~crc;
   for (size_t i = 0; i < length; i++) {
@@ -833,6 +872,7 @@ uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
   return ~crc;
 }
 
+// Purpose: Writes one checkpoint payload chunk while simultaneously folding it into the running CRC.
 bool checkpointWriteChunk(File& file, uint32_t& crc, const void* data, size_t bytes) {
   if (bytes == 0) return true;
   if (file.write((const uint8_t*)data, bytes) != bytes) return false;
@@ -840,6 +880,7 @@ bool checkpointWriteChunk(File& file, uint32_t& crc, const void* data, size_t by
   return true;
 }
 
+// Purpose: Serializes retained survey state to SPIFFS with header/version/length/CRC protection.
 bool saveSurveySessionCheckpoint(String& detail) {
   if (!spiffsMounted) {
     detail = "SPIFFS is not mounted.";
@@ -854,7 +895,7 @@ bool saveSurveySessionCheckpoint(String& detail) {
   h.magic = SESSION_CHECKPOINT_MAGIC;
   h.version = SESSION_CHECKPOINT_VERSION;
   h.headerBytes = sizeof(SessionCheckpointHeader);
-  h.savedUptimeMs = millis();
+  h.savedUptimeMs = surveySessionUptimeMs();
   h.scanCounter = scanCounter;
   h.lastScanUptimeMs = lastScanUptimeMs;
   h.wifiObservationCount = historyCount;
@@ -909,6 +950,7 @@ bool saveSurveySessionCheckpoint(String& detail) {
   return true;
 }
 
+// Purpose: Deletes the saved survey-session checkpoint from SPIFFS.
 bool discardSurveySessionCheckpoint(String& detail) {
   if (!spiffsMounted) { detail = "SPIFFS is not mounted."; return false; }
   if (!SPIFFS.exists(SESSION_CHECKPOINT_PATH)) {
@@ -922,6 +964,7 @@ bool discardSurveySessionCheckpoint(String& detail) {
   return ok;
 }
 
+// Purpose: Validates and restores a saved checkpoint, including history tables and logical survey time.
 bool restoreSurveySessionCheckpoint(String& detail) {
   if (!spiffsMounted || !SPIFFS.exists(SESSION_CHECKPOINT_PATH)) {
     detail = "No saved session found.";
@@ -974,15 +1017,14 @@ bool restoreSurveySessionCheckpoint(String& detail) {
   wifiApCount = h.wifiApCount;
   memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
   if (f.read((uint8_t*)wifiScanMetadata, h.wifiMetadataCount * sizeof(WifiScanMetadata)) != (int)(h.wifiMetadataCount * sizeof(WifiScanMetadata))) { f.close(); detail = "Wi-Fi metadata restore failed."; return false; }
+  // Preserve saved history timestamps and continue the survey-session clock
+  // from the checkpoint. Raw millis() still starts at zero after reboot and
+  // remains the scheduler timebase. This avoids unsigned underflow when a
+  // restored observation is older than the new boot uptime.
   uint32_t restoreNow = millis();
-  for (size_t i = 0; i < h.wifiMetadataCount; i++) {
-    if (wifiScanMetadata[i].scanNumber != 0) {
-      uint32_t ageAtSave = h.savedUptimeMs - wifiScanMetadata[i].uptimeMs;
-      wifiScanMetadata[i].uptimeMs = restoreNow - ageAtSave;
-    }
-  }
+  sessionUptimeOffsetMs = h.savedUptimeMs - restoreNow;
   scanCounter = h.scanCounter;
-  lastScanUptimeMs = restoreNow - (h.savedUptimeMs - h.lastScanUptimeMs);
+  lastScanUptimeMs = h.lastScanUptimeMs;
 
   if (h.bleObservationCount || h.bleAddressCount || h.bleMetadataCount) {
     if (bleSurveyEnabled && bleHistory && bleAddressTable && bleScanMetadata) {
@@ -998,13 +1040,8 @@ bool restoreSurveySessionCheckpoint(String& detail) {
       bleAddressCount = h.bleAddressCount;
       memset(bleScanMetadata, 0, bleScanMetadataCapacity * sizeof(SurveyScanMetadata));
       if (f.read((uint8_t*)bleScanMetadata, h.bleMetadataCount * sizeof(SurveyScanMetadata)) != (int)(h.bleMetadataCount * sizeof(SurveyScanMetadata))) { f.close(); detail = "BLE metadata restore failed."; return false; }
-      uint32_t bleRestoreNow = millis();
-      for (size_t i = 0; i < h.bleMetadataCount; i++) {
-        if (bleScanMetadata[i].scanNumber != 0) {
-          uint32_t ageAtSave = h.savedUptimeMs - bleScanMetadata[i].uptimeMs;
-          bleScanMetadata[i].uptimeMs = bleRestoreNow - ageAtSave;
-        }
-      }
+      // BLE metadata uses the same continued survey-session timebase as Wi-Fi.
+      // Saved timestamps remain unchanged; sessionUptimeOffsetMs was set above.
     } else {
       size_t skipBytes = h.bleObservationCount * sizeof(BleObservation) +
           h.bleAddressCount * sizeof(BleAddressEntry) + h.bleMetadataCount * sizeof(SurveyScanMetadata);
@@ -1018,17 +1055,32 @@ bool restoreSurveySessionCheckpoint(String& detail) {
   return true;
 }
 
+// Purpose: Mounts SPIFFS, performs first-use formatting when needed, and attempts automatic checkpoint restore.
 void initializeSessionStorageAndRestore() {
+  // First try a non-destructive mount so an existing checkpoint is preserved.
+  // On a new/unformatted SPIFFS partition, retry with format-on-failure enabled.
+  bool formattedAfterMountFailure = false;
   spiffsMounted = SPIFFS.begin(false);
   if (!spiffsMounted) {
-    sessionCheckpointStatus = "SPIFFS mount failed; checkpoint features unavailable.";
+    spiffsMounted = SPIFFS.begin(true);
+    formattedAfterMountFailure = spiffsMounted;
+  }
+  if (!spiffsMounted) {
+    sessionCheckpointStatus = "SPIFFS mount/format failed; checkpoint features unavailable.";
     return;
   }
+
   String detail;
-  if (SPIFFS.exists(SESSION_CHECKPOINT_PATH)) restoreSurveySessionCheckpoint(detail);
-  else sessionCheckpointStatus = "No saved session.";
+  if (SPIFFS.exists(SESSION_CHECKPOINT_PATH)) {
+    restoreSurveySessionCheckpoint(detail);
+  } else {
+    sessionCheckpointStatus = formattedAfterMountFailure
+      ? "SPIFFS mounted after first-use format; no saved session."
+      : "No saved session.";
+  }
 }
 
+// Purpose: Waits briefly for active work to finish, then saves a checkpoint before an intentional reboot.
 bool checkpointBeforeControlledRestart() {
   if (historyCount == 0 && (!bleSurveyEnabled || bleHistoryCount == 0)) return true;
   uint32_t waitStarted = millis();
@@ -1044,6 +1096,7 @@ bool checkpointBeforeControlledRestart() {
 // V33 synthetic Wi-Fi history test tools
 // ============================================================
 
+// Purpose: Adds deterministic synthetic Wi-Fi observations until the requested percentage of history capacity is filled.
 bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
   if (percent != 50 && percent != 75 && percent != 95) { detail = "Unsupported target."; return false; }
   if (!scanHistory || !wifiApTable || !wifiScanMetadata || wifiScanInProgress || csvExportInProgress) {
@@ -1068,7 +1121,7 @@ bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
     if (wifiScanMetadata[slot].scanNumber != 0 && wifiScanMetadata[slot].scanNumber != scanCounter)
       discardObservationsForScanSlot(slot);
     wifiScanMetadata[slot].scanNumber = scanCounter;
-    wifiScanMetadata[slot].uptimeMs = millis();
+    wifiScanMetadata[slot].uptimeMs = surveySessionUptimeMs();
     lastScanUptimeMs = wifiScanMetadata[slot].uptimeMs;
     for (uint8_t a = 0; a < syntheticApCount && historyCount < target; a++) {
       WifiObservation test = {};
@@ -1085,6 +1138,7 @@ bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
   return true;
 }
 
+// Purpose: HTTP handler for the Developer synthetic-history prefill controls.
 void handleHistoryPrefill() {
   markExplicitUserInteraction();
   if (!server.hasArg("percent")) { server.send(400, "text/plain", "Missing target percent."); return; }
@@ -1095,18 +1149,26 @@ void handleHistoryPrefill() {
   server.send(ok ? 303 : 409, "text/plain", detail);
 }
 
+// Purpose: HTTP handler for manually saving a survey-session checkpoint.
 void handleSessionCheckpointSave() {
   markExplicitUserInteraction();
+  uint32_t waitStarted = millis();
+  while (wifiScanInProgress && (uint32_t)(millis() - waitStarted) < 10000) {
+    serviceLoggedWifiScan();
+    delay(10);
+  }
   String detail; bool ok = saveSurveySessionCheckpoint(detail);
   server.sendHeader("Location", "/system"); server.send(ok ? 303 : 409, "text/plain", detail);
 }
 
+// Purpose: HTTP handler for deleting a saved survey-session checkpoint.
 void handleSessionCheckpointDiscard() {
   markExplicitUserInteraction();
   String detail; bool ok = discardSurveySessionCheckpoint(detail);
   server.sendHeader("Location", "/system"); server.send(ok ? 303 : 500, "text/plain", detail);
 }
 
+// Purpose: Observes infrastructure Wi-Fi link transitions so native ESP32 auto-reconnect behavior can be diagnosed.
 void serviceNativeReconnectDiagnostics() {
   bool connected = WiFi.status() == WL_CONNECTED;
   if (!nativeReconnectStateInitialized) {
@@ -1126,6 +1188,7 @@ void serviceNativeReconnectDiagnostics() {
 // BLE helpers
 // ============================================================
 
+// Purpose: Converts the compact BLE address-type code into a readable Public/Random label.
 String bleAddressTypeLabel(uint8_t addressType) {
   switch (addressType) {
     case 0: return "Public";
@@ -1136,6 +1199,7 @@ String bleAddressTypeLabel(uint8_t addressType) {
   }
 }
 
+// Purpose: Initializes the BLE stack and scanner only when Bluetooth Survey is enabled at boot.
 void initializeBLEScanner() {
   if (!bleSurveyEnabled || bleInitialized) return;
 
@@ -1150,6 +1214,7 @@ void initializeBLEScanner() {
 // Wi-Fi compact normalized history (V21)
 // ============================================================
 
+// Purpose: Returns the total RAM reserved for Wi-Fi compact observations, AP identity table, and scan metadata.
 size_t wifiHistoryAllocatedBytes() {
   return
     scanHistoryCapacity * sizeof(WifiObservation) +
@@ -1157,12 +1222,14 @@ size_t wifiHistoryAllocatedBytes() {
     wifiScanMetadataCapacity * sizeof(WifiScanMetadata);
 }
 
+// Purpose: Returns a retained compact Wi-Fi observation by logical ring-buffer index.
 const WifiObservation& compactHistoryRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (historyStart + logicalIndex) % scanHistoryCapacity;
   return scanHistory[physicalIndex];
 }
 
+// Purpose: Formats a six-byte Wi-Fi BSSID as standard colon-separated hexadecimal text.
 void formatBssid(const uint8_t bssid[6], char output[18]) {
   snprintf(
     output, 18,
@@ -1172,6 +1239,7 @@ void formatBssid(const uint8_t bssid[6], char output[18]) {
   );
 }
 
+// Purpose: Synthesizes a full Wi-Fi ScanRecord view from the compact observation and lookup tables.
 ScanRecord historyRecord(size_t logicalIndex) {
   ScanRecord record = {};
   if (
@@ -1204,6 +1272,7 @@ ScanRecord historyRecord(size_t logicalIndex) {
   return record;
 }
 
+// Purpose: Counts distinct retained Wi-Fi scan numbers represented in the observation ring.
 size_t countRetainedScanGroups() {
   if (historyCount == 0 || scanHistory == nullptr) return 0;
 
@@ -1222,12 +1291,14 @@ size_t countRetainedScanGroups() {
   return groups;
 }
 
+// Purpose: Evicts the oldest Wi-Fi observation from the ring buffer.
 void discardOldestWifiObservation() {
   if (historyCount == 0 || scanHistoryCapacity == 0) return;
   historyStart = (historyStart + 1) % scanHistoryCapacity;
   historyCount--;
 }
 
+// Purpose: Removes Wi-Fi observations that reference a scan-metadata slot being recycled.
 void discardObservationsForScanSlot(uint16_t scanSlot) {
   // Observations are chronological. Any observation using a metadata slot that
   // is about to be recycled belongs to the oldest retained scan using it.
@@ -1238,6 +1309,7 @@ void discardObservationsForScanSlot(uint16_t scanSlot) {
   }
 }
 
+// Purpose: Changes the logical Wi-Fi history-retention limit without reallocating the physical buffers.
 bool setWifiRetentionLimit(size_t requestedLimit) {
   if (scanHistory == nullptr || scanHistoryCapacity == 0) {
     historyResizeMessage = "Wi-Fi history storage is not allocated.";
@@ -1263,11 +1335,13 @@ bool setWifiRetentionLimit(size_t requestedLimit) {
 
 // Compatibility wrapper: V21 no longer reallocates the history buffer at
 // runtime. Web changes alter only the logical retention limit.
+// Purpose: Compatibility wrapper for changing the Wi-Fi retention limit under the compact fixed-allocation design.
 bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
   (void)preserveRecords;
   return setWifiRetentionLimit(requestedCapacity);
 }
 
+// Purpose: Clears Wi-Fi history and then applies a requested logical retention limit.
 bool clearAndResizeScanHistory(size_t requestedCapacity) {
   historyStart = 0;
   historyCount = 0;
@@ -1280,6 +1354,7 @@ bool clearAndResizeScanHistory(size_t requestedCapacity) {
   return setWifiRetentionLimit(requestedCapacity);
 }
 
+// Purpose: Appends one compact Wi-Fi observation, evicting old data as required by the ring-buffer limit.
 void appendWifiObservation(const WifiObservation& observation) {
   if (
     scanHistory == nullptr ||
@@ -1296,6 +1371,7 @@ void appendWifiObservation(const WifiObservation& observation) {
   historyCount++;
 }
 
+// Purpose: Clears retained Wi-Fi observations and associated scan-history state.
 void clearScanHistory() {
   historyStart = 0;
   historyCount = 0;
@@ -1307,6 +1383,7 @@ void clearScanHistory() {
     memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
 }
 
+// Purpose: Finds an existing Wi-Fi AP-table entry whose binary BSSID matches the supplied address.
 int findWifiApByBssid(const uint8_t bssid[6]) {
   for (size_t i = 0; i < wifiApCount; i++) {
     if (memcmp(wifiApTable[i].bssid, bssid, 6) == 0)
@@ -1315,6 +1392,7 @@ int findWifiApByBssid(const uint8_t bssid[6]) {
   return -1;
 }
 
+// Purpose: Checks whether any retained Wi-Fi observation still refers to a given AP-table slot.
 bool wifiApIndexIsReferenced(size_t apIndex) {
   for (size_t i = 0; i < historyCount; i++) {
     if (compactHistoryRecord(i).apIndex == apIndex) return true;
@@ -1381,10 +1459,11 @@ int findOrCreateWifiAp(
   return (int)targetIndex;
 }
 
+// Purpose: Allocates the compact Wi-Fi observation ring, AP table, and scan-metadata table within the chosen RAM budget.
 bool initializeCompactWifiHistory(size_t budgetBytes) {
   // Scale metadata overhead down in BLE mode, where the available Wi-Fi
   // history budget is intentionally small. Wi-Fi-only mode uses larger tables.
-  size_t apCapacity = budgetBytes >= 24 * 1024 ? 256 : 64;
+  size_t apCapacity = budgetBytes >= 24 * 1024 ? 512 : 64;
   size_t scanCapacity = budgetBytes >= 24 * 1024 ? 1024 : 64;
 
   size_t metadataBytes =
@@ -1448,9 +1527,10 @@ bool loadCredentials(String& ssid, String& password);
 void considerInfrastructureReconnectAfterScan(int networkCount);
 void serviceNativeReconnectDiagnostics();
 
+// Purpose: Converts a completed ESP32 Wi-Fi scan into compact retained observations and updates scan state.
 int processCompletedWifiScan(int networkCount) {
   scanCounter++;
-  lastScanUptimeMs = millis();
+  lastScanUptimeMs = surveySessionUptimeMs();
   wifiScanCompletedSinceBoot = true;
 
   if (wifiScanMetadata == nullptr || wifiScanMetadataCapacity == 0)
@@ -1499,6 +1579,7 @@ int processCompletedWifiScan(int networkCount) {
   return networkCount;
 }
 
+// Purpose: Adds one successful Wi-Fi scan duration to the last/min/max/average statistics.
 void recordWifiScanDuration(uint32_t durationMs) {
   wifiLastScanDurationMs = durationMs;
   wifiTotalScanDurationMs += durationMs;
@@ -1510,16 +1591,19 @@ void recordWifiScanDuration(uint32_t durationMs) {
     wifiMaxScanDurationMs = durationMs;
 }
 
+// Purpose: Returns the arithmetic mean duration of successful Wi-Fi scans recorded this session.
 uint32_t wifiAverageScanDurationMs() {
   if (wifiScanDurationCount == 0) return 0;
   return (uint32_t)(wifiTotalScanDurationMs / wifiScanDurationCount);
 }
 
+// Purpose: Records an automatic Wi-Fi scan-start failure and arms the retry-backoff state.
 void noteAutomaticScanFailure() {
   wifiAutoScanRetryPending = true;
   lastWifiAutoScanFailureMs = millis();
 }
 
+// Purpose: Legacy synchronous wrapper that starts a logged Wi-Fi scan and waits for its completion.
 int performLoggedScan() {
   ensureWiFiStationMode();
 
@@ -1537,6 +1621,7 @@ int performLoggedScan() {
   return result;
 }
 
+// Purpose: Starts an asynchronous Wi-Fi scan when scheduling and resource conditions permit it.
 bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   if (wifiScanInProgress) return false;
 
@@ -1569,6 +1654,7 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   return true;
 }
 
+// Purpose: Polls an in-progress asynchronous Wi-Fi scan and processes it when the ESP32 reports completion.
 void serviceLoggedWifiScan() {
   if (!wifiScanInProgress) return;
 
@@ -1595,7 +1681,7 @@ void serviceLoggedWifiScan() {
   recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
-    lastWifiAutoScanCompletionMs = lastScanUptimeMs;
+    lastWifiAutoScanCompletionMs = millis();
   }
   wifiScanStatusMessage = "Complete";
   WiFi.scanDelete();
@@ -1614,6 +1700,7 @@ void serviceLoggedWifiScan() {
 // BLE compact normalized history
 // ============================================================
 
+// Purpose: Returns the total RAM reserved for BLE observations, address identities, and scan metadata.
 size_t bleHistoryAllocatedBytes() {
   return
     bleHistoryCapacity * sizeof(BleObservation) +
@@ -1621,12 +1708,14 @@ size_t bleHistoryAllocatedBytes() {
     bleScanMetadataCapacity * sizeof(SurveyScanMetadata);
 }
 
+// Purpose: Returns a retained compact BLE observation by logical ring-buffer index.
 const BleObservation& compactBleHistoryRecord(size_t logicalIndex) {
   size_t physicalIndex =
       (bleHistoryStart + logicalIndex) % bleHistoryCapacity;
   return bleHistory[physicalIndex];
 }
 
+// Purpose: Parses colon-separated BLE address text into its six-byte binary representation.
 bool parseBleAddress(const String& text, uint8_t output[6]) {
   unsigned int b[6];
   if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
@@ -1635,11 +1724,13 @@ bool parseBleAddress(const String& text, uint8_t output[6]) {
   return true;
 }
 
+// Purpose: Formats a six-byte BLE address as colon-separated hexadecimal text.
 void formatBleAddress(const uint8_t address[6], char output[18]) {
   snprintf(output, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
     address[0], address[1], address[2], address[3], address[4], address[5]);
 }
 
+// Purpose: Synthesizes a full BLE ScanRecord view from compact observation and lookup-table data.
 BleScanRecord bleHistoryRecord(size_t logicalIndex) {
   BleScanRecord record = {};
   if (
@@ -1665,6 +1756,7 @@ BleScanRecord bleHistoryRecord(size_t logicalIndex) {
   return record;
 }
 
+// Purpose: Checks whether any retained BLE observation still references a given address-table slot.
 bool bleAddressIndexIsReferenced(size_t addressIndex) {
   for (size_t i = 0; i < bleHistoryCount; i++) {
     if (compactBleHistoryRecord(i).addressIndex == addressIndex) return true;
@@ -1672,6 +1764,7 @@ bool bleAddressIndexIsReferenced(size_t addressIndex) {
   return false;
 }
 
+// Purpose: Counts BLE address-table slots that are still referenced by retained observations.
 size_t countReferencedBleAddresses() {
   if (!bleAddressTable || bleAddressTableCapacity == 0) return 0;
   size_t count = 0;
@@ -1680,6 +1773,7 @@ size_t countReferencedBleAddresses() {
   return count;
 }
 
+// Purpose: Counts BLE scan-metadata slots that are still referenced by retained observations.
 size_t countReferencedBleScanSlots() {
   if (!bleScanMetadata || bleScanMetadataCapacity == 0) return 0;
   size_t count = 0;
@@ -1693,6 +1787,7 @@ size_t countReferencedBleScanSlots() {
   return count;
 }
 
+// Purpose: Updates peak BLE address-table and scan-metadata utilization diagnostics.
 void updateBleUsageHighWaterMarks() {
   size_t addresses = countReferencedBleAddresses();
   if (addresses > bleAddressPeakReferenced) bleAddressPeakReferenced = addresses;
@@ -1700,12 +1795,14 @@ void updateBleUsageHighWaterMarks() {
   if (scans > bleScanMetadataPeakUsed) bleScanMetadataPeakUsed = scans;
 }
 
+// Purpose: Evicts the oldest BLE observation from the ring buffer.
 void discardOldestBleObservation() {
   if (bleHistoryCount == 0 || bleHistoryCapacity == 0) return;
   bleHistoryStart = (bleHistoryStart + 1) % bleHistoryCapacity;
   bleHistoryCount--;
 }
 
+// Purpose: Removes BLE observations tied to a scan-metadata slot that must be recycled.
 void discardBleObservationsForScanSlot(uint16_t scanSlot) {
   if (bleHistoryCount == 0) return;
   size_t original = bleHistoryCount;
@@ -1716,6 +1813,7 @@ void discardBleObservationsForScanSlot(uint16_t scanSlot) {
   }
 }
 
+// Purpose: Changes the logical BLE history-retention limit without reallocating boot-time buffers.
 bool setBleRetentionLimit(size_t requestedCapacity) {
   if (requestedCapacity < MIN_BLE_HISTORY_RECORDS)
     requestedCapacity = MIN_BLE_HISTORY_RECORDS;
@@ -1730,6 +1828,7 @@ bool setBleRetentionLimit(size_t requestedCapacity) {
   return true;
 }
 
+// Purpose: Appends one compact BLE observation while enforcing the configured retention limit.
 void appendBleObservation(const BleObservation& observation) {
   if (!bleHistory || bleHistoryCapacity == 0 || bleHistoryRetentionLimit == 0)
     return;
@@ -1740,6 +1839,7 @@ void appendBleObservation(const BleObservation& observation) {
   bleHistoryCount++;
 }
 
+// Purpose: Clears retained BLE observations and resets related BLE history bookkeeping.
 void clearBleHistory() {
   bleHistoryStart = 0;
   bleHistoryCount = 0;
@@ -1755,6 +1855,7 @@ void clearBleHistory() {
     memset(bleScanMetadata, 0, bleScanMetadataCapacity * sizeof(SurveyScanMetadata));
 }
 
+// Purpose: Finds or prepares the BLE address-table lookup used to associate observations with compact identities.
 int findBleAddress(const uint8_t address[6]) {
   for (size_t i = 0; i < bleAddressCount; i++) {
     if (memcmp(bleAddressTable[i].address, address, 6) == 0) return (int)i;
@@ -1800,6 +1901,7 @@ int findOrCreateBleAddress(
   return (int)target;
 }
 
+// Purpose: Allocates compact BLE observation, address, and metadata tables within the dual-radio RAM budget.
 bool initializeCompactBleHistory(size_t budgetBytes) {
   const size_t addressCapacity = BLE_ADDRESS_TABLE_TARGET;
   const size_t scanCapacity = BLE_SCAN_METADATA_SLOTS;
@@ -1849,6 +1951,7 @@ bool initializeCompactBleHistory(size_t budgetBytes) {
   return true;
 }
 
+// Purpose: Counts distinct BLE scans still represented in retained history.
 size_t countRetainedBleScanGroups() {
   if (bleHistoryCount == 0 || bleHistory == nullptr) return 0;
   size_t groups = 0;
@@ -1865,6 +1968,7 @@ size_t countRetainedBleScanGroups() {
   return groups;
 }
 
+// Purpose: Chooses Wi-Fi/BLE RAM budgets after radio mode is known and allocates the compact history tables.
 void initializeAutoSizedHistories() {
   if (scanHistory != nullptr || bleHistory != nullptr) return;
 
@@ -1920,6 +2024,7 @@ void initializeAutoSizedHistories() {
   bleHistoryResizeMessage = "";
 }
 
+// Purpose: Tests whether the requested BLE address currently exists in retained history.
 bool bleHistoryContainsAddress(const String& address) {
   uint8_t parsed[6];
   if (!parseBleAddress(address, parsed)) return false;
@@ -1927,6 +2032,7 @@ bool bleHistoryContainsAddress(const String& address) {
   return index >= 0 && bleAddressIndexIsReferenced((size_t)index);
 }
 
+// Purpose: Returns the most recently retained advertised name for a BLE address, when available.
 String latestBleNameForAddress(const String& address) {
   uint8_t parsed[6];
   if (!parseBleAddress(address, parsed)) return "(unnamed)";
@@ -1935,6 +2041,7 @@ String latestBleNameForAddress(const String& address) {
   return bleAddressTable[index].name[0] ? String(bleAddressTable[index].name) : String("(unnamed)");
 }
 
+// Purpose: Checks whether a newer retained observation exists for the same BLE address.
 bool hasNewerBleObservationForAddress(size_t logicalIndex, const String& address) {
   for (size_t i = logicalIndex + 1; i < bleHistoryCount; i++) {
     if (String(bleHistoryRecord(i).address).equalsIgnoreCase(address)) return true;
@@ -1942,6 +2049,7 @@ bool hasNewerBleObservationForAddress(size_t logicalIndex, const String& address
   return false;
 }
 
+// Purpose: Aggregates retained observations for one BLE address into RSSI and identity summary statistics.
 bool buildBleDeviceSummary(const String& address, BLEDeviceSummary& summary) {
   summary = {};
   resetSignalStats(summary.signal);
@@ -1963,6 +2071,7 @@ bool buildBleDeviceSummary(const String& address, BLEDeviceSummary& summary) {
   return true;
 }
 
+// Purpose: Runs a BLE scan through the Arduino BLE API and stores its results in the compact BLE history.
 int performLoggedBLEScan() {
   if (!bleSurveyEnabled) {
     bleStatusMessage = "Bluetooth Survey is disabled; BLE stack is not initialized.";
@@ -1977,7 +2086,7 @@ int performLoggedBLEScan() {
   stopScanLed();
 
   bleScanCounter++;
-  lastBleScanUptimeMs = millis();
+  lastBleScanUptimeMs = surveySessionUptimeMs();
   int resultCount = results != nullptr ? results->getCount() : 0;
 
   if (!bleScanMetadata || bleScanMetadataCapacity == 0) {
@@ -2027,6 +2136,7 @@ int performLoggedBLEScan() {
   return resultCount;
 }
 
+// Purpose: Prints a string to Serial and pads it to a fixed column width for readable text tables.
 void printPadded(const String& value, int width) {
   String output = value;
 
@@ -2045,6 +2155,7 @@ void printPadded(const String& value, int width) {
 // Wi-Fi credential storage
 // ============================================================
 
+// Purpose: Stores validated infrastructure Wi-Fi credentials in NVS.
 void saveCredentials(const String& ssid, const String& password) {
   preferences.begin("wifi", false);
   preferences.putString("ssid", ssid);
@@ -2054,6 +2165,7 @@ void saveCredentials(const String& ssid, const String& password) {
   Serial.println("Wi-Fi credentials saved.");
 }
 
+// Purpose: Loads saved infrastructure Wi-Fi credentials from NVS when present.
 bool loadCredentials(String& ssid, String& password) {
   preferences.begin("wifi", true);
 
@@ -2065,6 +2177,7 @@ bool loadCredentials(String& ssid, String& password) {
   return ssid.length() > 0;
 }
 
+// Purpose: Deletes saved infrastructure Wi-Fi credentials from NVS.
 void eraseCredentials() {
   preferences.begin("wifi", false);
   preferences.clear();
@@ -2078,6 +2191,7 @@ void eraseCredentials() {
 // Uptime
 // ============================================================
 
+// Purpose: Formats a millisecond duration as a compact human-readable uptime string.
 String formatUptime(uint32_t uptimeMs) {
   unsigned long totalSeconds = uptimeMs / 1000;
 
@@ -2111,6 +2225,7 @@ String formatUptime(uint32_t uptimeMs) {
   return result;
 }
 
+// Purpose: Returns the current raw boot uptime as a human-readable string.
 String getUptimeString() {
   return formatUptime(millis());
 }
@@ -2123,16 +2238,26 @@ String retainedWindowLabel(
   return formatUptime(newestMs - oldestMs);
 }
 
+// Purpose: Converts a survey-session timestamp into a relative age such as seconds, minutes, or hours ago.
 String observationAgeLabel(uint32_t observationMs) {
-  uint32_t now = millis();
+  uint32_t now = surveySessionUptimeMs();
   if (now < observationMs) return "counter wrapped";
   return formatUptime(now - observationMs) + " ago";
 }
 
+// Purpose: Converts a raw boot-runtime timestamp into a relative age for scheduler diagnostics.
+String runtimeAgeLabel(uint32_t runtimeMs) {
+  uint32_t now = millis();
+  if (now < runtimeMs) return "counter wrapped";
+  return formatUptime(now - runtimeMs) + " ago";
+}
+
+// Purpose: Marks the current web request as an explicit user action so automatic scans can briefly yield afterward.
 void markExplicitUserInteraction() {
   explicitUserInteractionHandled = true;
 }
 
+// Purpose: Starts the post-request defer window used to prioritize immediate user interactions over new automatic scans.
 void armUserInteractionDeferAfterWebService() {
   if (!explicitUserInteractionHandled) return;
   explicitUserInteractionHandled = false;
@@ -2140,16 +2265,19 @@ void armUserInteractionDeferAfterWebService() {
   userInteractionDeferArmed = true;
 }
 
+// Purpose: Returns whether the short user-interaction defer window is currently active.
 bool userInteractionDeferActive() {
   if (!userInteractionDeferArmed) return false;
   return (uint32_t)(millis() - userInteractionDeferStartedMs) < USER_INTERACTION_DEFER_MS;
 }
 
+// Purpose: Formats a duration in milliseconds using an appropriate human-readable unit.
 String millisecondsLabel(uint32_t durationMs) {
   if (durationMs < 1000) return String(durationMs) + " ms";
   return String(durationMs / 1000.0f, 2) + " s";
 }
 
+// Purpose: Builds the last/average/min/max successful Wi-Fi scan-duration summary.
 String wifiScanDurationSummaryLabel() {
   if (wifiScanDurationCount == 0) return "No completed scan timing yet";
   return "last " + millisecondsLabel(wifiLastScanDurationMs) +
@@ -2158,12 +2286,14 @@ String wifiScanDurationSummaryLabel() {
          "; max " + millisecondsLabel(wifiMaxScanDurationMs);
 }
 
+// Purpose: Calculates and formats CSV streaming throughput from bytes and elapsed time.
 String csvThroughputLabel(size_t bytes, uint32_t durationMs) {
   if (durationMs == 0) return "n/a";
   float kibPerSecond = ((float)bytes / 1024.0f) / ((float)durationMs / 1000.0f);
   return String(kibPerSecond, 1) + " KB/s";
 }
 
+// Purpose: Builds the row/size/duration/throughput summary for the most recent CSV export.
 String csvExportSummaryLabel(size_t rows, size_t bytes, uint32_t durationMs) {
   return String(rows) + " rows; " +
          String(bytes / 1024.0f, 1) + " KB; " +
@@ -2171,6 +2301,7 @@ String csvExportSummaryLabel(size_t rows, size_t bytes, uint32_t durationMs) {
          csvThroughputLabel(bytes, durationMs);
 }
 
+// Purpose: Determines whether automatic Wi-Fi scanning is later than expected after allowing for scan and interaction timing.
 bool wifiAutoScanCadenceOverdue() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
@@ -2187,6 +2318,7 @@ bool wifiAutoScanCadenceOverdue() {
   return schedulerAgeMs > intervalMs + WIFI_AUTOSCAN_DIAG_GRACE_MS;
 }
 
+// Purpose: Builds the human-readable automatic Wi-Fi scan health/status message.
 String wifiAutoScanDiagnosticLabel() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
@@ -2224,20 +2356,23 @@ String wifiAutoScanDiagnosticLabel() {
   return "WARN - scan overdue; automatic scan not in progress";
 }
 
+// Purpose: Formats the relative runtime age of the last automatic Wi-Fi scan start.
 String wifiAutoScanLastStartLabel() {
   if (wifiAutoScanStartCount == 0) return "Never";
-  return observationAgeLabel(lastWifiAutoScanStartMs);
+  return runtimeAgeLabel(lastWifiAutoScanStartMs);
 }
 
+// Purpose: Formats the relative runtime age of the last automatic Wi-Fi scan completion.
 String wifiAutoScanLastCompletionLabel() {
   if (wifiAutoScanCompletionCount == 0) return "Never";
-  return observationAgeLabel(lastWifiAutoScanCompletionMs);
+  return runtimeAgeLabel(lastWifiAutoScanCompletionMs);
 }
 
 // ============================================================
 // Wi-Fi connection
 // ============================================================
 
+// Purpose: Attempts infrastructure Wi-Fi connection with supplied credentials while preserving survey operation.
 bool connectToWiFi(const String& ssid, const String& password) {
   Serial.println();
   Serial.print("Connecting to ");
@@ -2282,6 +2417,7 @@ bool connectToWiFi(const String& ssid, const String& password) {
   return true;
 }
 
+// Purpose: Loads and attempts connection using saved infrastructure Wi-Fi credentials.
 bool connectUsingSavedCredentials() {
   String ssid;
   String password;
@@ -2298,6 +2434,7 @@ bool connectUsingSavedCredentials() {
 }
 
 
+// Purpose: Legacy reconnect decision hook; native ESP32 auto-reconnect is preferred in the current design.
 void considerInfrastructureReconnectAfterScan(int networkCount) {
   if (WiFi.status() == WL_CONNECTED || networkCount <= 0) {
     if (WiFi.status() == WL_CONNECTED) infrastructureReconnectPending = false;
@@ -2332,6 +2469,7 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
 }
 
 
+// Purpose: Services application-side infrastructure reconnect state when such a retry has been explicitly armed.
 void serviceInfrastructureReconnect() {
   if (WiFi.status() == WL_CONNECTED) {
     infrastructureReconnectPending = false;
@@ -2401,6 +2539,7 @@ void serviceInfrastructureReconnect() {
 // Informational Wi-Fi scan
 // ============================================================
 
+// Purpose: Runs the interactive/serial Wi-Fi scan presentation path.
 void scanNetworks() {
   Serial.println();
   Serial.println("Scanning for Wi-Fi networks...");
@@ -2453,6 +2592,7 @@ void scanNetworks() {
 // Interactive Wi-Fi configuration
 // ============================================================
 
+// Purpose: Initializes station/AP Wi-Fi operation and attempts optional infrastructure connectivity.
 void configureWiFi() {
   while (true) {
     Serial.println();
@@ -2559,6 +2699,7 @@ void configureWiFi() {
 // Status display
 // ============================================================
 
+// Purpose: Prints current infrastructure and Device AP Wi-Fi state to Serial.
 void printWiFiStatus() {
   ensureWiFiStationMode();
 
@@ -2627,6 +2768,7 @@ void printWiFiStatus() {
   Serial.println();
 }
 
+// Purpose: Prints the ESP32 Wi-Fi MAC identities to Serial.
 void printMacAddress() {
   ensureWiFiStationMode();
 
@@ -2641,10 +2783,12 @@ void printMacAddress() {
 // Firmware information
 // ============================================================
 
+// Purpose: Returns the compile date/time string for the running firmware build.
 String firmwareBuildTimestamp() {
   return String(__DATE__) + " " + String(__TIME__);
 }
 
+// Purpose: Prints firmware identity, core/IDF, chip, memory, and related build information to Serial.
 void printFirmwareInfo() {
   Serial.println();
   Serial.println("================================");
@@ -2666,6 +2810,7 @@ void printFirmwareInfo() {
 
 // ============================================================
 
+// Purpose: Escapes text before inserting it into HTML so data cannot accidentally break page markup.
 String htmlEscape(const String& input) {
   String output = input;
   output.replace("&", "&amp;");
@@ -2676,6 +2821,7 @@ String htmlEscape(const String& input) {
   return output;
 }
 
+// Purpose: Percent-encodes text before placing it in URL query parameters.
 String urlEncode(const String& input) {
   const char* hex = "0123456789ABCDEF";
   String output;
@@ -2705,6 +2851,7 @@ String urlEncode(const String& input) {
   return output;
 }
 
+// Purpose: Returns the latest retained SSID associated with a specific BSSID.
 String latestSSIDForBSSID(const String& bssid) {
   for (size_t offset = 0; offset < historyCount; offset++) {
     size_t logicalIndex = historyCount - 1 - offset;
@@ -2722,6 +2869,7 @@ String latestSSIDForBSSID(const String& bssid) {
   return "";
 }
 
+// Purpose: Checks whether a BSSID is represented anywhere in retained Wi-Fi history.
 bool historyContainsBSSID(const String& bssid) {
   if (bssid.length() == 0) {
     return false;
@@ -2736,6 +2884,7 @@ bool historyContainsBSSID(const String& bssid) {
   return false;
 }
 
+// Purpose: Returns the shared CSS used by all web-interface pages, including V34 view-depth visibility rules.
 String pageStyles() {
   return R"rawliteral(
 <style>
@@ -3059,13 +3208,28 @@ String pageStyles() {
     font-size: 0.9em;
   }
 
+  .sticky-interface-card {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card-bg);
+  }
+
   .site-header {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    margin-bottom: 14px;
+    margin-bottom: 10px;
+  }
+
+  #rssi-plot {
+    scroll-margin-top: 150px;
   }
 
   .site-title {
@@ -3210,6 +3374,25 @@ String pageStyles() {
     color: #777;
   }
 
+  /* V34 view-depth model: Standard < Advanced < Developer. */
+  .advanced-only, .developer-only { display: none !important; }
+  html[data-view="advanced"] div.advanced-only,
+  html[data-view="developer"] div.advanced-only,
+  html[data-view="developer"] div.developer-only { display: block !important; }
+  html[data-view="advanced"] .row.advanced-only,
+  html[data-view="developer"] .row.advanced-only,
+  html[data-view="developer"] .row.developer-only { display: flex !important; }
+  html[data-view="advanced"] form.advanced-only,
+  html[data-view="developer"] form.advanced-only,
+  html[data-view="developer"] form.developer-only { display: flex !important; }
+  html[data-view="advanced"] tr.advanced-only,
+  html[data-view="developer"] tr.advanced-only,
+  html[data-view="developer"] tr.developer-only { display: table-row !important; }
+  html[data-view="advanced"] th.advanced-only, html[data-view="advanced"] td.advanced-only,
+  html[data-view="developer"] th.advanced-only, html[data-view="developer"] td.advanced-only,
+  html[data-view="developer"] th.developer-only, html[data-view="developer"] td.developer-only { display: table-cell !important; }
+  .status-neutral { font-weight: bold; }
+
   @media (max-width: 600px) {
     table {
       font-size: 0.9em;
@@ -3228,12 +3411,14 @@ String pageStyles() {
 // Web Wi-Fi scan page and logger controls
 // ============================================================
 
+// Purpose: Quotes and escapes a value for safe CSV output.
 String csvEscape(const String& input) {
   String output = input;
   output.replace("\"", "\"\"");
   return "\"" + output + "\"";
 }
 
+// Purpose: Appends CSV text to a streaming buffer and flushes when the buffer reaches its target size.
 void appendCsvBuffered(String& buffer, const String& text, size_t& bytesSent) {
   if (buffer.length() > 0 && buffer.length() + text.length() > CSV_STREAM_BUFFER_BYTES) {
     size_t pendingBytes = buffer.length();
@@ -3251,6 +3436,7 @@ void appendCsvBuffered(String& buffer, const String& text, size_t& bytesSent) {
   buffer += text;
 }
 
+// Purpose: Sends any pending CSV buffer content to the HTTP client and resets the buffer.
 void flushCsvBuffer(String& buffer, size_t& bytesSent) {
   if (buffer.length() == 0) return;
   size_t pendingBytes = buffer.length();
@@ -3259,6 +3445,7 @@ void flushCsvBuffer(String& buffer, size_t& bytesSent) {
   buffer.remove(0);
 }
 
+// Purpose: Escapes dynamic text before embedding it inside generated JavaScript string literals.
 String jsEscape(String input) {
   input.replace("\\", "\\\\");
   input.replace("'", "\\'");
@@ -3267,11 +3454,13 @@ String jsEscape(String input) {
   return input;
 }
 
+// Purpose: Sends an HTTP redirect back to the Wi-Fi Survey page.
 void redirectToScanPage() {
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", "");
 }
 
+// Purpose: Returns compact JSON describing current Wi-Fi scan activity for browser polling.
 void handleWifiScanStatus() {
   String json = "{\"scan\":" + String(scanCounter) +
                 ",\"records\":" + String(historyCount) +
@@ -3291,6 +3480,7 @@ void handleWifiScanStatus() {
   server.send(200, "application/json", json);
 }
 
+// Purpose: HTTP endpoint that requests an immediate asynchronous Wi-Fi scan.
 void handleWebScanNow() {
   markExplicitUserInteraction();
   bool started = beginLoggedWifiScan(false, false);
@@ -3304,6 +3494,7 @@ void handleWebScanNow() {
     ",\"message\":\"" + jsEscape(wifiScanStatusMessage) + "\"}");
 }
 
+// Purpose: HTTP endpoint that persists the global Live Updates checkbox state.
 void handleLiveUpdatesSetting() {
   markExplicitUserInteraction();
   if (!server.hasArg("enabled")) {
@@ -3317,6 +3508,7 @@ void handleLiveUpdatesSetting() {
     String("{\"enabled\":") + (enabled ? "true" : "false") + "}");
 }
 
+// Purpose: Validates, applies, and persists a Wi-Fi scan interval supplied by an HTTP request.
 bool applyWifiScanIntervalFromRequest() {
   if (!server.hasArg("interval")) return false;
 
@@ -3336,12 +3528,14 @@ bool applyWifiScanIntervalFromRequest() {
   return true;
 }
 
+// Purpose: Legacy Wi-Fi settings endpoint that applies the interval and redirects to the survey page.
 void handleScanSettings() {
   markExplicitUserInteraction();
   applyWifiScanIntervalFromRequest();
   redirectToScanPage();
 }
 
+// Purpose: JSON endpoint used by the Wi-Fi page to save scan interval without reloading the page.
 void handleWifiIntervalSetting() {
   markExplicitUserInteraction();
   bool accepted = applyWifiScanIntervalFromRequest();
@@ -3359,12 +3553,14 @@ void handleWifiIntervalSetting() {
   );
 }
 
+// Purpose: Clears Wi-Fi history and redirects back to the Wi-Fi Survey page.
 void handleClearScanHistory() {
   markExplicitUserInteraction();
   clearScanHistory();
   redirectToScanPage();
 }
 
+// Purpose: Streams retained Wi-Fi observations as CSV while pausing new automatic scan starts during export.
 void handleScanCsv() {
   markExplicitUserInteraction();
   csvExportInProgress = true;
@@ -3431,6 +3627,7 @@ void handleScanCsv() {
   csvExportInProgress = false;
 }
 
+// Purpose: Generates and streams the SVG RSSI history plot for one selected Wi-Fi BSSID.
 void sendRssiHistoryPlot(const String& selectedBssid) {
   const int SVG_WIDTH = 720;
   const int SVG_HEIGHT = 280;
@@ -3659,6 +3856,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 }
 
 
+// Purpose: Finds an AP-table slot by matching a textual BSSID.
 int findWifiApByTextBssid(const String& bssid) {
   char textBssid[18];
 
@@ -3739,11 +3937,10 @@ bool buildNetworkSummary(
   return buildNetworkSummaryByApIndex((uint16_t)apIndex, summary);
 }
 
+// Purpose: Streams the sortable Observed Networks table with columns progressively exposed by view depth.
 void sendNetworkSummaryTable() {
   if (historyCount == 0) {
-    server.sendContent(
-      "<p>No networks have been observed yet.</p>"
-    );
+    server.sendContent("<p>No networks have been observed yet.</p>");
     return;
   }
 
@@ -3751,160 +3948,66 @@ void sendNetworkSummaryTable() {
     "<div class=\"table-scroll\"><table id=\"network-summary\">"
     "<thead><tr>"
     "<th class=\"sortable\" onclick=\"sortTable('network-summary',0,'text')\">SSID</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('network-summary',1,'text')\">BSSID</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',2,'number')\">CH</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',3,'number')\">Latest</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',4,'number')\">Min</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',5,'number')\">Max</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',6,'number')\">Avg</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',7,'number')\">Samples</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('network-summary',8,'text')\">Security</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('network-summary',9,'number')\">First Seen</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('network-summary',10,'number')\">Last Seen</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',1,'number')\">CH</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',2,'number')\">Last</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',3,'number')\">Avg</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('network-summary',4,'number')\">Count</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('network-summary',5,'number')\">Last Seen</th>"
+    "<th class=\"sortable signal advanced-only\" onclick=\"sortTable('network-summary',6,'number')\">Min</th>"
+    "<th class=\"sortable signal advanced-only\" onclick=\"sortTable('network-summary',7,'number')\">Max</th>"
+    "<th class=\"sortable developer-only\" onclick=\"sortTable('network-summary',8,'text')\">BSSID</th>"
+    "<th class=\"sortable developer-only\" onclick=\"sortTable('network-summary',9,'text')\">Security</th>"
+    "<th class=\"sortable developer-only\" onclick=\"sortTable('network-summary',10,'number')\">First Seen</th>"
     "</tr></thead><tbody>"
   );
 
-  // Iterate newest -> oldest and use the compact observation's AP index as
-  // the deduplication key. This removes the former O(n^2) "is there a newer
-  // BSSID?" history search while keeping newest-observed row ordering.
-  bool emittedAp[256] = {};
+  // Walk newest-to-oldest and emit each AP once. The compact observation's
+  // AP index is the deduplication key, preserving the V32d linear-time path.
+  bool emittedAp[512] = {};
   String tableBuffer;
   tableBuffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
 
-  for (
-    size_t offset = 0;
-    offset < historyCount;
-    offset++
-  ) {
-    size_t logicalIndex =
-        historyCount - 1 - offset;
-
-    const WifiObservation& latestObservation =
-        compactHistoryRecord(logicalIndex);
+  for (size_t offset = 0; offset < historyCount; offset++) {
+    size_t logicalIndex = historyCount - 1 - offset;
+    const WifiObservation& latestObservation = compactHistoryRecord(logicalIndex);
     uint16_t apIndex = latestObservation.apIndex;
 
-    if (apIndex >= wifiApCount || apIndex >= 256) continue;
+    if (apIndex >= wifiApCount || apIndex >= 512) continue;
     if (emittedAp[apIndex]) continue;
     emittedAp[apIndex] = true;
 
     NetworkSummary summary = {};
+    if (!buildNetworkSummaryByApIndex(apIndex, summary)) continue;
 
-    if (!buildNetworkSummaryByApIndex(apIndex, summary)) {
-      continue;
-    }
-
-    String plotUrl =
-        "/scan?plot=" +
-        urlEncode(String(summary.bssid)) +
-        "#rssi-plot";
-
-    String displaySSID =
-        summary.hidden
-          ? "(hidden)"
-          : String(summary.ssid);
-
-    float avgRssi =
-        averageSignal(summary.signal);
+    String plotUrl = "/scan?plot=" + urlEncode(String(summary.bssid)) + "#rssi-plot";
+    String displaySSID = summary.hidden ? "(hidden)" : String(summary.ssid);
+    float avgRssi = averageSignal(summary.signal);
+    uint32_t nowMs = surveySessionUptimeMs();
+    uint32_t firstAgeMs = nowMs >= summary.signal.firstSeenMs ? nowMs - summary.signal.firstSeenMs : 0;
+    uint32_t lastAgeMs = nowMs >= summary.signal.lastSeenMs ? nowMs - summary.signal.lastSeenMs : 0;
 
     String row;
-    row.reserve(900);
-
-    if (summary.connected) {
-      row += "<tr class=\"current\">";
-    } else {
-      row += "<tr>";
-    }
-
-    row += "<td class=\"address\"><a href=\"";
-    row += plotUrl;
-    row += "\">";
-    row += htmlEscape(displaySSID);
-
-    if (summary.connected) {
-      row += " (connected)";
-    }
-
+    row.reserve(950);
+    row += summary.connected ? "<tr class=\"current\">" : "<tr>";
+    row += "<td class=\"address\"><a href=\"" + plotUrl + "\">" + htmlEscape(displaySSID);
+    if (summary.connected) row += " (connected)";
     row += "</a></td>";
-
-    row += "<td><a href=\"";
-    row += plotUrl;
-    row += "\">";
-    row += htmlEscape(String(summary.bssid));
-    row += "</a></td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.channel);
-    row += "\">";
-    row += String(summary.channel);
-    row += "</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.latestRssi);
-    row += "\">";
-    row += String(summary.signal.latestRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.minRssi);
-    row += "\">";
-    row += String(summary.signal.minRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.maxRssi);
-    row += "\">";
-    row += String(summary.signal.maxRssi);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(avgRssi, 1);
-    row += "\">";
-    row += String(avgRssi, 1);
-    row += " dBm</td>";
-
-    row += "<td class=\"signal\" data-sort=\"";
-    row += String(summary.signal.samples);
-    row += "\">";
-    row += String(summary.signal.samples);
-    row += "</td>";
-
-    row += "<td>";
-    row += htmlEscape(
-      securityLabel(
-        (wifi_auth_mode_t)summary.authMode
-      )
-    );
-    row += "</td>";
-
-    // Sort by age (smaller = more recent) while displaying relative time.
-    uint32_t nowMs = millis();
-    uint32_t firstAgeMs = nowMs >= summary.signal.firstSeenMs
-        ? nowMs - summary.signal.firstSeenMs : 0;
-    uint32_t lastAgeMs = nowMs >= summary.signal.lastSeenMs
-        ? nowMs - summary.signal.lastSeenMs : 0;
-
-    row += "<td data-sort=\"";
-    row += String(firstAgeMs);
-    row += "\">";
-    row += htmlEscape(observationAgeLabel(summary.signal.firstSeenMs));
-    row += "</td>";
-
-    row += "<td data-sort=\"";
-    row += String(lastAgeMs);
-    row += "\">";
-    row += htmlEscape(observationAgeLabel(summary.signal.lastSeenMs));
-    row += "</td>";
-
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.channel) + "\">" + String(summary.channel) + "</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
+    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.samples) + "\">" + String(summary.signal.samples) + "</td>";
+    row += "<td data-sort=\"" + String(lastAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.lastSeenMs)) + "</td>";
+    row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
+    row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
+    row += "<td class=\"developer-only\"><a href=\"" + plotUrl + "\">" + htmlEscape(String(summary.bssid)) + "</a></td>";
+    row += "<td class=\"developer-only\">" + htmlEscape(securityLabel((wifi_auth_mode_t)summary.authMode)) + "</td>";
+    row += "<td class=\"developer-only\" data-sort=\"" + String(firstAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.firstSeenMs)) + "</td>";
     row += "</tr>";
 
-    if (
-      tableBuffer.length() > 0 &&
-      tableBuffer.length() + row.length() > CSV_STREAM_BUFFER_BYTES
-    ) {
+    if (tableBuffer.length() > 0 && tableBuffer.length() + row.length() > CSV_STREAM_BUFFER_BYTES) {
       server.sendContent(tableBuffer);
       tableBuffer = "";
     }
-
     tableBuffer += row;
   }
 
@@ -3914,6 +4017,7 @@ void sendNetworkSummaryTable() {
 
 void sendThemeControl();
 
+// Purpose: Returns early JavaScript that applies the saved theme/view before the page renders, reducing visual flash.
 String themeBootstrapScript() {
   return
     "<script>"
@@ -3925,24 +4029,28 @@ String themeBootstrapScript() {
           ":(v==='dark');"
         "document.documentElement.dataset.theme=d?'dark':'light';"
         "var w=localStorage.getItem('esp32-view')||'standard';"
-        "document.documentElement.dataset.view=(w==='advanced')?'advanced':'standard';"
+        "w=(w==='developer'||w==='advanced')?w:'standard';"
+        "document.documentElement.dataset.view=w;"
       "}catch(e){}"
     "})();"
     "</script>";
 }
 
+// Purpose: Streams the theme/view bootstrap JavaScript into the current page.
 void sendThemeBootstrapScript() {
   server.sendContent(themeBootstrapScript());
 }
 
+// Purpose: Returns the HTML class attribute used to highlight the active top-level navigation item.
 String activeNavClass(const String& active, const char* item) {
   return active == item ? " class=\"active\"" : "";
 }
 
+// Purpose: Streams the common site header, navigation links, Live Updates control, and view/theme controls.
 void sendSiteNavigation(const String& active) {
   String nav;
-  nav.reserve(1300);
-  nav += "<div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><div class=\"header-actions\"><nav class=\"nav\">";
+  nav.reserve(1400);
+  nav += "<div class=\"sticky-interface-card\"><div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><div class=\"header-actions\"><nav class=\"nav\">";
   nav += "<a href=\"/\"" + activeNavClass(active, "wifi") + ">Wi-Fi</a>";
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
@@ -3952,6 +4060,7 @@ void sendSiteNavigation(const String& active) {
   nav += "> Live updates</label></div></div>";
   server.sendContent(nav);
   sendThemeControl();
+  server.sendContent("</div>");
   server.sendContent(
     "<script>(function(){"
     "const c=document.getElementById('live-updates-toggle');if(!c)return;"
@@ -3964,6 +4073,7 @@ void sendSiteNavigation(const String& active) {
   );
 }
 
+// Purpose: Streams the Standard/Advanced/Developer view selector and System/Light/Dark theme selector.
 void sendThemeControl() {
   server.sendContent(
     "<div class=\"interface-controls\">"
@@ -3972,6 +4082,7 @@ void sendThemeControl() {
     "<select id=\"view-select\" class=\"view-select\" onchange=\"setViewMode(this.value)\">"
     "<option value=\"standard\">Standard</option>"
     "<option value=\"advanced\">Advanced</option>"
+    "<option value=\"developer\">Developer</option>"
     "</select></div>"
     "<div class=\"theme-control\">"
     "<label for=\"theme-select\">Theme</label>"
@@ -3983,6 +4094,7 @@ void sendThemeControl() {
   );
 }
 
+// Purpose: Streams browser-side JavaScript for changing and persisting theme/view selections.
 void sendThemeScript() {
   server.sendContent(
     "<script>"
@@ -3998,22 +4110,21 @@ void sendThemeScript() {
       "applyTheme(v);"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
     "}"
-    "function applyViewMode(v,force){"
-      "v=(v==='advanced')?'advanced':'standard';"
+    "function applyViewMode(v){"
+      "v=(v==='developer'||v==='advanced')?v:'standard';"
       "document.documentElement.dataset.view=v;"
       "document.querySelectorAll('.view-select').forEach(s=>s.value=v);"
-      "if(force){document.querySelectorAll('details.diagnostic-details').forEach(d=>d.open=(v==='advanced'));}"
     "}"
     "function setViewMode(v){"
-      "v=(v==='advanced')?'advanced':'standard';"
+      "v=(v==='developer'||v==='advanced')?v:'standard';"
       "localStorage.setItem('esp32-view',v);"
-      "applyViewMode(v,true);"
+      "applyViewMode(v);"
     "}"
     "document.addEventListener('DOMContentLoaded',()=>{"
       "const v=localStorage.getItem('esp32-theme')||'system';"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
       "const w=localStorage.getItem('esp32-view')||'standard';"
-      "applyViewMode(w,true);"
+      "applyViewMode(w);"
       "if(window.matchMedia){"
         "window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{"
           "if((localStorage.getItem('esp32-theme')||'system')==='system')applyTheme('system');"
@@ -4024,6 +4135,7 @@ void sendThemeScript() {
   );
 }
 
+// Purpose: Streams the generic client-side table sorting function used by Wi-Fi and BLE result tables.
 void sendSortableTableScript() {
   server.sendContent(
     "<script>"
@@ -4069,12 +4181,14 @@ struct ChannelAnalysis {
 // emitting this custom return type before ChannelAnalysis is declared.
 ChannelAnalysis analyzeLatestWifiScan();
 
+// Purpose: Converts RSSI into a relative interference weight for channel scoring.
 float rssiInterferenceWeight(int rssi) {
   if (rssi <= -100) return 0.0f;
   if (rssi >= -30) return 100.0f;
   return (float)(rssi + 100) * (100.0f / 70.0f);
 }
 
+// Purpose: Returns the weighting applied to interference from an AP a given number of channels away.
 float channelOverlapFactor(int distance) {
   if (distance == 0) return 1.0f;
   if (distance == 1) return 0.75f;
@@ -4084,6 +4198,7 @@ float channelOverlapFactor(int distance) {
   return 0.0f;
 }
 
+// Purpose: Analyzes the latest retained Wi-Fi scan and computes per-channel observed-interference scores.
 ChannelAnalysis analyzeLatestWifiScan() {
   ChannelAnalysis a = {};
   a.suggestedChannel = 0;
@@ -4116,30 +4231,32 @@ ChannelAnalysis analyzeLatestWifiScan() {
   return a;
 }
 
+// Purpose: Streams the channel recommendation and, in deeper views, the detailed interference table.
 void sendWifiChannelAnalysis() {
   ChannelAnalysis a = analyzeLatestWifiScan();
-  server.sendContent("<div class=\"card\"><h2>2.4 GHz Observed Channel Interference</h2>");
+  server.sendContent("<div class=\"card\"><h2>Observed Channel Interference</h2>");
   if (!a.valid) {
-    server.sendContent("<p>No scan data is available yet.</p><div class=\"note\">This is an estimate based on observed AP presence and RSSI, not measured airtime utilization or traffic load.</div></div>");
+    server.sendContent("<p>No retained Wi-Fi scan is available for channel analysis yet.</p></div>");
     return;
   }
-  String s;
-  s.reserve(2600);
-  s += "<div class=\"row\"><span class=\"label\">Based On</span><span class=\"value\">Latest scan #" + String(a.scanNumber) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Suggested Channel Based on Observed APs</span><span class=\"value\"><strong>" + String(a.suggestedChannel) + "</strong></span></div>";
-  s += "<div class=\"note\">This estimate compares channels 1, 6, and 11 using visible AP strength plus co-channel and adjacent-channel overlap. Lower score is preferred. It is based only on observed AP presence and RSSI; it does not measure airtime utilization, traffic load, noise floor, retransmissions, or non-Wi-Fi interference.</div>";
-  s += "<div class=\"table-scroll\"><table><thead><tr><th>Channel</th><th>APs</th><th>Strongest AP</th><th>Co-channel</th><th>Adjacent</th><th>Total score</th></tr></thead><tbody>";
-  for (int ch = 1; ch <= 11; ch++) {
-    s += "<tr";
-    if (ch == a.suggestedChannel) s += " class=\"current\"";
-    s += "><td>" + String(ch) + "</td><td>" + String(a.apCount[ch]) + "</td><td>";
-    s += a.strongestRssi[ch] == -127 ? "-" : String(a.strongestRssi[ch]) + " dBm";
-    s += "</td><td>" + String(a.coChannelScore[ch], 1) + "</td><td>" + String(a.adjacentScore[ch], 1) + "</td><td>" + String(a.totalScore[ch], 1) + "</td></tr>";
+  server.sendContent("<div class=\"row\"><span class=\"label\">Suggested Channel</span><span class=\"value\"><strong>" + String(a.suggestedChannel) + "</strong></span></div>"
+    "<div class=\"note\">Suggestion is based on currently observed 2.4 GHz Wi-Fi interference.</div>");
+  String detail = "<div class=\"advanced-only\"><div class=\"row\"><span class=\"label\">Based On</span><span class=\"value\">Latest scan #" + String(a.scanNumber) + "</span></div>"
+    "<div class=\"note\">This estimate compares visible AP strength plus co-channel and adjacent-channel overlap. Lower score is preferred. It does not measure airtime utilization, traffic load, noise floor, retransmissions, or non-Wi-Fi interference.</div>"
+    "<div class=\"table-scroll\"><table><thead><tr><th>Channel</th><th>APs</th><th>Strongest AP</th><th>Co-channel</th><th>Adjacent</th><th>Total score</th></tr></thead><tbody>";
+  server.sendContent(detail);
+  for (int ch=1; ch<=11; ch++) {
+    String row = "<tr";
+    if (ch == a.suggestedChannel) row += " class=\"current\"";
+    row += "><td>" + String(ch) + "</td><td>" + String(a.apCount[ch]) + "</td><td>";
+    row += a.strongestRssi[ch] == -127 ? "-" : String(a.strongestRssi[ch]) + " dBm";
+    row += "</td><td>" + String(a.coChannelScore[ch],1) + "</td><td>" + String(a.adjacentScore[ch],1) + "</td><td>" + String(a.totalScore[ch],1) + "</td></tr>";
+    server.sendContent(row);
   }
-  s += "</tbody></table></div></div>";
-  server.sendContent(s);
+  server.sendContent("</tbody></table></div></div></div>");
 }
 
+// Purpose: Builds the Wi-Fi Survey page using the V34 information hierarchy and progressive view-depth content.
 void handleWebScan() {
   markExplicitUserInteraction();
   ensureWiFiStationMode();
@@ -4148,292 +4265,114 @@ void handleWebScan() {
   String connectedSSID = connected ? WiFi.SSID() : "";
   String connectedBSSID = connected ? WiFi.BSSIDstr() : "";
   int connectedRSSI = connected ? WiFi.RSSI() : 0;
-
   String selectedBSSID = "";
 
   if (server.hasArg("plot")) {
     String requestedBSSID = server.arg("plot");
     requestedBSSID.trim();
-
-    if (historyContainsBSSID(requestedBSSID)) {
-      selectedBSSID = requestedBSSID;
-    }
+    if (historyContainsBSSID(requestedBSSID)) selectedBSSID = requestedBSSID;
   }
+  if (selectedBSSID.length() == 0 && connected && historyContainsBSSID(connectedBSSID)) selectedBSSID = connectedBSSID;
+  if (selectedBSSID.length() == 0 && historyCount > 0) selectedBSSID = String(historyRecord(historyCount - 1).bssid);
 
-  // Default to the currently connected infrastructure AP when its BSSID
-  // is present in scan history.
-  if (
-    selectedBSSID.length() == 0 &&
-    connected &&
-    historyContainsBSSID(connectedBSSID)
-  ) {
-    selectedBSSID = connectedBSSID;
-  }
-
-  // In AP-only operation, or before the connected AP has appeared in a
-  // logged scan, default to the newest retained network observation.
-  if (
-    selectedBSSID.length() == 0 &&
-    historyCount > 0
-  ) {
-    selectedBSSID =
-        String(historyRecord(historyCount - 1).bssid);
-  }
-
-  String selectedSSID =
-      latestSSIDForBSSID(selectedBSSID);
-
+  String selectedSSID = latestSSIDForBSSID(selectedBSSID);
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-
-  server.sendContent(
-    "<!DOCTYPE html><html><head>"
-    "<meta charset=\"UTF-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    "<title>ESP32 Wi-Fi Survey</title>"
-  );
-
+  server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wi-Fi Survey</title>");
   sendThemeBootstrapScript();
   server.sendContent(pageStyles());
-
-  server.sendContent(
-    "</head><body><div class=\"container\">"
-  );
-
+  server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("wifi");
+  server.sendContent("<h1>Wi-Fi Survey</h1>");
 
-  server.sendContent(
-    "<h1>Wi-Fi Survey</h1>"
-  );
-
-  if (connected) {
-    String connectedCard;
-    connectedCard.reserve(550);
-
-    connectedCard +=
-      "<div class=\"card\">"
-      "<div class=\"row\"><span class=\"label\">Connected SSID</span>"
-      "<span class=\"value\">";
-    connectedCard += htmlEscape(connectedSSID);
-    connectedCard +=
-      "</span></div>"
-      "<div class=\"row\"><span class=\"label\">Connected BSSID</span>"
-      "<span class=\"value\">";
-    connectedCard += htmlEscape(connectedBSSID);
-    connectedCard +=
-      "</span></div>"
-      "<div class=\"row\"><span class=\"label\">Current Signal</span>"
-      "<span class=\"value\">";
-    connectedCard += String(connectedRSSI);
-    connectedCard +=
-      " dBm</span></div>"
-      "</div>";
-
-    server.sendContent(connectedCard);
-  }
-
-  String loggingCard;
-  loggingCard.reserve(1800);
-
-  loggingCard +=
-    "<div class=\"card\"><h2>Survey Controls</h2>"
-    "<div class=\"row\"><span class=\"label\">Surveying</span>"
-    "<span class=\"value\">Always on</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scans This Session</span>"
-    "<span class=\"value\">";
-  loggingCard += String(scanCounter);
-  loggingCard +=
-    "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Stored Observations</span>"
-    "<span class=\"value\">";
-  loggingCard += String(historyCount);
-  loggingCard += " / ";
-  loggingCard += String(scanHistoryCapacity);
-  loggingCard +=
-    " capacity</span></div>"
-    "<div class=\"row\"><span class=\"label\">Last Scan</span>"
-    "<span class=\"value\">";
-
-  if (scanCounter == 0) {
-    loggingCard += "Never";
-  } else {
-    loggingCard += htmlEscape(observationAgeLabel(lastScanUptimeMs));
-  }
-
-  loggingCard +=
-    "</span></div>"
-    "<div class=\"survey-control-row\">"
-    "<div class=\"control\"><label for=\"interval\">Scan interval (seconds)</label>"
-    "<input id=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"";
-  loggingCard += String(scanIntervalSeconds);
-  loggingCard +=
-    "\"></div>"
-    "<span id=\"interval-save-state\" class=\"save-state\"></span>"
-    "</div>"
-    "<div class=\"buttons\">"
-    "<button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button>"
-    "<a class=\"button\" href=\"/scanlog.csv\">Download CSV</a>"
-    "<a class=\"button\" href=\"/scan-clear\">Clear History</a>"
-    "<a class=\"button\" href=\"/\">Refresh Page</a>"
-    "</div>"
-    "<div id=\"wifi-scan-state\" class=\"scan-state\"></div>"
-    "<div class=\"note\">"
-    "Surveying runs automatically whenever the device is operating. "
-    "Changing the interval saves immediately. Scan history is RAM-only and is cleared by reset or power cycle."
-    "</div>";
-
+  String card;
+  card.reserve(2600);
+  card += "<div class=\"card\"><h2>Survey Status &amp; Controls</h2>"
+    "<div class=\"row\"><span class=\"label\">Surveying</span><span class=\"value\">Always On</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scans This Session</span><span class=\"value\">" + String(scanCounter) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">" + (scanCounter ? htmlEscape(observationAgeLabel(lastScanUptimeMs)) : String("Never")) + "</span></div>"
+    "<div class=\"survey-control-row\"><div class=\"control\"><label for=\"interval\">Scan Interval (seconds)</label>"
+    "<input id=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(scanIntervalSeconds) + "\"></div>"
+    "<span id=\"interval-save-state\" class=\"save-state\"></span></div>"
+    "<div class=\"buttons\"><button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button>"
+    "<a class=\"button\" href=\"/\">Refresh Page</a></div><div id=\"wifi-scan-state\" class=\"scan-state\"></div>"
+    "<div class=\"note\">Surveying runs automatically whenever the device is operating. Changing the interval saves immediately.</div>";
   String autoScanHealth = wifiAutoScanDiagnosticLabel();
-  if (autoScanHealth.startsWith("WARN")) {
-    loggingCard += "<div class=\"diagnostic-warning\">" + htmlEscape(autoScanHealth) + "</div>";
-  }
+  if (autoScanHealth.startsWith("WARN")) card += "<div class=\"diagnostic-warning\">" + htmlEscape(autoScanHealth) + "</div>";
+  if (wifiApTableFullDrops > 0) card += "<div class=\"diagnostic-warning\">" + String(wifiApTableFullDrops) + " Wi-Fi observation(s) were not logged because no AP table slot was available.</div>";
+  card += "</div>";
 
-  if (wifiApTableFullDrops > 0) {
-    loggingCard += "<div class=\"note\"><strong>Warning:</strong> ";
-    loggingCard += String(wifiApTableFullDrops);
-    loggingCard += " observation(s) were not logged because the unique AP table was full.</div>";
-  }
-
-  loggingCard += "</div>";
-  server.sendContent(loggingCard);
-  server.sendContent(
-    "<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2>"
-  );
-
-  if (selectedBSSID.length() > 0) {
-    String plotInfo;
-    plotInfo.reserve(500);
-
-    plotInfo +=
-      "<div class=\"row\"><span class=\"label\">Selected Network</span>"
-      "<span class=\"value\">";
-    plotInfo += htmlEscape(selectedSSID);
-    plotInfo +=
-      "</span></div>"
-      "<div class=\"row\"><span class=\"label\">Selected BSSID</span>"
-      "<span class=\"value\">";
-    plotInfo += htmlEscape(selectedBSSID);
-    plotInfo += "</span></div>";
-
-    if (
-      connected &&
-      selectedBSSID.equalsIgnoreCase(connectedBSSID)
-    ) {
-      plotInfo +=
-        "<div class=\"row\"><span class=\"label\">Current Connection</span>"
-        "<span class=\"value\">Yes</span></div>";
-    }
-
-    server.sendContent(plotInfo);
-
-    sendRssiHistoryPlot(selectedBSSID);
-
-    server.sendContent(
-      "<div class=\"note\">"
-      "Click any SSID or BSSID in the scan-history tables below to redraw "
-      "this plot using that access point's logged data. The default selection "
-      "is the currently connected infrastructure AP when available. "
-      "Each point is one logged scan observation; hover a point for scan "
-      "number, uptime, and RSSI."
-      "</div>"
-    );
-  } else {
-    server.sendContent(
-      "<p>No logged networks are available to plot yet.</p>"
-    );
-  }
-
-  server.sendContent("</div>");
-
-  server.sendContent(
-    "<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2>"
-    "<div class=\"note\">"
-    "One row is shown for each BSSID observed during this session. "
-    "Click any column header to sort the table. Click an SSID or BSSID "
-    "to redraw the RSSI plot for that access point."
-    "</div>"
-  );
-
-  sendNetworkSummaryTable();
-
-  server.sendContent("</div>");
-
-  String surveyDetails;
-  surveyDetails.reserve(2800);
-  surveyDetails +=
-    "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Survey Diagnostics"
-    "<span class=\"diagnostic-summary\">" + String(scanCounter) + " scans &middot; " +
-    String(historyCount) + " observations &middot; " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB free heap</span></summary>"
-    "<div class=\"diagnostic-body\">"
-    "<div class=\"row\"><span class=\"label\">History Capacity</span><span class=\"value\">" +
-    String(scanHistoryCapacity) + " observations (automatic maximum)</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Groups Retained</span><span class=\"value\">" +
-    String(countRetainedScanGroups()) + "</span></div>";
-
+  card += "<div class=\"card\"><h2>History</h2>"
+    "<div class=\"row\"><span class=\"label\">Stored Observations</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Retained Scans</span><span class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>";
   if (historyCount > 0) {
-    const ScanRecord& oldestRetained = historyRecord(0);
-    const ScanRecord& newestRetained = historyRecord(historyCount - 1);
-    surveyDetails +=
-      "<div class=\"row\"><span class=\"label\">Oldest Record Age</span><span class=\"value\">" +
-      htmlEscape(observationAgeLabel(oldestRetained.uptimeMs)) + "</span></div>"
-      "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span class=\"value\">" +
-      htmlEscape(retainedWindowLabel(oldestRetained.uptimeMs, newestRetained.uptimeMs)) + "</span></div>";
+    const ScanRecord& oldest = historyRecord(0);
+    const ScanRecord& newest = historyRecord(historyCount - 1);
+    card += "<div class=\"row\"><span class=\"label\">Oldest Data</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldest.uptimeMs)) + "</span></div>";
+    card += "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldest.uptimeMs, newest.uptimeMs)) + "</span></div>";
   }
+  card += "<div class=\"buttons\"><a class=\"button\" href=\"/scanlog.csv\">Download CSV</a><a class=\"button\" href=\"/scan-clear\">Clear History</a></div>"
+    "<div class=\"note\">History is retained in RAM during normal operation. Controlled restarts may restore a saved session checkpoint when available.</div></div>";
+  server.sendContent(card);
 
-  surveyDetails +=
-    "<div class=\"row\"><span class=\"label\">Auto-Scan Diagnostic</span><span class=\"value\">" +
-    htmlEscape(wifiAutoScanDiagnosticLabel()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Automatic Scan Starts</span><span class=\"value\">" +
-    String(wifiAutoScanStartCount) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Automatic Scan Completions</span><span class=\"value\">" +
-    String(wifiAutoScanCompletionCount) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Automatic Start Failures</span><span class=\"value\">" +
-    String(wifiAutoScanStartFailureCount) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Automatic Completion Failures</span><span class=\"value\">" +
-    String(wifiAutoScanCompletionFailureCount) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Automatic Retry Backoff</span><span class=\"value\">" +
-    String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + " s; " +
-    String(wifiAutoScanRetryPending ? "retry pending" : "idle") + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Last Automatic Start</span><span class=\"value\">" +
-    htmlEscape(wifiAutoScanLastStartLabel()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Last Automatic Completion</span><span class=\"value\">" +
-    htmlEscape(wifiAutoScanLastCompletionLabel()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Duration</span><span class=\"value\">" +
-    htmlEscape(wifiScanDurationSummaryLabel()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">User Interaction Defer</span><span class=\"value\">" +
-    String(USER_INTERACTION_DEFER_MS / 1000.0f, 1) + " s after explicit web requests; background polling excluded</span></div>"
-    "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" +
-    String(wifiCsvExportCount) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" +
-    (wifiCsvExportCount == 0 ? String("Never") : htmlEscape(csvExportSummaryLabel(wifiCsvLastRows, wifiCsvLastBytes, wifiCsvLastDurationMs))) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
-    String(wifiHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>"
-    "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">" +
-    String((scanHistoryCapacity * sizeof(WifiObservation)) / 1024.0, 1) + " KB; " +
-    String(sizeof(WifiObservation)) + " bytes/observation</span></div>"
-    "<div class=\"row\"><span class=\"label\">AP Table</span><span class=\"value\">" +
-    String(wifiApCount) + " / " + String(wifiApTableCapacity) + " APs; " +
-    String((wifiApTableCapacity * sizeof(WifiApEntry)) / 1024.0, 1) + " KB allocated</span></div>"
-    "<div class=\"row\"><span class=\"label\">Scan Metadata</span><span class=\"value\">" +
-    String(wifiScanMetadataCapacity) + " slots; " +
-    String((wifiScanMetadataCapacity * sizeof(WifiScanMetadata)) / 1024.0, 1) + " KB allocated</span></div>"
-    "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" +
-    String(ESP.getFreeHeap() / 1024.0, 1) + " KB</span></div>"
-    "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" +
-    String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024.0, 1) + " KB</span></div>"
-    "</div></details></div>";
-  server.sendContent(surveyDetails);
+  String plotHeading = selectedSSID.length() ? selectedSSID : String("");
+  server.sendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History" + (plotHeading.length() ? String(" &mdash; ") + htmlEscape(plotHeading) : String("")) + "</h2>");
+  if (selectedBSSID.length() > 0) {
+    server.sendContent("<div class=\"row developer-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(selectedBSSID) + "</span></div>");
+    sendRssiHistoryPlot(selectedBSSID);
+    server.sendContent("<div class=\"note\">Click a network below to plot that access point's retained RSSI history.</div>");
+  } else server.sendContent("<p>No logged networks are available to plot yet.</p>");
+  server.sendContent("</div>");
+
+  server.sendContent("<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2><div class=\"note\">One row per retained BSSID. Click a column header to sort; click a network to redraw the RSSI plot.</div>");
+  sendNetworkSummaryTable();
+  server.sendContent("</div>");
+
+  server.sendContent("<div class=\"card advanced-only\"><h2>Survey Health</h2>");
+  String health;
+  health.reserve(1900);
+  health += "<div class=\"row\"><span class=\"label\">Auto-Scan Diagnostic</span><span class=\"value\">" + htmlEscape(wifiAutoScanDiagnosticLabel()) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Automatic Scan Starts</span><span class=\"value\">" + String(wifiAutoScanStartCount) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Automatic Scan Completions</span><span class=\"value\">" + String(wifiAutoScanCompletionCount) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Automatic Start Failures</span><span class=\"value\">" + String(wifiAutoScanStartFailureCount) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Automatic Completion Failures</span><span class=\"value\">" + String(wifiAutoScanCompletionFailureCount) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Last Automatic Start</span><span class=\"value\">" + htmlEscape(wifiAutoScanLastStartLabel()) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Last Automatic Completion</span><span class=\"value\">" + htmlEscape(wifiAutoScanLastCompletionLabel()) + "</span></div>";
+  health += "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Duration</span><span class=\"value\">" + htmlEscape(wifiScanDurationSummaryLabel()) + "</span></div></div>";
+  server.sendContent(health);
+
+  String dev;
+  dev.reserve(2100);
+  dev += "<div class=\"card developer-only\"><h2>Survey Scheduler Diagnostics</h2>"
+    "<div class=\"row\"><span class=\"label\">Automatic Retry Backoff</span><span class=\"value\">" + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + " s; " + String(wifiAutoScanRetryPending ? "retry pending" : "idle") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">User Interaction Defer</span><span class=\"value\">" + String(USER_INTERACTION_DEFER_MS / 1000.0f, 1) + " s after explicit web requests</span></div></div>";
+  dev += "<div class=\"card developer-only\"><h2>CSV Diagnostics</h2>"
+    "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" + String(wifiCsvExportCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" + (wifiCsvExportCount ? htmlEscape(csvExportSummaryLabel(wifiCsvLastRows, wifiCsvLastBytes, wifiCsvLastDurationMs)) : String("Never")) + "</span></div></div>";
+  dev += "<div class=\"card developer-only\"><h2>Wi-Fi Memory Diagnostics</h2>"
+    "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>"
+    "<div class=\"row\"><span class=\"label\">Observation Storage</span><span class=\"value\">" + String((scanHistoryCapacity*sizeof(WifiObservation))/1024.0,1) + " KB; " + String(sizeof(WifiObservation)) + " bytes/observation</span></div>"
+    "<div class=\"row\"><span class=\"label\">AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + "; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Metadata</span><span class=\"value\">" + String(wifiScanMetadataCapacity) + " slots; " + String((wifiScanMetadataCapacity*sizeof(WifiScanMetadata))/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(ESP.getFreeHeap()/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)/1024.0,1) + " KB</span></div></div>";
+  server.sendContent(dev);
 
   sendWifiChannelAnalysis();
 
-  server.sendContent(
-    "<div class=\"footer\">ESP32 Web Interface</div>"
-  );
+  if (connected) {
+    String infra = "<div class=\"card\"><h2>Infrastructure Connected Network</h2>"
+      "<div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(connectedSSID) + "</span></div>"
+      "<div class=\"row\"><span class=\"label\">Signal</span><span class=\"value\">" + String(connectedRSSI) + " dBm</span></div>"
+      "<div class=\"row advanced-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(connectedBSSID) + "</span></div></div>";
+    server.sendContent(infra);
+  } else {
+    server.sendContent("<div class=\"card\"><h2>Infrastructure Connected Network</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">Not connected</span></div></div>");
+  }
 
+  server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
-
-  // Live updates repaint only changing survey fragments; the document,
-  // scroll position, forms, and plot selection remain intact.
   {
     String refreshScript =
       "<script>(function(){"
@@ -4449,32 +4388,17 @@ void handleWebScan() {
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Scanning…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
-      "async function repaint(){"
-        "if(updating)return;updating=true;"
-        "try{"
-          "const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;})];"
-          "if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}"
-          "await Promise.all(jobs);"
-        "}catch(e){}finally{updating=false;}"
-      "}"
-      "setInterval(function(){"
-        "fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){"
-          "showScanState(!!s.scanning,s.scanning?'Scanning…':'');"
-          "if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}"
-        "}).catch(function(){});"
-      "},2000);"
+      "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;})];if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
+      "setInterval(function(){fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':'');if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);"
       "})();</script>";
     server.sendContent(refreshScript);
   }
-
-  server.sendContent(
-    "</div></body></html>"
-  );
-
+  server.sendContent("</div></body></html>");
   server.sendContent("");
 }
 
 
+// Purpose: Returns only the Observed Networks card content for live-update repainting.
 void handleWifiObservedFragment() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -4489,28 +4413,25 @@ void handleWifiObservedFragment() {
   server.sendContent("");
 }
 
+// Purpose: Returns only the selected Wi-Fi RSSI plot fragment for live-update repainting.
 void handleWifiPlotFragment() {
   String selectedBSSID = server.hasArg("bssid") ? server.arg("bssid") : "";
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
-  server.sendContent("<h2>RSSI History</h2>");
 
   if (selectedBSSID.length() > 0) {
     NetworkSummary summary = {};
     if (buildNetworkSummary(selectedBSSID, summary)) {
-      server.sendContent(
-        "<div class=\"row\"><span class=\"label\">Selected Network</span><span class=\"value\">" +
-        htmlEscape(String(summary.ssid)) +
-        "</span></div><div class=\"row\"><span class=\"label\">Selected BSSID</span><span class=\"value\">" +
-        htmlEscape(selectedBSSID) + "</span></div>"
-      );
+      String displaySSID = summary.hidden ? "(hidden)" : String(summary.ssid);
+      server.sendContent("<h2>RSSI History &mdash; " + htmlEscape(displaySSID) + "</h2>");
+      server.sendContent("<div class=\"row developer-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(selectedBSSID) + "</span></div>");
       sendRssiHistoryPlot(selectedBSSID);
     } else {
-      server.sendContent("<p>The selected network is no longer retained.</p>");
+      server.sendContent("<h2>RSSI History</h2><p>The selected network is no longer retained.</p>");
     }
   } else {
-    server.sendContent("<p>Select an SSID or BSSID below to display RSSI history.</p>");
+    server.sendContent("<h2>RSSI History</h2><p>Select a network below to display RSSI history.</p>");
   }
   server.sendContent("");
 }
@@ -4519,11 +4440,13 @@ void handleWifiPlotFragment() {
 // BLE web survey
 // ============================================================
 
+// Purpose: Sends an HTTP redirect back to the Bluetooth Survey page.
 void redirectToBLEPage() {
   server.sendHeader("Location", "/ble");
   server.send(303, "text/plain", "");
 }
 
+// Purpose: Applies Bluetooth scan interval/automatic-survey settings from the web page.
 void handleBLESettings() {
   markExplicitUserInteraction();
   if (!bleSurveyEnabled) {
@@ -4545,12 +4468,14 @@ void handleBLESettings() {
   redirectToBLEPage();
 }
 
+// Purpose: Clears BLE history and redirects back to the Bluetooth Survey page.
 void handleClearBLEHistory() {
   markExplicitUserInteraction();
   clearBleHistory();
   redirectToBLEPage();
 }
 
+// Purpose: Streams retained BLE observations as CSV and records export-performance diagnostics.
 void handleBLEScanCsv() {
   markExplicitUserInteraction();
   csvExportInProgress = true;
@@ -4596,6 +4521,7 @@ void handleBLEScanCsv() {
   csvExportInProgress = false;
 }
 
+// Purpose: Generates and streams the SVG RSSI history plot for one selected BLE address.
 void sendBleRssiHistoryPlot(const String& selectedAddress) {
   const int SVG_WIDTH = 720, SVG_HEIGHT = 280;
   const int LEFT = 58, RIGHT = 20, TOP = 20, BOTTOM = 45;
@@ -4673,6 +4599,7 @@ void sendBleRssiHistoryPlot(const String& selectedAddress) {
   server.sendContent("</svg></div>");
 }
 
+// Purpose: Streams the sortable Observed BLE Devices table with columns progressively exposed by view depth.
 void sendBleSummaryTable() {
   if (bleHistoryCount == 0) {
     server.sendContent("<p>No BLE devices have been observed yet.</p>");
@@ -4682,21 +4609,20 @@ void sendBleSummaryTable() {
   server.sendContent("<div class=\"table-scroll\"><table id=\"ble-summary\"><thead><tr>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',0,'text')\">Name</th>"
     "<th class=\"sortable\" onclick=\"sortTable('ble-summary',1,'text')\">Address</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',2,'text')\">Address Type</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',3,'number')\">Latest</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',4,'number')\">Min</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',5,'number')\">Max</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',6,'number')\">Avg</th>"
-    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',7,'number')\">Samples</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',8,'number')\">First Seen</th>"
-    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',9,'number')\">Last Seen</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',2,'number')\">Last</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',3,'number')\">Avg</th>"
+    "<th class=\"sortable signal\" onclick=\"sortTable('ble-summary',4,'number')\">Count</th>"
+    "<th class=\"sortable\" onclick=\"sortTable('ble-summary',5,'number')\">Last Seen</th>"
+    "<th class=\"sortable signal advanced-only\" onclick=\"sortTable('ble-summary',6,'number')\">Min</th>"
+    "<th class=\"sortable signal advanced-only\" onclick=\"sortTable('ble-summary',7,'number')\">Max</th>"
+    "<th class=\"sortable developer-only\" onclick=\"sortTable('ble-summary',8,'text')\">Address Type</th>"
+    "<th class=\"sortable developer-only\" onclick=\"sortTable('ble-summary',9,'number')\">First Seen</th>"
     "</tr></thead><tbody>");
 
   for (size_t offset = 0; offset < bleHistoryCount; offset++) {
     size_t logicalIndex = bleHistoryCount - 1 - offset;
     const BleScanRecord& newest = bleHistoryRecord(logicalIndex);
     String address = String(newest.address);
-
     if (hasNewerBleObservationForAddress(logicalIndex, address)) continue;
 
     BLEDeviceSummary summary = {};
@@ -4705,23 +4631,23 @@ void sendBleSummaryTable() {
     String plotUrl = "/ble?plot=" + urlEncode(address) + "#rssi-plot";
     String displayName = summary.named ? String(summary.name) : "(unnamed)";
     float avgRssi = averageSignal(summary.signal);
+    uint32_t nowMs = surveySessionUptimeMs();
+    uint32_t firstAgeMs = nowMs >= summary.signal.firstSeenMs ? nowMs - summary.signal.firstSeenMs : 0;
+    uint32_t lastAgeMs = nowMs >= summary.signal.lastSeenMs ? nowMs - summary.signal.lastSeenMs : 0;
 
     String row;
-    row.reserve(850);
+    row.reserve(900);
     row += "<tr>";
     row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(displayName) + "</a></td>";
     row += "<td class=\"address\"><a href=\"" + plotUrl + "\">" + htmlEscape(address) + "</a></td>";
-    row += "<td>" + htmlEscape(bleAddressTypeLabel(summary.addressType)) + "</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
-    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
-    row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.samples) + "\">" + String(summary.signal.samples) + "</td>";
-    uint32_t bleNowMs = millis();
-    uint32_t bleFirstAgeMs = bleNowMs >= summary.signal.firstSeenMs ? bleNowMs - summary.signal.firstSeenMs : 0;
-    uint32_t bleLastAgeMs = bleNowMs >= summary.signal.lastSeenMs ? bleNowMs - summary.signal.lastSeenMs : 0;
-    row += "<td data-sort=\"" + String(bleFirstAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.firstSeenMs)) + "</td>";
-    row += "<td data-sort=\"" + String(bleLastAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.lastSeenMs)) + "</td>";
+    row += "<td data-sort=\"" + String(lastAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.lastSeenMs)) + "</td>";
+    row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
+    row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
+    row += "<td class=\"developer-only\">" + htmlEscape(bleAddressTypeLabel(summary.addressType)) + "</td>";
+    row += "<td class=\"developer-only\" data-sort=\"" + String(firstAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.firstSeenMs)) + "</td>";
     row += "</tr>";
     server.sendContent(row);
   }
@@ -4729,6 +4655,7 @@ void sendBleSummaryTable() {
   server.sendContent("</tbody></table></div>");
 }
 
+// Purpose: Returns compact JSON describing current BLE scan state for browser polling.
 void handleBleScanStatus() {
   String json = "{\"scan\":" + String(bleScanCounter) +
                 ",\"records\":" + String(bleHistoryCount) + "}";
@@ -4736,42 +4663,33 @@ void handleBleScanStatus() {
   server.send(200, "application/json", json);
 }
 
+// Purpose: Builds either the disabled or enabled Bluetooth Survey page under the V34 information hierarchy.
 void handleBLESurvey() {
   markExplicitUserInteraction();
   String selectedAddress = "";
-
   if (server.hasArg("plot")) {
     String requested = server.arg("plot");
     requested.trim();
     if (bleHistoryContainsAddress(requested)) selectedAddress = requested;
   }
-
-  if (selectedAddress.length() == 0 && bleHistoryCount > 0)
-    selectedAddress = String(bleHistoryRecord(bleHistoryCount - 1).address);
+  if (selectedAddress.length() == 0 && bleHistoryCount > 0) selectedAddress = String(bleHistoryRecord(bleHistoryCount - 1).address);
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-  server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    "<title>ESP32 Bluetooth Survey</title>");
+  server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Bluetooth Survey</title>");
   sendThemeBootstrapScript();
   server.sendContent(pageStyles());
   server.sendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("ble");
-  server.sendContent("<h1>Bluetooth Survey <span class=\"badge\">Limited Mode</span></h1>"
-    "<div class=\"card\"><h2>Scan Logging</h2>");
+  server.sendContent("<h1>Bluetooth Survey</h1>");
 
   if (!bleSurveyEnabled) {
-    server.sendContent(
-      "<div class=\"note\"><strong>Bluetooth Survey is disabled.</strong> "
-      "The BLE stack is not initialized, leaving substantially more RAM available for Wi-Fi survey history. "
-      "Enabling Bluetooth saves the setting and restarts the ESP32 so memory can be allocated safely at boot.</div>"
-      "<div class=\"row\"><span class=\"label\">BLE Stack</span><span class=\"value\">Not initialized</span></div>"
-      "<div class=\"row\"><span class=\"label\">BLE History RAM</span><span class=\"value\">0 KB</span></div>"
-      "<form class=\"controls\" action=\"/ble-mode\" method=\"post\">"
-      "<input type=\"hidden\" name=\"enabled\" value=\"1\">"
-      "<button type=\"submit\">Enable Bluetooth Survey</button></form>"
-      "</div><div class=\"footer\">ESP32 Web Interface</div>");
+    server.sendContent("<div class=\"card\"><h2>Surveying: Disabled</h2>"
+      "<div class=\"note\"><strong>Bluetooth Survey is disabled.</strong> Enabling Bluetooth allows Bluetooth surveying, but significantly reduces Wi-Fi history capacity because both surveys share the ESP32's available memory. Enabling Bluetooth requires a restart.</div>"
+      "<div class=\"row advanced-only\"><span class=\"label\">BLE Stack</span><span class=\"value\">Not initialized</span></div>"
+      "<div class=\"row developer-only\"><span class=\"label\">BLE History RAM</span><span class=\"value\">0 KB</span></div>"
+      "<form class=\"controls\" action=\"/ble-mode\" method=\"post\"><input type=\"hidden\" name=\"enabled\" value=\"1\"><button type=\"submit\">Enable Bluetooth Survey</button></form></div>"
+      "<div class=\"footer\">ESP32 Web Interface</div>");
     sendThemeScript();
     server.sendContent("</div></body></html>");
     server.sendContent("");
@@ -4779,98 +4697,65 @@ void handleBLESurvey() {
   }
 
   String status;
-  status.reserve(2600);
-  status += "<div class=\"row\"><span class=\"label\">Automatic Scanning</span><span class=\"value\">" +
-    String(autoBleScanEnabled ? "ON" : "OFF") + "</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Scan Interval</span><span class=\"value\">" +
-    String(bleScanIntervalSeconds) + " seconds</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Scans This Session</span><span class=\"value\">" +
-    String(bleScanCounter) + "</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Stored Records</span><span class=\"value\">" +
-    String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) +
-    " retained; " + String(bleHistoryCapacity) + " physical</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">";
-  status += bleScanCounter == 0 ? "Never" : formatUptime(lastBleScanUptimeMs) + " uptime";
-  status += "</span></div>";
-  status += "<details class=\"diagnostic-details\"><summary>Diagnostics<span class=\"diagnostic-summary\">memory, tables, drops, CSV</span></summary><div class=\"diagnostic-body\">";
-  status += "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" +
-    String(bleHistoryAllocatedBytes() / 1024.0, 1) + " KB total</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" +
-    String(sizeof(BleObservation)) + " bytes (previous flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" +
-    String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " +
-    String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB allocated</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" +
-    String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " +
-    String(bleScanMetadataPeakUsed) + "; " + String(bleScanMetadataCapacity*sizeof(SurveyScanMetadata)/1024.0,1) + " KB allocated</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Dropped BLE Observations</span><span class=\"value\">" +
-    String(bleAddressTableFullDrops) + " (address table full)</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" +
-    String(bleCsvExportCount) + "</span></div>";
-  status += "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" +
-    (bleCsvExportCount == 0 ? String("Never") : htmlEscape(csvExportSummaryLabel(bleCsvLastRows, bleCsvLastBytes, bleCsvLastDurationMs))) +
-    "</span></div></div></details>";
-
-  status += "<form class=\"settings-row\" action=\"/ble-settings\" method=\"get\">"
-    "<div class=\"control\"><label for=\"ble-interval\">Interval (seconds)</label>"
-    "<input id=\"ble-interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" +
-    String(bleScanIntervalSeconds) + "\"></div>"
-    "<div class=\"control\"><label>History capacity</label><div class=\"value\">" +
-    String(bleHistoryCapacity) + " observations (automatic maximum)</div></div>"
-    "<div class=\"checkbox-stack\">"
-    "<label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
-
+  status.reserve(3000);
+  status += "<div class=\"card\"><h2>Survey Status &amp; Controls</h2>"
+    "<div class=\"row\"><span class=\"label\">Automatic Surveying</span><span class=\"value\">" + String(autoBleScanEnabled ? "On" : "Off") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scan Interval</span><span class=\"value\">" + String(bleScanIntervalSeconds) + " seconds</span></div>"
+    "<div class=\"row\"><span class=\"label\">Scans This Session</span><span class=\"value\">" + String(bleScanCounter) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Scan</span><span class=\"value\">" + (bleScanCounter ? htmlEscape(observationAgeLabel(lastBleScanUptimeMs)) : String("Never")) + "</span></div>"
+    "<form class=\"settings-row\" action=\"/ble-settings\" method=\"get\"><div class=\"control\"><label for=\"ble-interval\">Scan Interval (seconds)</label>"
+    "<input id=\"ble-interval\" name=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(bleScanIntervalSeconds) + "\"></div>"
+    "<div class=\"checkbox-stack\"><label><input type=\"checkbox\" name=\"auto\" value=\"1\"";
   if (autoBleScanEnabled) status += " checked";
+  status += "> Automatic Surveying</label></div><button type=\"submit\">Apply</button></form>"
+    "<div class=\"buttons\"><a class=\"button\" href=\"/ble-scan\">Scan Now</a><a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
+    "<div class=\"note\">Bluetooth surveying significantly reduces available Wi-Fi history capacity.</div></div>";
 
-  status += "> Automatic scanning</label></div><button type=\"submit\">Apply</button></form>"
-    "<div class=\"buttons\"><a class=\"button\" href=\"/ble-scan\">Scan Now</a>"
-    "<a class=\"button\" href=\"/blelog.csv\">Download CSV</a>"
-    "<a class=\"button\" href=\"/ble-clear\">Clear History</a>"
-    "<a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
-    "<div class=\"note\">Automatic BLE scanning defaults to 300 seconds. "
-    "Physical capacity is allocated once at boot; the retention limit changes immediately without reallocating RAM. ""Combined BLE mode is intentionally a limited option on this ESP32 because the BLE stack substantially reduces heap and retained-history capacity. ""BLE scans still use the synchronous Arduino BLE API and may briefly pause web servicing while a BLE scan is active.</div>";
-
+  status += "<div class=\"card\"><h2>History</h2>"
+    "<div class=\"row\"><span class=\"label\">Stored Observations</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>"
+    "<div class=\"buttons\"><a class=\"button\" href=\"/blelog.csv\">Download CSV</a><a class=\"button\" href=\"/ble-clear\">Clear History</a></div></div>";
   if (bleHistoryResizeMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleHistoryResizeMessage) + "</strong></div>";
   if (bleStatusMessage.length()) status += "<div class=\"note\"><strong>" + htmlEscape(bleStatusMessage) + "</strong></div>";
-
-  status += "</div>";
   server.sendContent(status);
 
-  server.sendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2>");
+  String adv = "<div class=\"card advanced-only\"><h2>Survey Health</h2>"
+    "<div class=\"row\"><span class=\"label\">Dropped BLE Observations</span><span class=\"value\">" + String(bleAddressTableFullDrops) + "</span></div></div>";
+  server.sendContent(adv);
 
+  String dev;
+  dev.reserve(1800);
+  dev += "<div class=\"card developer-only\"><h2>BLE Implementation Diagnostics</h2>"
+    "<div class=\"row\"><span class=\"label\">History RAM</span><span class=\"value\">" + String(bleHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>"
+    "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" + String(sizeof(BleObservation)) + " bytes</span></div>"
+    "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" + String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " + String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" + String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " + String(bleScanMetadataPeakUsed) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">CSV Exports Served</span><span class=\"value\">" + String(bleCsvExportCount) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last CSV Export</span><span class=\"value\">" + (bleCsvExportCount ? htmlEscape(csvExportSummaryLabel(bleCsvLastRows,bleCsvLastBytes,bleCsvLastDurationMs)) : String("Never")) + "</span></div>"
+    "<div class=\"note\">BLE scans use the synchronous Arduino BLE API and can temporarily delay web servicing while a scan is active.</div></div>";
+  server.sendContent(dev);
+
+  String identity;
   if (selectedAddress.length()) {
     String selectedName = latestBleNameForAddress(selectedAddress);
-    server.sendContent("<div class=\"row\"><span class=\"label\">Selected Device</span><span class=\"value\">" +
-      htmlEscape(selectedName) + "</span></div><div class=\"row\"><span class=\"label\">BLE Address</span><span class=\"value\">" +
-      htmlEscape(selectedAddress) + "</span></div>");
-    sendBleRssiHistoryPlot(selectedAddress);
-    server.sendContent("<div class=\"note\">Click any device name or address below to redraw this plot.</div>");
-  } else {
-    server.sendContent("<p>No logged BLE devices are available to plot yet.</p>");
+    identity = (selectedName.length() && selectedName != "(unnamed)") ? selectedName : selectedAddress;
   }
-
-  server.sendContent("</div><div class=\"card\" id=\"ble-observed-card\"><h2>Observed BLE Devices</h2>"
-    "<div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
+  server.sendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History" + (identity.length() ? String(" &mdash; ") + htmlEscape(identity) : String("")) + "</h2>");
+  if (selectedAddress.length()) {
+    server.sendContent("<div class=\"row developer-only\"><span class=\"label\">BLE Address</span><span class=\"value\">" + htmlEscape(selectedAddress) + "</span></div>");
+    sendBleRssiHistoryPlot(selectedAddress);
+    server.sendContent("<div class=\"note\">Click a device below to redraw this plot.</div>");
+  } else server.sendContent("<p>No logged BLE addresses are available to plot yet.</p>");
+  server.sendContent("</div><div class=\"card\" id=\"ble-observed-card\"><h2>Observed BLE Devices</h2><div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
   sendBleSummaryTable();
   server.sendContent("</div><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
   {
     String refreshScript =
-      "<script>(function(){"
-      "let scan=" + String(bleScanCounter) + ";"
-      "const toggle=document.getElementById('live-updates-toggle');"
-      "const address='" + jsEscape(selectedAddress) + "';"
-      "let updating=false;"
-      "async function repaint(){if(updating)return;updating=true;try{"
-        "const jobs=[fetch('/api/ble/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('ble-observed-card');if(e)e.innerHTML=h;})];"
-        "if(address){jobs.push(fetch('/api/ble/plot?address='+encodeURIComponent(address),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}"
-        "await Promise.all(jobs);"
-      "}catch(e){}finally{updating=false;}}"
-      "setInterval(function(){if(!toggle||!toggle.checked)return;"
-        "fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(s.scan!==scan){scan=s.scan;repaint();}}).catch(function(){});"
-      "},2000);"
-      "})();</script>";
+      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;"
+      "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/ble/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('ble-observed-card');if(e)e.innerHTML=h;})];if(address){jobs.push(fetch('/api/ble/plot?address='+encodeURIComponent(address),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
+      "setInterval(function(){if(!toggle||!toggle.checked)return;fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(s.scan!==scan){scan=s.scan;repaint();}}).catch(function(){});},2000);})();</script>";
     server.sendContent(refreshScript);
   }
   server.sendContent("</div></body></html>");
@@ -4878,6 +4763,7 @@ void handleBLESurvey() {
 }
 
 
+// Purpose: Returns only the Observed BLE Devices card content for live-update repainting.
 void handleBleObservedFragment() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -4887,24 +4773,25 @@ void handleBleObservedFragment() {
   server.sendContent("");
 }
 
+// Purpose: Returns only the selected BLE RSSI plot fragment for live-update repainting.
 void handleBlePlotFragment() {
   String selectedAddress = server.hasArg("address") ? server.arg("address") : "";
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
-  server.sendContent("<h2>RSSI History</h2>");
   if (selectedAddress.length()) {
     String selectedName = latestBleNameForAddress(selectedAddress);
-    server.sendContent("<div class=\"row\"><span class=\"label\">Selected Device</span><span class=\"value\">" +
-      htmlEscape(selectedName) + "</span></div><div class=\"row\"><span class=\"label\">BLE Address</span><span class=\"value\">" +
-      htmlEscape(selectedAddress) + "</span></div>");
+    String identity = (selectedName.length() && selectedName != "(unnamed)") ? selectedName : selectedAddress;
+    server.sendContent("<h2>RSSI History &mdash; " + htmlEscape(identity) + "</h2>");
+    server.sendContent("<div class=\"row developer-only\"><span class=\"label\">BLE Address</span><span class=\"value\">" + htmlEscape(selectedAddress) + "</span></div>");
     sendBleRssiHistoryPlot(selectedAddress);
   } else {
-    server.sendContent("<p>Select a BLE address below to display RSSI history.</p>");
+    server.sendContent("<h2>RSSI History</h2><p>Select a BLE address below to display RSSI history.</p>");
   }
   server.sendContent("");
 }
 
+// Purpose: Runs the user-requested immediate BLE scan endpoint.
 void handleBLEScanNow() {
   markExplicitUserInteraction();
   if (!bleSurveyEnabled) {
@@ -4923,6 +4810,7 @@ void handleBLEScanNow() {
 // System status, diagnostics, and settings
 // ============================================================
 
+// Purpose: Converts the ESP-IDF reset-reason enum into a readable diagnostic label.
 String resetReasonLabel(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_POWERON: return "Power-on";
@@ -4939,6 +4827,7 @@ String resetReasonLabel(esp_reset_reason_t reason) {
   }
 }
 
+// Purpose: Converts the ESP32 Wi-Fi mode enum into a readable mode label.
 String wifiModeLabel(wifi_mode_t mode) {
   switch (mode) {
     case WIFI_MODE_NULL: return "Off";
@@ -4949,204 +4838,117 @@ String wifiModeLabel(wifi_mode_t mode) {
   }
 }
 
+// Purpose: Builds one consistent HTML status row for System Health component checks.
 String selfTestRow(const String& name, const String& state, const String& detail) {
   String css = state == "PASS" ? "status-pass" : (state == "WARN" ? "status-warn" : "status-fail");
   return "<div class=\"row\"><span class=\"label\">" + htmlEscape(name) + "</span><span class=\"value \"" + css + "\">" + state + " - " + htmlEscape(detail) + "</span></div>";
 }
 
+// Purpose: Builds the V34 System page: Device, System Health, Memory, Network, Session, and Developer test tools.
 void handleSystemStatus() {
   markExplicitUserInteraction();
   uint8_t primaryChannel = 0;
   wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
   esp_err_t channelResult = esp_wifi_get_channel(&primaryChannel, &secondary);
   size_t freeHeap = ESP.getFreeHeap();
+  size_t minFreeHeap = ESP.getMinFreeHeap();
   size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   float largestPct = freeHeap ? (100.0f * largestBlock / freeHeap) : 0.0f;
   esp_reset_reason_t rr = esp_reset_reason();
+  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+  size_t appPartitionBytes = runningPartition ? runningPartition->size : 0;
+  size_t unusedAppBytes = appPartitionBytes > ESP.getSketchSize() ? appPartitionBytes - ESP.getSketchSize() : 0;
+
+  bool wh = scanHistory && wifiApTable && wifiScanMetadata && scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS && scanHistoryRetentionLimit>=MIN_SCAN_HISTORY_RECORDS && scanHistoryRetentionLimit<=scanHistoryCapacity && historyCount<=scanHistoryRetentionLimit;
+  bool bh = !bleSurveyEnabled || (bleHistory && bleAddressTable && bleScanMetadata && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryRetentionLimit>=MIN_BLE_HISTORY_RECORDS && bleHistoryRetentionLimit<=bleHistoryCapacity && bleHistoryCount<=bleHistoryRetentionLimit);
+  bool cfg = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS && (!bleSurveyEnabled || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
+  bool initialDone = !initialWifiScanPending && (!bleSurveyEnabled || !initialBleScanPending);
+  bool autos = !bleSurveyEnabled || autoBleScanEnabled;
+  bool wifiCadenceOverdue = wifiAutoScanCadenceOverdue();
+  bool currentHeapOk = bleSurveyEnabled ? freeHeap >= 24*1024 : freeHeap >= HEAP_WARN_BYTES;
+  bool lowWaterOk = bleSurveyEnabled ? minFreeHeap >= DUAL_RADIO_MIN_HEAP_WARN_BYTES : minFreeHeap >= HEAP_WARN_BYTES;
+  bool memoryOk = currentHeapOk && lowWaterOk;
+  bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
+  bool overallFail = !wifiSubsystemInitialized || (bleSurveyEnabled && !bleInitialized) || !wh || !bh || !cfg;
+  bool overallWarn = !overallFail && (!initialDone || !autos || wifiCadenceOverdue || !memoryOk || !spiffsMounted || !mdnsStarted || resetWarn);
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 System</title>");
-  sendThemeBootstrapScript();
-  server.sendContent(pageStyles());
-  server.sendContent("</head><body><div class=\"container\">");
-  sendSiteNavigation("system");
-  server.sendContent("<h1>System</h1><div class=\"card\"><h2>Firmware & Hardware</h2>");
+  sendThemeBootstrapScript(); server.sendContent(pageStyles());
+  server.sendContent("</head><body><div class=\"container\">"); sendSiteNavigation("system");
+  server.sendContent("<h1>System</h1>");
 
-  String s;
-  s.reserve(5200);
-  s += "<div class=\"row\"><span class=\"label\">Firmware File</span><span class=\"value\">" + htmlEscape(FIRMWARE_FILE) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Firmware Version</span><span class=\"value\">" + htmlEscape(FIRMWARE_VERSION) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Build</span><span class=\"value\">" + htmlEscape(firmwareBuildTimestamp()) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Arduino ESP32 Core</span><span class=\"value\">" + String(ESP_ARDUINO_VERSION_STR) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">ESP-IDF</span><span class=\"value\">" + String(esp_get_idf_version()) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Uptime</span><span class=\"value\">" + htmlEscape(getUptimeString()) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Last Reset</span><span class=\"value\">" + htmlEscape(resetReasonLabel(rr)) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Chip</span><span class=\"value\">" + String(ESP.getChipModel()) + ", rev " + String(ESP.getChipRevision()) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">CPU</span><span class=\"value\">" + String(ESP.getCpuFreqMHz()) + " MHz, " + String(ESP.getChipCores()) + " cores</span></div></div>";
-  s += "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Flash &amp; Memory<span class=\"diagnostic-summary\">heap, partitions, survey allocations</span></summary><div class=\"diagnostic-body\">";
-  s += "<div class=\"row\"><span class=\"label\">Flash Size</span><span class=\"value\">" + String(ESP.getFlashChipSize()/1024.0/1024.0, 2) + " MB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Sketch Size</span><span class=\"value\">" + String(ESP.getSketchSize()/1024.0, 1) + " KB</span></div>";
-  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
-  size_t appPartitionBytes = runningPartition ? runningPartition->size : 0;
-  size_t unusedAppBytes = appPartitionBytes > ESP.getSketchSize() ? appPartitionBytes - ESP.getSketchSize() : 0;
-  s += "<div class=\"row\"><span class=\"label\">App Partition Size</span><span class=\"value\">" + String(appPartitionBytes/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Unused App Partition</span><span class=\"value\">" + String(unusedAppBytes/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Heap Size</span><span class=\"value\">" + String(ESP.getHeapSize()/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(ESP.getMinFreeHeap()/1024.0, 1) + " KB</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0, 1) + " KB (" + String(largestPct,1) + "% of free heap)</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + BLE (limited)" : "Wi-Fi only") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Target Heap Reserve</span><span class=\"value\">" + String((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024) + " KB at history allocation</span></div>";
-  if (bleSurveyEnabled) {
-    s += "<div class=\"row\"><span class=\"label\">Dual-Radio Low-Water Warning</span><span class=\"value\">" + String(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024) + " KB minimum free heap</span></div>";
-  }
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi History</span><span class=\"value\">" + String(historyCount) + " / " + String(scanHistoryRetentionLimit) + " retained; " + String(scanHistoryCapacity) + " history capacity; " + String(wifiHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Observation Size</span><span class=\"value\">" + String(sizeof(WifiObservation)) + " bytes (V20 flat record was " + String(sizeof(ScanRecord)) + " bytes)</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi AP Table</span><span class=\"value\">" + String(wifiApCount) + " / " + String(wifiApTableCapacity) + " entries; " + String(wifiApTableCapacity*sizeof(WifiApEntry)/1024.0,1) + " KB allocated</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Scan Metadata</span><span class=\"value\">" + String(wifiScanMetadataCapacity) + " slots; " + String(wifiScanMetadataCapacity*sizeof(WifiScanMetadata)/1024.0,1) + " KB allocated</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Scans</span><span class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>";
-  if (historyCount > 0) {
-    const ScanRecord& oldestWifi = historyRecord(0);
-    const ScanRecord& newestWifi = historyRecord(historyCount - 1);
-    s += "<div class=\"row\"><span class=\"label\">Wi-Fi Oldest Record Age</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldestWifi.uptimeMs)) + "</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">Wi-Fi Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestWifi.uptimeMs, newestWifi.uptimeMs)) + "</span></div>";
-  }
-  if (bleSurveyEnabled) {
-    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">" + String(bleHistoryCount) + " / " + String(bleHistoryRetentionLimit) + " retained; " + String(bleHistoryCapacity) + " capacity; " + String(bleHistoryAllocatedBytes()/1024.0,1) + " KB total</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">BLE Observation Size</span><span class=\"value\">" + String(sizeof(BleObservation)) + " bytes (previous flat record was " + String(sizeof(BleScanRecord)) + " bytes)</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">BLE Address Table</span><span class=\"value\">" + String(countReferencedBleAddresses()) + " / " + String(bleAddressTableCapacity) + " referenced; peak " + String(bleAddressPeakReferenced) + "; drops " + String(bleAddressTableFullDrops) + "</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">BLE Scan Metadata</span><span class=\"value\">" + String(countReferencedBleScanSlots()) + " / " + String(bleScanMetadataCapacity) + " referenced; peak " + String(bleScanMetadataPeakUsed) + "</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">BLE Retained Scans</span><span class=\"value\">" + String(countRetainedBleScanGroups()) + "</span></div>";
-    if (bleHistoryCount > 0) {
-      const BleScanRecord& oldestBle = bleHistoryRecord(0);
-      const BleScanRecord& newestBle = bleHistoryRecord(bleHistoryCount - 1);
-      s += "<div class=\"row\"><span class=\"label\">BLE Oldest Record Age</span><span class=\"value\">" + htmlEscape(observationAgeLabel(oldestBle.uptimeMs)) + "</span></div>";
-      s += "<div class=\"row\"><span class=\"label\">BLE Retained Time Window</span><span class=\"value\">" + htmlEscape(retainedWindowLabel(oldestBle.uptimeMs, newestBle.uptimeMs)) + "</span></div>";
-    }
-  } else {
-    s += "<div class=\"row\"><span class=\"label\">BLE History</span><span class=\"value\">Disabled at boot; 0 KB history allocated</span></div>";
-  }
-  s += "</div></details></div>";
-  s += "<div class=\"card\"><details class=\"diagnostic-details\"><summary>Radio Diagnostics<span class=\"diagnostic-summary\">mode, MACs, channel, radio state</span></summary><div class=\"diagnostic-body\">";
-  s += "<div class=\"row\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">STA MAC</span><span class=\"value\">" + WiFi.macAddress() + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">AP MAC</span><span class=\"value\">" + WiFi.softAPmacAddress() + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Infrastructure Wi-Fi</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
-  String reconnectState = infrastructureReconnectAttemptActive
-      ? "attempting"
-      : (infrastructureReconnectPending ? "pending" : "idle");
-  s += "<div class=\"row\"><span class=\"label\">Infrastructure Auto-Reconnect</span><span class=\"value\">ESP32 native auto-reconnect enabled; " +
-       String(nativeReconnectObservedCount) + " reconnect transition(s) observed</span></div>";
-  if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">STA SSID / RSSI</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Survey AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + (apRunning ? " - " + htmlEscape(apSSID) : "") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">mDNS Hostname</span><span class=\"value\">" + htmlEscape(mdnsHostname) + ".local</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\"><a href=\"" + htmlEscape(mdnsWebAddress()) + "\">" + htmlEscape(mdnsWebAddress()) + "</a></span></div>";
-  s += "<div class=\"row\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">BLE Boot Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled (maximum Wi-Fi history)") + "</span></div>";
-  s += "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + (STATUS_LED_AVAILABLE ? (statusLedEnabled ? String("GPIO ") + String(STATUS_LED_PIN) + String(" enabled") : String("Disabled by setting")) : String("Not available")) + "</span></div></div></details></div>";
+  String s; s.reserve(5200);
+  s += "<div class=\"card\"><h2>Device</h2>"
+    "<div class=\"row\"><span class=\"label\">Firmware Version</span><span class=\"value\">" + htmlEscape(FIRMWARE_VERSION) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Uptime</span><span class=\"value\">" + htmlEscape(getUptimeString()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Last Reset</span><span class=\"value\">" + htmlEscape(resetReasonLabel(rr)) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Build</span><span class=\"value\">" + htmlEscape(firmwareBuildTimestamp()) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Firmware File</span><span class=\"value\">" + htmlEscape(FIRMWARE_FILE) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Arduino ESP32 Core</span><span class=\"value\">" + String(ESP_ARDUINO_VERSION_STR) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">ESP-IDF</span><span class=\"value\">" + String(esp_get_idf_version()) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Chip</span><span class=\"value\">" + String(ESP.getChipModel()) + ", rev " + String(ESP.getChipRevision()) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">CPU</span><span class=\"value\">" + String(ESP.getCpuFreqMHz()) + " MHz, " + String(ESP.getChipCores()) + " cores</span></div></div>";
+
+  String overall = overallFail ? "FAIL" : (overallWarn ? "WARN" : "PASS");
+  String bleHealth = bleSurveyEnabled ? (bleInitialized ? "PASS" : "FAIL") : "Disabled";
+  s += "<div class=\"card\"><h2>System Health</h2>"
+    "<div class=\"row\"><span class=\"label\">Wi-Fi Survey</span><span class=\"value\">" + String(wifiSubsystemInitialized ? "PASS" : "FAIL") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Bluetooth Survey</span><span class=\"value\">" + bleHealth + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Automatic Surveying</span><span class=\"value\">" + String(autos && !wifiCadenceOverdue ? "PASS" : "WARN") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Memory</span><span class=\"value\">" + String(memoryOk ? "PASS" : "WARN") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Overall</span><span class=\"value\"><strong>" + overall + "</strong></span></div>";
+  s += "<div class=\"advanced-only\">";
+  s += selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid");
+  s += selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL", !bleSurveyEnabled ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid"));
+  s += selfTestRow("Scan configuration", cfg ? "PASS" : "FAIL", cfg ? "survey intervals within valid range" : "one or more values out of range");
+  s += selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN", initialDone ? "required initial scans completed" : "one or more initial scans pending");
+  s += selfTestRow("Wi-Fi auto-scan cadence", wifiCadenceOverdue ? "WARN" : "PASS", wifiAutoScanDiagnosticLabel());
+  s += selfTestRow("Wi-Fi scan timing", wifiScanDurationCount ? "PASS" : "WARN", wifiScanDurationSummaryLabel());
+  s += selfTestRow("Session checkpoint storage", spiffsMounted ? "PASS" : "WARN", spiffsMounted ? sessionCheckpointStatus : "SPIFFS unavailable");
+  s += selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN", mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage);
+  s += selfTestRow("Heap reserve", memoryOk ? "PASS" : "WARN", String(freeHeap/1024) + " KB free; " + String(minFreeHeap/1024) + " KB minimum");
+  s += selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr));
+  s += "</div><div class=\"developer-only\">" + selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition") + "</div></div>";
+
+  s += "<div class=\"card advanced-only\"><h2>Memory</h2>"
+    "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Minimum Free Heap</span><span class=\"value\">" + String(minFreeHeap/1024.0,1) + " KB</span></div>"
+    "<div class=\"row\"><span class=\"label\">Survey Memory Mode</span><span class=\"value\">" + String(bleSurveyEnabled ? "Wi-Fi + Bluetooth" : "Wi-Fi only") + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Largest Free Block</span><span class=\"value\">" + String(largestBlock/1024.0,1) + " KB (" + String(largestPct,1) + "%)</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Flash Size</span><span class=\"value\">" + String(ESP.getFlashChipSize()/1024.0/1024.0,2) + " MB</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Sketch Size</span><span class=\"value\">" + String(ESP.getSketchSize()/1024.0,1) + " KB</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">App Partition Size</span><span class=\"value\">" + String(appPartitionBytes/1024.0,1) + " KB</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Unused App Partition</span><span class=\"value\">" + String(unusedAppBytes/1024.0,1) + " KB</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Target Heap Reserve</span><span class=\"value\">" + String((bleSurveyEnabled?DUAL_RADIO_HEAP_RESERVE_BYTES:HISTORY_HEAP_RESERVE_BYTES)/1024) + " KB at history allocation</span></div></div>";
+
+  s += "<div class=\"card\"><h2>Network</h2>"
+    "<div class=\"row\"><span class=\"label\">Infrastructure Wi-Fi</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
+  if (WiFi.status()==WL_CONNECTED) s += "<div class=\"row\"><span class=\"label\">Network / Signal</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + " / " + String(WiFi.RSSI()) + " dBm</span></div>";
+  s += "<div class=\"row\"><span class=\"label\">Device AP</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Broadcast SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\"><a href=\"" + htmlEscape(mdnsWebAddress()) + "\">" + htmlEscape(mdnsWebAddress()) + "</a></span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Infrastructure Auto-Reconnect</span><span class=\"value\">Native enabled; " + String(nativeReconnectObservedCount) + " transition(s) observed</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">STA MAC</span><span class=\"value\">" + WiFi.macAddress() + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">AP MAC</span><span class=\"value\">" + WiFi.softAPmacAddress() + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Radio Channel</span><span class=\"value\">" + String(channelResult==ESP_OK ? String(primaryChannel) : String("Unavailable")) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div></div>";
   server.sendContent(s);
 
-  server.sendContent("<div class=\"card\"><h2>Boot Heap Checkpoints</h2>"
-    "<div class=\"note\">Captured during startup so Wi-Fi, BLE, history, web-server, mDNS, and initial-scan RAM costs can be compared directly.</div>"
-    "<div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
-  for (size_t i = 0; i < bootHeapCheckpointCount; i++) {
-    const BootHeapCheckpoint& cp = bootHeapCheckpoints[i];
-    String row = "<tr><td>" + htmlEscape(String(cp.stage)) + "</td>"
-      "<td class=\"signal\">" + String(cp.freeHeap / 1024.0, 1) + " KB</td>"
-      "<td class=\"signal\">" + String(cp.minimumFreeHeap / 1024.0, 1) + " KB</td>"
-      "<td class=\"signal\">" + String(cp.largestFreeBlock / 1024.0, 1) + " KB</td></tr>";
-    server.sendContent(row);
+  server.sendContent("<div class=\"card developer-only\"><h2>Boot Heap Checkpoints</h2><div class=\"note\">Startup instrumentation showing where heap is consumed.</div><div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
+  for (size_t i=0;i<bootHeapCheckpointCount;i++) {
+    const BootHeapCheckpoint& cp=bootHeapCheckpoints[i];
+    server.sendContent("<tr><td>"+htmlEscape(String(cp.stage))+"</td><td class=\"signal\">"+String(cp.freeHeap/1024.0,1)+" KB</td><td class=\"signal\">"+String(cp.minimumFreeHeap/1024.0,1)+" KB</td><td class=\"signal\">"+String(cp.largestFreeBlock/1024.0,1)+" KB</td></tr>");
   }
   server.sendContent("</tbody></table></div></div>");
 
-  server.sendContent("<div class=\"card\"><h2>Software Self-Tests</h2>");
-  server.sendContent(selfTestRow("Wi-Fi subsystem", wifiSubsystemInitialized ? "PASS" : "FAIL", wifiSubsystemInitialized ? "initialized" : "not initialized"));
-  if (bleSurveyEnabled) {
-    server.sendContent(selfTestRow("BLE subsystem", bleInitialized ? "PASS" : "FAIL", bleInitialized ? "initialized" : "not initialized"));
-  } else {
-    server.sendContent(selfTestRow("BLE subsystem", "PASS", "disabled by configured survey mode; BLE stack not initialized"));
-  }
-  bool wh = scanHistory && wifiApTable && wifiScanMetadata &&
-      scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS &&
-      scanHistoryRetentionLimit>=MIN_SCAN_HISTORY_RECORDS &&
-      scanHistoryRetentionLimit<=scanHistoryCapacity &&
-      historyCount<=scanHistoryRetentionLimit;
-  bool bh = !bleSurveyEnabled ||
-      (bleHistory && bleAddressTable && bleScanMetadata &&
-       bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS &&
-       bleHistoryRetentionLimit>=MIN_BLE_HISTORY_RECORDS &&
-       bleHistoryRetentionLimit<=bleHistoryCapacity &&
-       bleHistoryCount<=bleHistoryRetentionLimit);
-  server.sendContent(selfTestRow("Wi-Fi history buffer", wh ? "PASS" : "FAIL", wh ? "allocated and sane" : "allocation/capacity invalid"));
-  server.sendContent(selfTestRow("BLE history buffer", bh ? "PASS" : "FAIL",
-    !bleSurveyEnabled ? "not allocated by design" : (bh ? "allocated and sane" : "allocation/capacity invalid")));
-  bool cfg = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS &&
-      (!bleSurveyEnabled || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
-  server.sendContent(selfTestRow("Scan configuration", cfg ? "PASS" : "FAIL", cfg ? "enabled survey intervals within valid range" : "one or more values out of range"));
-  bool initialDone = !initialWifiScanPending &&
-      (!bleSurveyEnabled || !initialBleScanPending);
-  server.sendContent(selfTestRow("Initial boot scans", initialDone ? "PASS" : "WARN",
-    initialDone ? (bleSurveyEnabled ? "Wi-Fi and BLE initial scans completed" : "Wi-Fi initial scan completed; Bluetooth Survey disabled")
-                : "one or more required initial scans are still pending"));
-  bool autos = !bleSurveyEnabled || autoBleScanEnabled;
-  server.sendContent(selfTestRow("Headless automatic surveying", autos ? "PASS" : "WARN",
-    autos ? (bleSurveyEnabled ? "Wi-Fi and BLE periodic scanning enabled" : "Wi-Fi periodic scanning enabled; Bluetooth Survey disabled")
-          : "BLE automatic scanning is disabled at runtime"));
-  bool wifiCadenceOverdue = wifiAutoScanCadenceOverdue();
-  server.sendContent(selfTestRow("Wi-Fi auto-scan cadence", wifiCadenceOverdue ? "WARN" : "PASS",
-    wifiAutoScanDiagnosticLabel() + "; starts " + String(wifiAutoScanStartCount) +
-    ", completions " + String(wifiAutoScanCompletionCount) +
-    ", start failures " + String(wifiAutoScanStartFailureCount) +
-    ", completion failures " + String(wifiAutoScanCompletionFailureCount)));
-  server.sendContent(selfTestRow("Wi-Fi scan timing", wifiScanDurationCount > 0 ? "PASS" : "WARN",
-    wifiScanDurationSummaryLabel()));
-  server.sendContent(selfTestRow("Session checkpoint storage", spiffsMounted ? "PASS" : "WARN",
-    spiffsMounted ? sessionCheckpointStatus : "SPIFFS unavailable"));
-  server.sendContent(selfTestRow("mDNS hostname", mdnsStarted ? "PASS" : "WARN",
-    mdnsStarted ? mdnsWebAddress() : mdnsStatusMessage));
-  {
-    uint32_t minFreeHeap = ESP.getMinFreeHeap();
-    bool currentHeapOk = bleSurveyEnabled
-      ? freeHeap >= 24 * 1024
-      : freeHeap >= HEAP_WARN_BYTES;
-    bool lowWaterOk = bleSurveyEnabled
-      ? minFreeHeap >= DUAL_RADIO_MIN_HEAP_WARN_BYTES
-      : minFreeHeap >= HEAP_WARN_BYTES;
-    String heapDetail =
-      String(freeHeap/1024) + " KB free; " +
-      String(minFreeHeap/1024) + " KB minimum";
-    server.sendContent(
-      selfTestRow(
-        "Heap reserve",
-        (currentHeapOk && lowWaterOk) ? "PASS" : "WARN",
-        heapDetail
-      )
-    );
-  }
-  server.sendContent(selfTestRow("Application space", unusedAppBytes>64*1024 ? "PASS" : "WARN", String(unusedAppBytes/1024) + " KB unused in running app partition"));
-  bool resetWarn = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT || rr==ESP_RST_WDT || rr==ESP_RST_BROWNOUT;
-  server.sendContent(selfTestRow("Boot/reset diagnostic", resetWarn ? "WARN" : "PASS", resetReasonLabel(rr)));
-  server.sendContent("<div class=\"note\">WARN indicates a nonfatal condition worth reviewing. SPIFFS is used only for explicit/controlled-reboot session checkpoints; continuous persistent logging is not enabled. In dual-radio mode the BLE stack and fixed compact tables may intentionally leave less than the Wi-Fi-only heap margin.</div></div>");
-  server.sendContent(
-    "<div class=\"card\"><h2>Session &amp; History Test Tools</h2>"
-    "<div class=\"row\"><span class=\"label\">Session Checkpoint</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
-    "<div class=\"buttons\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save / Checkpoint Session</button></form>"
-    "<form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Saved Session</button></form></div>"
-    "<div class=\"note\">Checkpoint storage is intended for controlled reboots, not continuous logging. A valid saved checkpoint is restored automatically at boot.</div>"
-    "<h3>Developer History Prefill</h3>"
-    "<div class=\"buttons\">"
-    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
-    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
-    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
-    "</div><div class=\"note\"><strong>TEST FEATURE:</strong> adds synthetic TEST-PREFILL networks directly to the compact Wi-Fi history. Synthetic data is not a substitute for radio/endurance testing and will appear in CSV/UI until cleared or rolled out.</div></div>"
-  );
+  server.sendContent("<div class=\"card advanced-only\"><h2>Session</h2><div class=\"row\"><span class=\"label\">Session Restore</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div><div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
+    "<div class=\"developer-only\"><div class=\"buttons\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save / Checkpoint Session</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Saved Session</button></form></div><div class=\"note\">Manual checkpoint controls are for development and controlled-reboot testing; continuous persistent logging is not enabled.</div></div></div>");
+  server.sendContent("<div class=\"card developer-only\"><h2>History Test Tools</h2><div class=\"buttons\"><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form></div><div class=\"note\"><strong>TEST FEATURE:</strong> inserts synthetic TEST-PREFILL Wi-Fi observations into the real compact history.</div></div>");
   server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
-  sendThemeScript();
-  server.sendContent("</div></body></html>");
-  server.sendContent("");
+  sendThemeScript(); server.sendContent("</div></body></html>"); server.sendContent("");
 }
 
 
@@ -5158,6 +4960,7 @@ const uint32_t STATUS_SCHEMA_VERSION = 1;
 const uint32_t CONFIG_SCHEMA_VERSION = 1;
 const size_t MAX_CONFIG_IMPORT_BYTES = 4096;
 
+// Purpose: Escapes a string for safe inclusion in generated JSON.
 String jsonEscape(String input) {
   String out;
   out.reserve(input.length() + 8);
@@ -5184,6 +4987,7 @@ String jsonEscape(String input) {
   return out;
 }
 
+// Purpose: Returns a JSON string literal including surrounding quotes.
 String jsonQuoted(const String& value) {
   return String("\"") + jsonEscape(value) + "\"";
 }
@@ -5205,6 +5009,7 @@ struct PortableConfig {
 PortableConfig readPersistedPortableConfig();
 String portableConfigJson(const PortableConfig& c);
 
+// Purpose: Reads the non-secret persisted configuration values that are eligible for export/import.
 PortableConfig readPersistedPortableConfig() {
   PortableConfig c = {};
 
@@ -5241,6 +5046,7 @@ PortableConfig readPersistedPortableConfig() {
   return c;
 }
 
+// Purpose: Serializes portable non-secret configuration into the configuration-export JSON schema.
 String portableConfigJson(const PortableConfig& c) {
   String json;
   json.reserve(700);
@@ -5260,6 +5066,7 @@ String portableConfigJson(const PortableConfig& c) {
   return json;
 }
 
+// Purpose: Streams the portable non-secret configuration JSON download.
 void handleConfigExport() {
   markExplicitUserInteraction();
   PortableConfig c = readPersistedPortableConfig();
@@ -5530,6 +5337,7 @@ String configImportResultJson(
   return json;
 }
 
+// Purpose: Validates an uploaded configuration JSON document and applies supported settings atomically.
 void handleConfigImport() {
   markExplicitUserInteraction();
 
@@ -5667,6 +5475,7 @@ void handleConfigImport() {
   );
 }
 
+// Purpose: Streams the comprehensive diagnostic status snapshot as JSON.
 void handleStatusJsonExport() {
   markExplicitUserInteraction();
   ChannelAnalysis channel = analyzeLatestWifiScan();
@@ -5861,95 +5670,53 @@ void handleStatusJsonExport() {
   server.sendContent("");
 }
 
+// Purpose: Builds the V34 Settings page with ordinary settings in Standard and maintenance/diagnostic tools in deeper views.
 void handleSettingsPage() {
   markExplicitUserInteraction();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Settings</title>");
-  sendThemeBootstrapScript();
-  server.sendContent(pageStyles());
-  server.sendContent("</head><body><div class=\"container\">");
-  sendSiteNavigation("settings");
-  server.sendContent("<h1>Settings</h1><div class=\"card\"><h2>Infrastructure Wi-Fi</h2>");
-  String s;
-  s.reserve(3000);
-  s += "<div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
+  sendThemeBootstrapScript(); server.sendContent(pageStyles());
+  server.sendContent("</head><body><div class=\"container\">"); sendSiteNavigation("settings"); server.sendContent("<h1>Settings</h1>");
+
+  String s; s.reserve(1200);
+  s += "<div class=\"card\"><h2>Infrastructure Wi-Fi</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected") + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) {
     s += "<div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + "</span></div>";
-    s += "<div class=\"row\"><span class=\"label\">IP Address</span><span class=\"value\">" + WiFi.localIP().toString() + "</span></div>";
+    s += "<div class=\"row advanced-only\"><span class=\"label\">IP Address</span><span class=\"value\">" + WiFi.localIP().toString() + "</span></div>";
   }
-  s += "<form class=\"controls\" action=\"/wifi-save\" method=\"post\"><div class=\"control\"><label for=\"sta-ssid\">SSID</label><input id=\"sta-ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" required></div><div class=\"control\"><label for=\"sta-password\">Password</label><input id=\"sta-password\" name=\"password\" type=\"password\" maxlength=\"63\"></div><button type=\"submit\">Connect &amp; Save</button></form>";
-  s += "<form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>";
-  s += "<div class=\"note\">The stored infrastructure passphrase is never displayed. A connection must succeed before new credentials are saved. Infrastructure Wi-Fi is optional; failed or absent infrastructure connectivity does not stop surveying.</div></div>";
-  s += "<div class=\"card\"><h2>Network Identity</h2>"
-    "<div class=\"row\"><span class=\"label\">mDNS Hostname</span><span class=\"value\">" + htmlEscape(mdnsHostname) + ".local</span></div>"
-    "<div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\">" + htmlEscape(mdnsWebAddress()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>"
-    "<form class=\"controls\" action=\"/hostname-save\" method=\"post\">"
-    "<div class=\"control\"><label for=\"mdns-hostname\">Hostname</label><input id=\"mdns-hostname\" name=\"hostname\" type=\"text\" maxlength=\"32\" value=\"" + htmlEscape(mdnsHostname) + "\" required></div>"
-    "<button type=\"submit\">Save Hostname &amp; Restart</button></form>"
-    "<div class=\"note\">Use letters, numbers, and hyphens only. The name cannot begin or end with a hyphen. The normal friendly address is &lt;hostname&gt;.local. mDNS support on a directly connected ESP32 access point can vary by client, so the displayed IP addresses remain the fallback.</div></div>";
-  s += "<div class=\"card\"><h2>Survey Access Point</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div><div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div><div class=\"buttons\"><a class=\"button\" href=\"/ap\">Access Point Settings</a></div></div>";
-  s += "<div class=\"card\"><h2>Survey Mode</h2>"
-    "<div class=\"row\"><span class=\"label\">Bluetooth Survey</span><span class=\"value\">" +
-    String(bleSurveyEnabled ? "Enabled" : "Disabled - maximum Wi-Fi history") + "</span></div>"
-    "<form class=\"controls\" action=\"/ble-mode\" method=\"post\">"
-    "<input type=\"hidden\" name=\"enabled\" value=\"" + String(bleSurveyEnabled ? "0" : "1") + "\">"
-    "<button type=\"submit\">" + String(bleSurveyEnabled ? "Disable Bluetooth Survey" : "Enable Bluetooth Survey") + "</button></form>"
-    "<div class=\"note\">Bluetooth is disabled by default to maximize Wi-Fi history depth. Combined BLE surveying is a limited mode on this hardware because the BLE stack substantially reduces heap and retained-history capacity. Changing this setting is stored in NVS and restarts the ESP32. "
-    "The restart is intentional: BLE uses a large persistent heap allocation, so survey histories must be sized after the selected radio mode is established.</div></div>";
-  s += "<div class=\"card\"><h2>Interface &amp; Indicators</h2>"
-    "<form class=\"controls\" action=\"/interface-settings\" method=\"post\">"
-    "<div class=\"control\"><label><input type=\"checkbox\" name=\"ledEnabled\" value=\"1\" " + String(statusLedEnabled ? "checked" : "") + "> Enable status LED indicators</label></div>"
-    "<button type=\"submit\">Save Interface Settings</button></form>"
-    "<form class=\"controls\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
-    "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled on GPIO 2" : "Disabled by setting") : "Not available") + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Survey Page Live Updates</span><span class=\"value\">" + String(webAutoRefreshEnabled ? "Enabled" : "Disabled") + "</span></div>"
-    "<div class=\"note\">The LED setting is saved here. Live Updates are controlled immediately from the checkbox in the page header and are also stored in NVS. Theme and Standard/Advanced View selections remain browser-local.</div></div>";
-  server.sendContent(s);
-  server.sendContent(
-    "<div class=\"card\"><h2>Export &amp; Configuration</h2>"
-    "<div class=\"buttons\">"
-    "<a class=\"button\" href=\"/status.json\">Download Status JSON</a>"
-    "<a class=\"button\" href=\"/config.json\">Download Configuration JSON</a>"
-    "</div>"
-    "<div class=\"note\">Status JSON is a current diagnostic snapshot and does not contain the retained observation rows. "
-    "Configuration JSON contains supported non-secret settings only. Infrastructure Wi-Fi and access-point passwords are deliberately excluded.</div>"
-    "<div class=\"control\"><label for=\"config-import-file\">Restore configuration</label>"
-    "<input id=\"config-import-file\" type=\"file\" accept=\"application/json,.json\"></div>"
-    "<div class=\"buttons\"><button id=\"config-import-button\" type=\"button\" onclick=\"importConfiguration()\">Validate &amp; Apply Configuration</button></div>"
-    "<div id=\"config-import-result\" class=\"note\">Import validates the complete supported schema before writing NVS. "
-    "Settings that require restart are saved but are not silently restarted.</div>"
-    "</div>"
-  );
-  server.sendContent(
-    "<script>"
-    "async function importConfiguration(){"
-      "const f=document.getElementById('config-import-file');"
-      "const o=document.getElementById('config-import-result');"
-      "if(!f.files||!f.files.length){o.textContent='Choose a configuration JSON file first.';return;}"
-      "const file=f.files[0];"
-      "if(file.size>4096){o.textContent='Configuration file is larger than the 4096-byte import limit.';return;}"
-      "o.textContent='Validating configuration...';"
-      "try{"
-        "const body=await file.text();"
-        "const r=await fetch('/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'});"
-        "const j=await r.json();"
-        "if(!j.ok){o.textContent='Import rejected: '+j.message;return;}"
-        "let msg=j.message+' '+j.applied+' setting group(s) changed.';"
-        "if(j.restartRequired){msg+=' Restart required for: '+j.restartReason+'.';}"
-        "else{msg+=' No restart required.';}"
-        "o.textContent=msg;"
-      "}catch(e){o.textContent='Configuration import failed: '+e;}"
-    "}"
-    "</script>"
-  );
-  server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>");
-  sendThemeScript();
-  server.sendContent("</div></body></html>");
-  server.sendContent("");
+  s += "<form class=\"controls\" action=\"/wifi-save\" method=\"post\"><div class=\"control\"><label for=\"sta-ssid\">SSID</label><input id=\"sta-ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" required></div><div class=\"control\"><label for=\"sta-password\">Password</label><input id=\"sta-password\" name=\"password\" type=\"password\" maxlength=\"63\"></div><button type=\"submit\">Connect &amp; Save</button></form><form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>"
+    "<div class=\"note\">Infrastructure Wi-Fi is optional and does not affect automatic surveying. New credentials are saved only after a successful connection; stored passwords are never displayed.</div></div>";
+  server.sendContent(s); s.remove(0);
+
+  s += "<div class=\"card\"><h2>Device Hostname</h2><div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\">" + htmlEscape(mdnsWebAddress()) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>"
+    "<form class=\"controls\" action=\"/hostname-save\" method=\"post\"><div class=\"control\"><label for=\"mdns-hostname\">Hostname</label><input id=\"mdns-hostname\" name=\"hostname\" type=\"text\" maxlength=\"32\" value=\"" + htmlEscape(mdnsHostname) + "\" required></div><button type=\"submit\">Save Hostname &amp; Restart</button></form>"
+    "<div class=\"note\">Use letters, numbers, and hyphens only; the name cannot begin or end with a hyphen.</div><div class=\"note advanced-only\">The friendly address is &lt;hostname&gt;.local. mDNS support can vary by client, so IP addresses remain the fallback.</div></div>";
+  server.sendContent(s); s.remove(0);
+
+  s += "<div class=\"card\"><h2>Device AP</h2><div class=\"row\"><span class=\"label\">Status</span><span class=\"value\">" + String(apRunning ? "Running" : "Disabled") + "</span></div><div class=\"row\"><span class=\"label\">Broadcast SSID</span><span class=\"value\">" + htmlEscape(apSSID) + "</span></div><div class=\"buttons\"><a class=\"button\" href=\"/ap\">Access Point Settings</a></div></div>";
+  server.sendContent(s); s.remove(0);
+
+  s += "<div class=\"card\"><h2>Survey Mode</h2><div class=\"row\"><span class=\"label\">Bluetooth Survey</span><span class=\"value\">" + String(bleSurveyEnabled ? "Enabled" : "Disabled") + "</span></div><form class=\"controls\" action=\"/ble-mode\" method=\"post\"><input type=\"hidden\" name=\"enabled\" value=\"" + String(bleSurveyEnabled ? "0" : "1") + "\"><button type=\"submit\">" + String(bleSurveyEnabled ? "Disable Bluetooth Survey" : "Enable Bluetooth Survey") + "</button></form>"
+    "<div class=\"note\">Enabling Bluetooth allows simultaneous Wi-Fi and Bluetooth surveying, but significantly reduces Wi-Fi history capacity. Changing this mode requires a restart.</div>"
+    "<div class=\"note developer-only\">The selection is stored in NVS. BLE creates a persistent heap allocation at boot, so survey histories are sized after the selected radio mode is initialized.</div></div>";
+  server.sendContent(s); s.remove(0);
+
+  s += "<div class=\"card\"><h2>Interface &amp; Indicators</h2><form class=\"controls\" action=\"/interface-settings\" method=\"post\"><div class=\"control\"><label><input type=\"checkbox\" name=\"ledEnabled\" value=\"1\" " + String(statusLedEnabled ? "checked" : "") + "> Enable status LED indicators</label></div><button type=\"submit\">Save Interface Settings</button></form>"
+    "<div class=\"row\"><span class=\"label\">Status LED</span><span class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled") : "Not available") + "</span></div>"
+    "<form class=\"controls advanced-only\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
+    "<div class=\"row developer-only\"><span class=\"label\">Status LED GPIO</span><span class=\"value\">" + String(STATUS_LED_PIN) + "</span></div>"
+    "<div class=\"note advanced-only\">Theme and Standard/Advanced/Developer view selections are stored in this browser, not on the ESP32.</div></div>";
+  server.sendContent(s); s.remove(0);
+
+  server.sendContent("<div class=\"card advanced-only\"><h2>Configuration Backup &amp; Restore</h2><div class=\"buttons\"><a class=\"button\" href=\"/config.json\">Download Configuration</a></div><div class=\"note\">Configuration export contains supported non-secret settings; infrastructure and Device AP passwords are excluded.</div><div class=\"control\"><label for=\"config-import-file\">Restore configuration</label><input id=\"config-import-file\" type=\"file\" accept=\"application/json,.json\"></div><div class=\"buttons\"><button id=\"config-import-button\" type=\"button\" onclick=\"importConfiguration()\">Validate &amp; Apply Configuration</button></div><div id=\"config-import-result\" class=\"note\">Import validates the complete supported schema before writing settings. Restart-required changes are saved but are not silently restarted.</div></div>");
+  server.sendContent("<div class=\"card developer-only\"><h2>Diagnostics Export</h2><div class=\"buttons\"><a class=\"button\" href=\"/status.json\">Download Status JSON</a></div><div class=\"note\">Status JSON is a current diagnostic snapshot and does not contain retained observation rows.</div></div>");
+  server.sendContent("<script>async function importConfiguration(){const f=document.getElementById('config-import-file');const o=document.getElementById('config-import-result');if(!f||!o)return;if(!f.files||!f.files.length){o.textContent='Choose a configuration JSON file first.';return;}const file=f.files[0];if(file.size>4096){o.textContent='Configuration file is larger than the 4096-byte import limit.';return;}o.textContent='Validating configuration...';try{const body=await file.text();const r=await fetch('/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'});const j=await r.json();if(!j.ok){o.textContent='Import rejected: '+j.message;return;}let msg=j.message+' '+j.applied+' setting group(s) changed.';if(j.restartRequired){msg+=' Restart required for: '+j.restartReason+'.';}else{msg+=' No restart required.';}o.textContent=msg;}catch(e){o.textContent='Configuration import failed: '+e;}}</script>");
+  server.sendContent("<div class=\"footer\">ESP32 Web Interface</div>"); sendThemeScript(); server.sendContent("</div></body></html>"); server.sendContent("");
 }
 
+// Purpose: Validates and saves a new device hostname, checkpoints the session, and performs a controlled restart.
 void handleHostnameSave() {
   markExplicitUserInteraction();
   if (!server.hasArg("hostname")) {
@@ -5980,6 +5747,7 @@ void handleHostnameSave() {
   ESP.restart();
 }
 
+// Purpose: Saves ESP32-resident interface settings such as the status LED preference.
 void handleInterfaceSettings() {
   markExplicitUserInteraction();
   // Live Updates are managed by the persistent header control. Saving the LED
@@ -5991,6 +5759,7 @@ void handleInterfaceSettings() {
   server.send(303, "text/plain", "Interface settings saved.");
 }
 
+// Purpose: Runs the status LED self-test requested from the Settings page.
 void handleLedSelfTest() {
   markExplicitUserInteraction();
   runStatusLedSelfTest();
@@ -5998,6 +5767,7 @@ void handleLedSelfTest() {
   server.send(303, "text/plain", "Status LED self-test complete.");
 }
 
+// Purpose: Validates infrastructure Wi-Fi credentials, connects, and saves them only after connection succeeds.
 void handleSaveStationSettings() {
   markExplicitUserInteraction();
   if (!server.hasArg("ssid")) {
@@ -6017,6 +5787,7 @@ void handleSaveStationSettings() {
   server.send(303, "text/plain", connected ? "Connected and saved." : "Connection failed; previous saved credentials were retained.");
 }
 
+// Purpose: Persists the requested Bluetooth survey mode, attempts a checkpoint, and performs the required controlled restart.
 void handleBleModeChange() {
   markExplicitUserInteraction();
   if (!server.hasArg("enabled")) {
@@ -6039,7 +5810,7 @@ void handleBleModeChange() {
     "</head><body><div class=\"container\"><div class=\"card\"><h1>Bluetooth Survey Mode Updated</h1><p>Bluetooth Survey will be " +
     String(requested ? "enabled" : "disabled") +
     " after restart.</p><p>The ESP32 is restarting now. This page will reconnect automatically.</p>"
-    "<p id=\"reconnect-status\">Waiting for the surveyor...</p></div></div>"
+    "<p id=\"reconnect-status\">Waiting for the surveyor...</p><p><a class=\"button\" href=\"/ble\">Return to Bluetooth Survey</a></p></div></div>"
     "<script>(function(){setTimeout(function retry(){fetch('/ble',{cache:'no-store'}).then(function(r){"
     "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
     "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
@@ -6049,6 +5820,7 @@ void handleBleModeChange() {
   ESP.restart();
 }
 
+// Purpose: Deletes saved infrastructure Wi-Fi credentials and returns the radio to a usable station/AP mode.
 void handleClearStationSettings() {
   markExplicitUserInteraction();
   eraseCredentials();
@@ -6063,6 +5835,7 @@ void handleClearStationSettings() {
 // Access point web configuration
 // ============================================================
 
+// Purpose: Builds the Device AP configuration page.
 void handleAccessPointSettingsPage() {
   markExplicitUserInteraction();
   String html = R"rawliteral(
@@ -6223,6 +5996,7 @@ void handleAccessPointSettingsPage() {
   server.send(200, "text/html", html);
 }
 
+// Purpose: Validates and saves Device AP settings, then applies the restart/reconfiguration behavior required by those changes.
 void handleSaveAccessPointSettings() {
   markExplicitUserInteraction();
   bool requestedEnabled = server.hasArg("enabled");
@@ -6291,6 +6065,7 @@ void handleSaveAccessPointSettings() {
 // Web server
 // ============================================================
 
+// Purpose: Registers all HTTP routes and starts the ESP32 web server.
 void startWebServer() {
   if (webServerStarted) {
     return;
@@ -6364,6 +6139,7 @@ void startWebServer() {
 // Serial interface - text-oriented parity with the web UI
 // ============================================================
 
+// Purpose: Prints the top-level serial command menu.
 void printSerialMainMenu() {
   Serial.println();
   Serial.println("============================================================");
@@ -6381,6 +6157,7 @@ void printSerialMainMenu() {
   Serial.print("> ");
 }
 
+// Purpose: Prints Wi-Fi survey status and retained-network summaries to Serial.
 void printWifiSurveySerial() {
   Serial.println();
   Serial.println("============================================================");
@@ -6482,6 +6259,7 @@ void printWifiSurveySerial() {
   Serial.print("> ");
 }
 
+// Purpose: Prints Bluetooth survey status and retained-device summaries to Serial.
 void printBluetoothSurveySerial() {
   Serial.println();
   Serial.println("============================================================");
@@ -6522,6 +6300,7 @@ void printBluetoothSurveySerial() {
   Serial.print("> ");
 }
 
+// Purpose: Prints system/device/network/memory diagnostics to Serial.
 void printSystemSerial() {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t minHeap = ESP.getMinFreeHeap();
@@ -6588,6 +6367,7 @@ void printSystemSerial() {
   Serial.print("> ");
 }
 
+// Purpose: Prints the firmware self-test results to Serial.
 void printSoftwareSelfTestsSerial() {
   bool wifiHistOk = scanHistory && wifiApTable && wifiScanMetadata &&
                     scanHistoryCapacity >= MIN_SCAN_HISTORY_RECORDS;
@@ -6623,6 +6403,7 @@ void printSoftwareSelfTestsSerial() {
   Serial.println();
 }
 
+// Purpose: Prints current configurable settings and relevant state to Serial.
 void printSettingsSerial() {
   Serial.println();
   Serial.println("============================================================");
@@ -6653,8 +6434,10 @@ void printSettingsSerial() {
   Serial.print("> ");
 }
 
+// Purpose: Compatibility alias that prints the current serial main menu.
 void printMenu() { printSerialMainMenu(); }
 
+// Purpose: Extracts and trims the argument portion of a serial command with a known prefix.
 String commandArgument(const String& command, const String& prefix) {
   if (command.length() <= prefix.length()) return "";
   String value = command.substring(prefix.length());
@@ -6662,6 +6445,7 @@ String commandArgument(const String& command, const String& prefix) {
   return value;
 }
 
+// Purpose: Parses one serial command and dispatches it to the appropriate survey, settings, diagnostic, or test action.
 void handleSerialCommand() {
   if (!Serial.available()) return;
 
@@ -6773,6 +6557,7 @@ void handleSerialCommand() {
 // Setup
 // ============================================================
 
+// Purpose: Arduino entry point that initializes hardware, settings, radios, histories, checkpoint restore, web services, and initial survey scheduling.
 void setup() {
   Serial.begin(115200);
   delay(1500);
@@ -6901,6 +6686,7 @@ void setup() {
 // Automatic scan service
 // ============================================================
 
+// Purpose: Runs the required first Wi-Fi/BLE scans shortly after boot without blocking overall startup longer than necessary.
 void serviceInitialSurveyScans() {
   unsigned long elapsed = millis() - surveyServicesReadyMs;
 
@@ -6934,6 +6720,7 @@ void serviceInitialSurveyScans() {
   }
 }
 
+// Purpose: Schedules automatic Wi-Fi scans while honoring active work, interaction defer, retry backoff, and configured interval.
 void serviceAutomaticScan() {
   if (wifiScanInProgress || csvExportInProgress || userInteractionDeferActive()) return;
 
@@ -6952,6 +6739,7 @@ void serviceAutomaticScan() {
   beginLoggedWifiScan(false, true);
 }
 
+// Purpose: Schedules periodic BLE scans when Bluetooth Survey and automatic BLE surveying are enabled.
 void serviceAutomaticBLEScan() {
   if (!bleSurveyEnabled || !autoBleScanEnabled || wifiScanInProgress ||
       csvExportInProgress || userInteractionDeferActive()) return;
@@ -6968,6 +6756,7 @@ void serviceAutomaticBLEScan() {
 // Main loop
 // ============================================================
 
+// Purpose: Arduino main loop that continuously services web requests, serial commands, scan completion, reconnect diagnostics, and automatic survey scheduling.
 void loop() {
   if (webServerStarted) {
     server.handleClient();
