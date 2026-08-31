@@ -29,6 +29,9 @@ A persistent **View** selector controls information depth:
 
 The views are cumulative: Standard ⊂ Advanced ⊂ Developer. The navigation, Live Updates control, View selector, and Theme selector are held in a sticky card so they remain available while scrolling long pages.
 
+## 3D Printed Enclosure
+**[Honeycomb Case](https://www.printables.com/model/1826305-esp32-honeycomb-case-push-together-no-hardwaretool)*
+
 ## Key features
 
 ### Headless surveying
