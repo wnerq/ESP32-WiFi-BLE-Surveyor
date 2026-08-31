@@ -1,63 +1,17 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<script>
-(function(){const v=localStorage.getItem('demo-theme')||'system';document.documentElement.dataset.theme=
-v==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):v;})();
-</script>
-<title>ESP32 Wi-Fi Survey — Demo</title>
-<link rel="stylesheet" href="styles.css">
-</head>
-<body><div class="container"><div class="site-header"><div class="site-title">ESP32 Wireless Surveyor</div>
-<nav class="nav"><a class="active" href="index.html">Wi-Fi</a><a class="" href="bluetooth.html">Bluetooth</a><a class="" href="system.html">System</a><a class="" href="settings.html">Settings</a></nav>
-<select class="theme-select" data-theme-select aria-label="Theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
-</div>
-<div class="demo-banner">Documentation demo — simulated data; no ESP32 is connected.</div>
-<h1>Wi-Fi Survey</h1>
-<div class="card">
-<div class="row"><span class="label">Connected SSID</span><span class="value">Plant-Controls</span></div>
-<div class="row"><span class="label">Connected BSSID</span><span class="value">90:09:D0:37:D1:87</span></div>
-<div class="row"><span class="label">Current Signal</span><span class="value">-44 dBm</span></div>
-</div>
-<div class="card"><h2>Scan Logging</h2>
-<div class="grid-3">
-<div><div class="small">Automatic scanning</div><div class="kpi good">ON</div></div>
-<div><div class="small">Scan interval</div><div class="kpi">30 s</div></div>
-<div><div class="small">Scans this session</div><div class="kpi">19</div></div>
-</div>
-<div class="row"><span class="label">Stored Observations</span><span class="value">72 / 6253 retained / 6253 allocated</span></div>
-<div class="row"><span class="label">Scan Groups Retained</span><span class="value">19</span></div>
-<div class="row"><span class="label">Oldest Record Age</span><span class="value">14m 12s ago</span></div>
-<div class="row"><span class="label">Retained Time Window</span><span class="value">14m 5s</span></div>
-<div class="row"><span class="label">History RAM</span><span class="value">54.9 KB total</span></div>
-<div class="row"><span class="label">Observation Storage</span><span class="value">36.6 KB; 6 bytes/observation</span></div>
-<div class="row"><span class="label">AP Table</span><span class="value">6 / 256 APs; 10.3 KB allocated</span></div>
-<div class="row"><span class="label">Scan Metadata</span><span class="value">1024 slots; 8.0 KB allocated</span></div>
-<div class="row"><span class="label">Free Heap</span><span class="value">83.6 KB</span></div>
-<form class="settings-row">
-<div class="control"><label>Interval (seconds)</label><input type="number" value="30" min="5" max="3600"></div>
-<div class="control"><label>Retention limit (observations)</label><input type="number" value="6253" min="50" max="6253"></div>
-<div class="checkbox-stack"><label><input type="checkbox" checked> Automatic scanning</label></div>
-<button data-demo-action="Apply scan settings">Apply</button>
-</form>
-<div class="buttons"><a class="button" href="#" data-demo-action="Wi-Fi scan started">Scan Now</a><a class="button" href="#" data-demo-action="CSV download">Download CSV</a><a class="button danger" href="#" data-demo-action="Clear Wi-Fi history">Clear History</a></div>
-</div>
-<div class="card"><h2>2.4 GHz Channel Analysis</h2>
-<div class="row"><span class="label">Suggested channel</span><span class="value good">Channel 1</span></div>
-<div class="row"><span class="label">Reason</span><span class="value">Lowest RSSI-weighted co/adjacent-channel interference in latest scan</span></div>
-<div class="table-wrap"><table><thead><tr><th>Candidate</th><th>APs</th><th>Strongest interferer</th><th>Relative score</th></tr></thead>
-<tbody><tr><td>1</td><td>1</td><td>-74 dBm</td><td class="good">18</td></tr><tr><td>6</td><td>2</td><td>-44 dBm</td><td>63</td></tr><tr><td>11</td><td>3</td><td>-57 dBm</td><td class="warn">48</td></tr></tbody></table></div>
-<div class="note">Suggestion compares channels 1, 6, and 11 using visible AP strength plus co-channel and adjacent-channel overlap. Lower score is preferred. This does not measure actual airtime utilization or non-Wi-Fi interference.</div>
-</div>
-<div class="card"><h2>RSSI History</h2>
-<div class="row"><span class="label">Selected Network</span><span class="value">Plant-Controls</span></div>
-<div class="row"><span class="label">Selected BSSID</span><span class="value">90:09:D0:37:D1:87</span></div>
-<canvas data-points="-46,-45,-44,-47,-43,-42,-44,-41,-40,-42,-45,-44,-43,-44"></canvas>
-<div class="note">Each point is one simulated scan observation. The production firmware allows selecting a BSSID from the table to redraw this plot.</div>
-</div>
-<div class="card"><h2>Observed Networks</h2><div class="note">One row per BSSID observed during this simulated session. Column headers are sortable in this static demo.</div>
-<div class="table-wrap"><table><thead><tr><th data-sort>SSID</th><th data-sort>BSSID</th><th data-sort>CH</th><th data-sort>Current</th><th data-sort>Min</th><th data-sort>Max</th><th data-sort>Average</th><th data-sort>Obs.</th><th data-sort>Security</th><th data-sort>First Seen</th><th data-sort>Last Seen</th></tr></thead><tbody><tr class="connected"><td>Plant-Controls (connected)</td><td>90:09:D0:37:D1:87</td><td data-value="5">5</td><td data-value="-44">-44 dBm</td><td data-value="-47">-47 dBm</td><td data-value="-40">-40 dBm</td><td data-value="-43.5">-43.5 dBm</td><td data-value="19">19</td><td>WPA2-PSK</td><td>14m 12s ago</td><td>7s ago</td></tr><tr><td>Guest-WiFi</td><td>60:83:E7:74:28:1A</td><td data-value="10">10</td><td data-value="-57">-57 dBm</td><td data-value="-63">-63 dBm</td><td data-value="-52">-52 dBm</td><td data-value="-57.8">-57.8 dBm</td><td data-value="18">18</td><td>WPA2-PSK</td><td>14m 12s ago</td><td>7s ago</td></tr><tr><td>Warehouse-AP</td><td>82:9C:8E:7C:CD:05</td><td data-value="1">1</td><td data-value="-74">-74 dBm</td><td data-value="-82">-82 dBm</td><td data-value="-70">-70 dBm</td><td data-value="-76.1">-76.1 dBm</td><td data-value="13">13</td><td>WPA2/WPA3-PSK</td><td>11m 6s ago</td><td>7s ago</td></tr><tr><td>Maintenance</td><td>84:D3:43:AD:77:62</td><td data-value="11">11</td><td data-value="-86">-86 dBm</td><td data-value="-92">-92 dBm</td><td data-value="-82">-82 dBm</td><td data-value="-87.4">-87.4 dBm</td><td data-value="9">9</td><td>WPA/WPA2-PSK</td><td>8m 1s ago</td><td>37s ago</td></tr><tr><td>Hidden network</td><td>02:01:12:B0:A5:91</td><td data-value="6">6</td><td data-value="-89">-89 dBm</td><td data-value="-94">-94 dBm</td><td data-value="-85">-85 dBm</td><td data-value="-89.9">-89.9 dBm</td><td data-value="6">6</td><td>WPA2-PSK</td><td>5m 29s ago</td><td>1m 7s ago</td></tr><tr><td>Mobile-Hotspot</td><td>3A:5B:71:29:0E:C4</td><td data-value="11">11</td><td data-value="-67">-67 dBm</td><td data-value="-78">-78 dBm</td><td data-value="-62">-62 dBm</td><td data-value="-69.6">-69.6 dBm</td><td data-value="7">7</td><td>WPA2-PSK</td><td>4m 10s ago</td><td>7s ago</td></tr></tbody></table></div>
-</div>
-<div class="footer">ESP32 Wireless Surveyor V23 — static demonstration package</div></div><script src="app.js"></script></body></html>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP32 Wi-Fi Survey — V34b Demo</title><link rel="stylesheet" href="styles.css"></head><body><div class="container">
+<div class="site-header"><div class="header-top"><div class="site-title">ESP32 Wireless Surveyor</div><nav class="nav"><a class="active" href="index.html">Wi-Fi</a><a href="bluetooth.html">Bluetooth</a><a href="system.html">System</a><a href="settings.html">Settings</a></nav></div><div class="header-controls"><label class="control-inline"><input type="checkbox" checked> Live updates</label><div class="control-inline"><span>View</span><span class="segmented"><button data-view="standard">Standard</button><button data-view="advanced">Advanced</button><button data-view="developer">Developer</button></span></div><label class="control-inline">Theme <select class="theme-select" data-theme-select><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div></div>
+<div class="demo-banner">Documentation demo — simulated V34b data; no ESP32 is connected.</div><h1>Wi-Fi Survey</h1>
+<div class="card"><h2>Survey Status &amp; Controls</h2><div class="grid-3"><div><div class="small">Surveying</div><div class="kpi good">Always On</div></div><div><div class="small">Scan Interval</div><div class="kpi">30 s</div></div><div><div class="small">Scans This Session</div><div class="kpi">97</div></div></div><div class="row"><span class="label">Last Scan</span><span class="value">7s ago</span></div><form class="settings-row"><div class="control"><label>Scan Interval (seconds)</label><input type="number" value="30" min="5" max="3600"></div><button data-demo-action="Save Wi-Fi scan interval">Apply</button></form><div class="buttons"><a class="button" href="#" data-demo-action="Wi-Fi scan started">Scan Now</a><a class="button" href="#" data-demo-action="Refresh page">Refresh</a></div></div>
+<div class="card"><h2>History</h2><div class="row"><span class="label">Stored Observations</span><span class="value">258 / 3897</span></div><div class="row"><span class="label">Retained Scans</span><span class="value">78</span></div><div class="row"><span class="label">Oldest Data</span><span class="value">8h 3m ago</span></div><div class="row"><span class="label">Retained Time Window</span><span class="value">8h 0m</span></div><div class="buttons"><a class="button" href="#" data-demo-action="CSV download">Download CSV</a><a class="button danger" href="#" data-demo-action="Clear Wi-Fi history">Clear History</a></div></div>
+<div class="card" id="rssi"><h2>RSSI History — Plant-Controls</h2><canvas class="plot" data-points="-48,-47,-46,-49,-45,-44,-46,-43,-42,-44,-47,-46,-45,-44"></canvas><div class="note">Click a network below to select that retained BSSID in the real firmware. The heading follows the last-clicked network.</div></div>
+<div class="card"><h2>Observed Networks</h2><div class="note">Standard shows the fields most useful during a survey. Advanced and Developer progressively add detail.</div><div class="table-wrap"><table><thead><tr><th data-sort>SSID</th><th data-sort>Channel</th><th data-sort>Last</th><th data-sort>Average</th><th data-sort>Count</th><th data-sort>Last Seen</th><th class="advanced-only" data-sort>Min</th><th class="advanced-only" data-sort>Max</th><th class="developer-only" data-sort>BSSID</th><th class="developer-only" data-sort>Security</th><th class="developer-only" data-sort>First Seen</th></tr></thead><tbody>
+<tr class="connected"><td><a href="#rssi">Plant-Controls</a></td><td data-value="5">5</td><td data-value="-44">-44 dBm</td><td data-value="-45.3">-45.3 dBm</td><td data-value="76">76</td><td>7s ago</td><td class="advanced-only">-53</td><td class="advanced-only">-40</td><td class="developer-only">90:09:D0:37:D1:87</td><td class="developer-only">WPA2-PSK</td><td class="developer-only">8h 3m ago</td></tr>
+<tr><td>Guest-WiFi</td><td>10</td><td>-57 dBm</td><td>-58.1 dBm</td><td>74</td><td>7s ago</td><td class="advanced-only">-66</td><td class="advanced-only">-51</td><td class="developer-only">60:83:E7:74:28:1A</td><td class="developer-only">WPA2-PSK</td><td class="developer-only">8h 3m ago</td></tr>
+<tr><td>Warehouse-AP</td><td>1</td><td>-74 dBm</td><td>-76.4 dBm</td><td>58</td><td>37s ago</td><td class="advanced-only">-84</td><td class="advanced-only">-70</td><td class="developer-only">82:9C:8E:7C:CD:05</td><td class="developer-only">WPA2/WPA3-PSK</td><td class="developer-only">7h 42m ago</td></tr>
+<tr><td>(hidden)</td><td>6</td><td>-89 dBm</td><td>-88.2 dBm</td><td>23</td><td>1m 7s ago</td><td class="advanced-only">-94</td><td class="advanced-only">-83</td><td class="developer-only">02:01:12:B0:A5:91</td><td class="developer-only">WPA2-PSK</td><td class="developer-only">5h 29m ago</td></tr>
+</tbody></table></div></div>
+<div class="card advanced-only"><h2>Survey Health <span class="depth-tag">Advanced</span></h2><div class="row"><span class="label">Auto-Scan Diagnostic</span><span class="value good">OK</span></div><div class="row"><span class="label">Automatic Starts / Completions</span><span class="value">95 / 95</span></div><div class="row"><span class="label">Start / Completion Failures</span><span class="value">0 / 0</span></div><div class="row"><span class="label">Wi-Fi Scan Duration</span><span class="value">last 3.44s · avg 2.96s · min 2.62s · max 3.64s</span></div></div>
+<div class="card developer-only"><h2>Wi-Fi Implementation Diagnostics <span class="depth-tag">Developer</span></h2><div class="row"><span class="label">Automatic Retry Backoff</span><span class="value">2s · idle</span></div><div class="row"><span class="label">User Interaction Defer</span><span class="value">2s</span></div><div class="row"><span class="label">History RAM</span><span class="value">51.3 KB</span></div><div class="row"><span class="label">Observation Storage</span><span class="value">6 bytes / observation</span></div><div class="row"><span class="label">AP Table</span><span class="value">47 / 512 · 20.5 KB</span></div><div class="row"><span class="label">Scan Metadata</span><span class="value">1024 slots · 8.0 KB</span></div><div class="row"><span class="label">Free Heap / Largest Block</span><span class="value">65.4 KB / 38.0 KB</span></div></div>
+<div class="card"><h2>Observed Channel Interference</h2><div class="row"><span class="label">Suggested Channel</span><span class="value good">11</span></div><div class="table-wrap"><table><thead><tr><th>Candidate</th><th>Observed Score</th></tr></thead><tbody><tr><td>1</td><td>62.0</td></tr><tr><td>6</td><td>99.6</td></tr><tr><td>11</td><td class="good">37.7</td></tr></tbody></table></div><div class="advanced-only"><h3>Full 2.4 GHz analysis <span class="depth-tag">Advanced</span></h3><div class="table-wrap"><table><thead><tr><th>Channel</th><th>APs</th><th>Strongest</th><th>Co-channel</th><th>Adjacent</th><th>Total</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>-74 dBm</td><td>26.0</td><td>36.0</td><td>62.0</td></tr><tr><td>6</td><td>5</td><td>-44 dBm</td><td>91.4</td><td>8.2</td><td>99.6</td></tr><tr><td>11</td><td>1</td><td>-80 dBm</td><td>28.6</td><td>9.1</td><td>37.7</td></tr></tbody></table></div><div class="note">Lower score is preferred. This is an RSSI-weighted estimate of observed Wi-Fi interference, not measured airtime utilization.</div></div></div>
+<div class="card"><h2>Infrastructure Connected Network</h2><div class="row"><span class="label">SSID</span><span class="value">Plant-Controls</span></div><div class="row"><span class="label">Current RSSI</span><span class="value">-44 dBm</span></div><div class="row advanced-only"><span class="label">BSSID</span><span class="value">90:09:D0:37:D1:87</span></div><div class="row advanced-only"><span class="label">Channel</span><span class="value">5</span></div></div>
+<div class="footer">ESP32 Wireless Surveyor V34b — static demonstration package</div></div><script src="app.js"></script></body></html>

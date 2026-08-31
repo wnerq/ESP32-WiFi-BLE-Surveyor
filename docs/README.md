@@ -1,41 +1,34 @@
-# ESP32 Wireless Surveyor V23 — Static Demo Package
+# ESP32 Wireless Surveyor V34b — Static Demo Package
 
-This package is a standalone documentation/demo mock-up of the ESP32 Wireless
-Surveyor web interface. It contains **fictional sample data only** and does not
-communicate with an ESP32.
+This directory contains a standalone documentation/demo mock-up of the ESP32 Wireless Surveyor web interface. It uses **fictional sample data only** and does not communicate with an ESP32.
 
 ## Open the demo
 
-Unzip the package and open `index.html` in a modern browser.
-
-No web server, build tools, Internet connection, or external JavaScript
-libraries are required.
+Open `index.html` in a modern browser. No web server, build tools, Internet connection, or external JavaScript libraries are required.
 
 ## Pages
 
 - `index.html` — Wi-Fi Survey
-- `bluetooth.html` — Bluetooth Survey
-- `system.html` — System diagnostics and self-tests
-- `settings.html` — device/network/interface settings
+- `bluetooth.html` — Bluetooth Survey; begins in the normal disabled state and can simulate the enabled state
+- `system.html` — Device and System Health
+- `settings.html` — device/network/survey settings
 
-The shared navigation, theme selector, tables, demo buttons, and RSSI canvases
-are implemented with `styles.css` and `app.js`.
+`styles.css` and `app.js` provide the shared V34b-style navigation, sticky control card, Standard / Advanced / Developer view filtering, System / Light / Dark themes, sortable tables, demo controls, and RSSI plots.
+
+## V34b interface model
+
+The page tells you **what subject you are looking at**: Wi-Fi, Bluetooth, System, or Settings. The View selector tells you **how deep you want to go**:
+
+- Standard — normal operation and useful survey results
+- Advanced — deeper operational/troubleshooting information
+- Developer — implementation internals, instrumentation, and test tools
+
+Views are cumulative. The common navigation/control card is sticky so page navigation, Live Updates, View, and Theme remain available while scrolling.
 
 ## Intended use
 
-This is suitable for:
+The demo is suitable for product/engineering documentation, screenshots, demonstrating the survey workflow without hardware, and reviewing the interface information architecture.
 
-- product/engineering documentation
-- screenshots for a README or design document
-- demonstrating the survey workflow without hardware
-- explaining the compact Wi-Fi history and diagnostics architecture
-- showing stakeholders the local web-interface concept
+All SSIDs, BSSIDs, BLE addresses, measurements, IP details, memory values, firmware states, and diagnostics are illustrative.
 
-All SSIDs, BSSIDs, BLE addresses, measurements, IP details, memory values, and
-device status shown here should be treated as illustrative demo content.
-
-## Visual fidelity
-
-The static pages are styled from screenshots of the live embedded interface and are intended to closely represent the V23 web UI. Values are simulated. Bluetooth intentionally shows the default disabled state.
-
-For GitHub Pages, place these files at the root of the repository's `docs/` directory and configure **Settings → Pages → Deploy from a branch → main /docs**. `index.html` becomes the demo landing page.
+For GitHub Pages, keep these files in the repository `docs/` directory and configure Pages to deploy from `main /docs`. `index.html` is the landing page.
