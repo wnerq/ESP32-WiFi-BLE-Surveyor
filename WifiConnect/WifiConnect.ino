@@ -1,5 +1,6 @@
-// ESP32 Wireless Surveyor V34 - web-interface information architecture refactor
-// Preserves V33e survey/checkpoint behavior while adding Standard/Advanced/Developer views and source-learning comments.
+// ESP32 Wireless Surveyor V35 - BLE diagnostics and serial interface refactor
+// Preserves V34b survey/web-interface behavior while adding BLE diagnostic
+// streaming, timing/heap instrumentation, and the revised serial information architecture.
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -24,8 +25,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect34b_sticky_navigation.ino";
-const char* FIRMWARE_VERSION = "34b";
+const char* FIRMWARE_FILE = "WifiConnect35_ble_diagnostics.ino";
+const char* FIRMWARE_VERSION = "35";
 
 
 Preferences preferences;
@@ -347,6 +348,63 @@ unsigned long surveyServicesReadyMs = 0;
 
 size_t bootWifiHistoryCapacity = 0;
 size_t bootBleHistoryCapacity = 0;
+
+
+// ============================================================
+// V35 developer diagnostic streaming
+// ============================================================
+
+// Diagnostic streaming settings are persisted so a controlled restart (for
+// example enabling BLE mode) can be captured from the earliest BLE init event.
+// First-use defaults are selected for the BLE characterization campaign while
+// the master switch remains OFF until explicitly enabled.
+bool diagnosticStreamingEnabled = false;
+bool diagnosticSurveyEvents = true;
+bool diagnosticBleEvents = true;
+bool diagnosticMemoryEvents = true;
+bool diagnosticWebEvents = true;
+bool diagnosticSchedulerEvents = false;
+bool diagnosticCheckpointEvents = false;
+uint32_t diagnosticSnapshotIntervalMs = 10000;
+uint32_t diagnosticLastSnapshotMs = 0;
+
+// BLE timing separates the synchronous Arduino BLE API wait from the time
+// spent normalizing/copying returned advertisements into retained history.
+bool bleDiagnosticScanActive = false;
+uint32_t bleDiagnosticScanStartMs = 0;
+uint32_t bleDiagnosticLastApiDurationMs = 0;
+uint32_t bleDiagnosticLastProcessingDurationMs = 0;
+uint32_t bleDiagnosticLastTotalDurationMs = 0;
+uint32_t bleDiagnosticDurationCount = 0;
+uint64_t bleDiagnosticTotalDurationMs = 0;
+uint32_t bleDiagnosticMinDurationMs = UINT32_MAX;
+uint32_t bleDiagnosticMaxDurationMs = 0;
+uint32_t bleDiagnosticLastResultCount = 0;
+uint32_t bleDiagnosticLastScanEndMs = 0;
+uint8_t bleDiagnosticSchedulerReason = 0;
+uint32_t bleDiagnosticLastHeapBefore = 0;
+uint32_t bleDiagnosticLastHeapAfterApi = 0;
+uint32_t bleDiagnosticLastHeapAfterProcessing = 0;
+uint32_t bleDiagnosticLastLargestBefore = 0;
+uint32_t bleDiagnosticLastLargestAfterApi = 0;
+uint32_t bleDiagnosticLastLargestAfterProcessing = 0;
+
+// Main-loop gap instrumentation is valuable because a synchronous BLE scan
+// prevents loop(), server.handleClient(), and the normal survey scheduler from
+// running. A long gap that matches BLE scan duration is direct evidence of it.
+uint32_t diagnosticLastLoopEntryMs = 0;
+uint32_t diagnosticLastLoopGapMs = 0;
+uint32_t diagnosticMaxLoopGapMs = 0;
+uint32_t diagnosticLoopGapOver100MsCount = 0;
+
+// HTTP handler timing measures actual handler execution after WebServer begins
+// servicing a request. It does not claim to know when a TCP request first
+// arrived while loop() was blocked; loop-gap/BLE timestamps provide that side.
+uint32_t diagnosticWebHandlerCount = 0;
+uint32_t diagnosticWebSlowHandlerCount = 0;
+uint32_t diagnosticWebLastDurationMs = 0;
+uint32_t diagnosticWebMaxDurationMs = 0;
+const uint32_t DIAGNOSTIC_WEB_SLOW_MS = 100;
 
 
 // ============================================================
@@ -1185,6 +1243,236 @@ void serviceNativeReconnectDiagnostics() {
 }
 
 // ============================================================
+// Developer diagnostic streaming helpers (V35)
+// ============================================================
+
+// Purpose: Loads persisted developer logging selections early enough to observe BLE initialization after restart.
+void loadDiagnosticStreamingSettings() {
+  preferences.begin("diag", true);
+  diagnosticStreamingEnabled = preferences.getBool("enabled", false);
+  diagnosticSurveyEvents = preferences.getBool("survey", true);
+  diagnosticBleEvents = preferences.getBool("ble", true);
+  diagnosticMemoryEvents = preferences.getBool("memory", true);
+  diagnosticWebEvents = preferences.getBool("web", true);
+  diagnosticSchedulerEvents = preferences.getBool("scheduler", false);
+  diagnosticCheckpointEvents = preferences.getBool("checkpoint", false);
+  diagnosticSnapshotIntervalMs = preferences.getULong("snapshotMs", 10000);
+  preferences.end();
+}
+
+// Purpose: Persists developer logging selections so diagnostics survive controlled BLE mode restarts.
+void saveDiagnosticStreamingSettings() {
+  preferences.begin("diag", false);
+  preferences.putBool("enabled", diagnosticStreamingEnabled);
+  preferences.putBool("survey", diagnosticSurveyEvents);
+  preferences.putBool("ble", diagnosticBleEvents);
+  preferences.putBool("memory", diagnosticMemoryEvents);
+  preferences.putBool("web", diagnosticWebEvents);
+  preferences.putBool("scheduler", diagnosticSchedulerEvents);
+  preferences.putBool("checkpoint", diagnosticCheckpointEvents);
+  preferences.putULong("snapshotMs", diagnosticSnapshotIntervalMs);
+  preferences.end();
+}
+
+// Purpose: Returns the largest currently allocatable 8-bit heap block for fragmentation diagnostics.
+uint32_t diagnosticLargestFreeBlock() {
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+}
+
+// Purpose: Prints the common timestamp/category prefix used by streamed diagnostic events.
+void diagnosticPrefix(const char* category) {
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print("] ");
+  Serial.print(category);
+  Serial.print(" ");
+}
+
+// Purpose: Prints a compact heap triplet that can be compared at event boundaries.
+void diagnosticPrintHeapTriplet() {
+  Serial.print("heap="); Serial.print(ESP.getFreeHeap());
+  Serial.print(" min="); Serial.print(ESP.getMinFreeHeap());
+  Serial.print(" largest="); Serial.print(diagnosticLargestFreeBlock());
+}
+
+// Purpose: Emits one compact state snapshot without requiring the web interface.
+void printDiagnosticSnapshot() {
+  diagnosticPrefix("STATUS");
+  Serial.print("up="); Serial.print(millis());
+  Serial.print(" wifiScan="); Serial.print(wifiScanInProgress ? 1 : 0);
+  Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
+  Serial.print(" wifiObs="); Serial.print(historyCount);
+  Serial.print("/"); Serial.print(scanHistoryRetentionLimit);
+  Serial.print(" bleObs="); Serial.print(bleHistoryCount);
+  Serial.print("/"); Serial.print(bleHistoryRetentionLimit);
+  Serial.print(" bleScans="); Serial.print(bleScanCounter);
+  Serial.print(" sta="); Serial.print(WiFi.status() == WL_CONNECTED ? 1 : 0);
+  Serial.print(" loopGapLast="); Serial.print(diagnosticLastLoopGapMs);
+  Serial.print(" loopGapMax="); Serial.print(diagnosticMaxLoopGapMs);
+  Serial.print(" ");
+  diagnosticPrintHeapTriplet();
+  Serial.println();
+}
+
+// Purpose: Emits periodic diagnostic snapshots at the configured runtime interval.
+void serviceDiagnosticSnapshot() {
+  if (!diagnosticStreamingEnabled || diagnosticSnapshotIntervalMs == 0) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - diagnosticLastSnapshotMs) < diagnosticSnapshotIntervalMs) return;
+  diagnosticLastSnapshotMs = now;
+  printDiagnosticSnapshot();
+}
+
+// Purpose: Records long main-loop service gaps, including gaps caused by synchronous BLE scans.
+void serviceLoopGapDiagnostics() {
+  uint32_t now = millis();
+  if (diagnosticLastLoopEntryMs != 0) {
+    uint32_t gap = (uint32_t)(now - diagnosticLastLoopEntryMs);
+    diagnosticLastLoopGapMs = gap;
+    if (gap > diagnosticMaxLoopGapMs) diagnosticMaxLoopGapMs = gap;
+    if (gap >= 100) {
+      diagnosticLoopGapOver100MsCount++;
+      if (diagnosticStreamingEnabled && diagnosticSchedulerEvents) {
+        diagnosticPrefix("LOOP GAP");
+        Serial.print("duration="); Serial.print(gap); Serial.print("ms");
+        Serial.print(" bleActive="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
+        Serial.print(" afterBle="); Serial.print(bleDiagnosticLastScanEndMs != 0 && (uint32_t)(now - bleDiagnosticLastScanEndMs) < 100 ? 1 : 0);
+        Serial.print(" wifiActive="); Serial.print(wifiScanInProgress ? 1 : 0);
+        Serial.println();
+      }
+    }
+  }
+  diagnosticLastLoopEntryMs = now;
+}
+
+// Purpose: Runs a registered HTTP handler while measuring page/API generation time for developer diagnostics.
+void runDiagnosticWebHandler(const char* route, void (*handler)()) {
+  uint32_t startMs = millis();
+  if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+    diagnosticPrefix("HTTP START");
+    Serial.print("route="); Serial.print(route);
+    Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
+    Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+  }
+
+  handler();
+
+  uint32_t durationMs = (uint32_t)(millis() - startMs);
+  diagnosticWebHandlerCount++;
+  diagnosticWebLastDurationMs = durationMs;
+  if (durationMs > diagnosticWebMaxDurationMs) diagnosticWebMaxDurationMs = durationMs;
+  if (durationMs >= DIAGNOSTIC_WEB_SLOW_MS) diagnosticWebSlowHandlerCount++;
+  if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+    diagnosticPrefix("HTTP END");
+    Serial.print("route="); Serial.print(route);
+    Serial.print(" duration="); Serial.print(durationMs); Serial.print("ms");
+    if (durationMs >= DIAGNOSTIC_WEB_SLOW_MS) Serial.print(" SLOW");
+    Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+  }
+}
+
+// Purpose: Prints accumulated BLE timing, loop-gap, HTTP, and heap diagnostics as one serial report.
+void printDeveloperDiagnosticSummary() {
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println(" Developer Diagnostics");
+  Serial.println("============================================================");
+  Serial.print("Diagnostic streaming:  "); Serial.println(diagnosticStreamingEnabled ? "ON" : "OFF");
+  Serial.print("Periodic snapshot:     ");
+  if (diagnosticSnapshotIntervalMs == 0) Serial.println("OFF");
+  else { Serial.print(diagnosticSnapshotIntervalMs / 1000); Serial.println(" s"); }
+  Serial.print("Categories:             Survey="); Serial.print(diagnosticSurveyEvents ? "ON" : "OFF");
+  Serial.print(" BLE="); Serial.print(diagnosticBleEvents ? "ON" : "OFF");
+  Serial.print(" Memory="); Serial.print(diagnosticMemoryEvents ? "ON" : "OFF");
+  Serial.print(" Web="); Serial.print(diagnosticWebEvents ? "ON" : "OFF");
+  Serial.print(" Scheduler="); Serial.print(diagnosticSchedulerEvents ? "ON" : "OFF");
+  Serial.print(" Checkpoint="); Serial.println(diagnosticCheckpointEvents ? "ON" : "OFF");
+
+  Serial.println();
+  Serial.println("BLE timing:");
+  Serial.print("  Completed timed scans: "); Serial.println(bleDiagnosticDurationCount);
+  Serial.print("  Last API wait:         "); Serial.print(bleDiagnosticLastApiDurationMs); Serial.println(" ms");
+  Serial.print("  Last result processing:"); Serial.print(" "); Serial.print(bleDiagnosticLastProcessingDurationMs); Serial.println(" ms");
+  Serial.print("  Last total:            "); Serial.print(bleDiagnosticLastTotalDurationMs); Serial.println(" ms");
+  Serial.print("  Min / Avg / Max total: ");
+  if (bleDiagnosticDurationCount == 0) Serial.println("n/a");
+  else {
+    Serial.print(bleDiagnosticMinDurationMs); Serial.print(" / ");
+    Serial.print((uint32_t)(bleDiagnosticTotalDurationMs / bleDiagnosticDurationCount)); Serial.print(" / ");
+    Serial.print(bleDiagnosticMaxDurationMs); Serial.println(" ms");
+  }
+  Serial.print("  Last result count:     "); Serial.println(bleDiagnosticLastResultCount);
+
+  Serial.println();
+  Serial.println("Last BLE heap boundaries (bytes):");
+  Serial.print("  Before scan:           free="); Serial.print(bleDiagnosticLastHeapBefore); Serial.print(" largest="); Serial.println(bleDiagnosticLastLargestBefore);
+  Serial.print("  After BLE API:         free="); Serial.print(bleDiagnosticLastHeapAfterApi); Serial.print(" largest="); Serial.println(bleDiagnosticLastLargestAfterApi);
+  Serial.print("  After processing:      free="); Serial.print(bleDiagnosticLastHeapAfterProcessing); Serial.print(" largest="); Serial.println(bleDiagnosticLastLargestAfterProcessing);
+  Serial.print("  Current minimum heap:  "); Serial.println(ESP.getMinFreeHeap());
+
+  Serial.println();
+  Serial.println("Loop/Web timing:");
+  Serial.print("  Last / max loop gap:   "); Serial.print(diagnosticLastLoopGapMs); Serial.print(" / "); Serial.print(diagnosticMaxLoopGapMs); Serial.println(" ms");
+  Serial.print("  Loop gaps >=100 ms:    "); Serial.println(diagnosticLoopGapOver100MsCount);
+  Serial.print("  HTTP handlers timed:   "); Serial.println(diagnosticWebHandlerCount);
+  Serial.print("  Last / max HTTP time:  "); Serial.print(diagnosticWebLastDurationMs); Serial.print(" / "); Serial.print(diagnosticWebMaxDurationMs); Serial.println(" ms");
+  Serial.print("  HTTP handlers >=100 ms:"); Serial.print(" "); Serial.println(diagnosticWebSlowHandlerCount);
+
+  Serial.println();
+  Serial.println("Developer commands:");
+  Serial.println("  diag on|off            - Master diagnostic streaming switch");
+  Serial.println("  diag snapshot          - Print one state/heap snapshot now");
+  Serial.println("  diag summary           - Print accumulated timing diagnostics");
+  Serial.println("  diag interval <sec>    - Periodic snapshot interval; 0 disables");
+  Serial.println("  diag survey on|off     - Survey lifecycle events");
+  Serial.println("  diag ble on|off        - BLE scan/init/timing events");
+  Serial.println("  diag memory on|off     - Heap boundaries in event logs");
+  Serial.println("  diag web on|off        - HTTP handler timing");
+  Serial.println("  diag scheduler on|off  - Scheduler/loop-gap events");
+  Serial.println("  diag checkpoint on|off - Checkpoint events (reserved category)");
+  Serial.println("  diag reset             - Reset accumulated timing counters");
+  Serial.println("  0/back                 - Main menu");
+  Serial.println();
+  Serial.print("> ");
+}
+
+// Purpose: Clears accumulated V35 timing counters without changing logging category selections.
+void resetDeveloperDiagnostics() {
+  bleDiagnosticLastApiDurationMs = 0;
+  bleDiagnosticLastProcessingDurationMs = 0;
+  bleDiagnosticLastTotalDurationMs = 0;
+  bleDiagnosticDurationCount = 0;
+  bleDiagnosticTotalDurationMs = 0;
+  bleDiagnosticMinDurationMs = UINT32_MAX;
+  bleDiagnosticMaxDurationMs = 0;
+  bleDiagnosticLastResultCount = 0;
+  bleDiagnosticLastHeapBefore = 0;
+  bleDiagnosticLastHeapAfterApi = 0;
+  bleDiagnosticLastHeapAfterProcessing = 0;
+  bleDiagnosticLastLargestBefore = 0;
+  bleDiagnosticLastLargestAfterApi = 0;
+  bleDiagnosticLastLargestAfterProcessing = 0;
+  diagnosticLastLoopGapMs = 0;
+  diagnosticMaxLoopGapMs = 0;
+  diagnosticLoopGapOver100MsCount = 0;
+  diagnosticWebHandlerCount = 0;
+  diagnosticWebSlowHandlerCount = 0;
+  diagnosticWebLastDurationMs = 0;
+  diagnosticWebMaxDurationMs = 0;
+}
+
+// Purpose: Logs BLE scheduler state only when the blocking/defer reason changes, avoiding per-loop serial spam.
+void diagnosticBleSchedulerState(uint8_t reason, const char* label) {
+  if (reason == bleDiagnosticSchedulerReason) return;
+  bleDiagnosticSchedulerReason = reason;
+  if (!diagnosticStreamingEnabled || !diagnosticSchedulerEvents) return;
+  diagnosticPrefix("BLE SCHED");
+  Serial.print("state="); Serial.print(label);
+  Serial.print(" sinceLast="); Serial.print((uint32_t)(millis() - lastAutoBleScanMs)); Serial.print("ms");
+  Serial.print(" interval="); Serial.print(bleScanIntervalSeconds * 1000UL); Serial.println("ms");
+}
+
+// ============================================================
 // BLE helpers
 // ============================================================
 
@@ -1203,10 +1491,26 @@ String bleAddressTypeLabel(uint8_t addressType) {
 void initializeBLEScanner() {
   if (!bleSurveyEnabled || bleInitialized) return;
 
+  uint32_t startMs = millis();
+  uint32_t heapBefore = ESP.getFreeHeap();
+  uint32_t largestBefore = diagnosticLargestFreeBlock();
+  if (diagnosticStreamingEnabled && diagnosticBleEvents) {
+    diagnosticPrefix("BLE INIT START");
+    Serial.print("heap="); Serial.print(heapBefore);
+    Serial.print(" largest="); Serial.println(largestBefore);
+  }
+
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
   scan->setActiveScan(true);
   bleInitialized = true;
+
+  if (diagnosticStreamingEnabled && diagnosticBleEvents) {
+    diagnosticPrefix("BLE INIT END");
+    Serial.print("duration="); Serial.print((uint32_t)(millis() - startMs)); Serial.print("ms ");
+    diagnosticPrintHeapTriplet();
+    Serial.println();
+  }
 }
 
 
@@ -2071,8 +2375,8 @@ bool buildBleDeviceSummary(const String& address, BLEDeviceSummary& summary) {
   return true;
 }
 
-// Purpose: Runs a BLE scan through the Arduino BLE API and stores its results in the compact BLE history.
-int performLoggedBLEScan() {
+// Purpose: Runs one BLE scan with a trigger label and records blocking/API, processing, heap, and result diagnostics.
+int performLoggedBLEScanWithTrigger(const char* trigger) {
   if (!bleSurveyEnabled) {
     bleStatusMessage = "Bluetooth Survey is disabled; BLE stack is not initialized.";
     return -1;
@@ -2081,16 +2385,60 @@ int performLoggedBLEScan() {
   initializeBLEScanner();
   BLEScan* scan = BLEDevice::getScan();
   bleStatusMessage = "BLE scan in progress...";
+
+  uint32_t totalStartMs = millis();
+  bleDiagnosticScanActive = true;
+  bleDiagnosticScanStartMs = totalStartMs;
+  bleDiagnosticLastHeapBefore = ESP.getFreeHeap();
+  bleDiagnosticLastLargestBefore = diagnosticLargestFreeBlock();
+
+  if (diagnosticStreamingEnabled && (diagnosticBleEvents || diagnosticSurveyEvents)) {
+    diagnosticPrefix("BLE SCAN START");
+    Serial.print("trigger="); Serial.print(trigger);
+    Serial.print(" nextSeq="); Serial.print(bleScanCounter + 1);
+    Serial.print(" durationCfg="); Serial.print(BLE_SCAN_DURATION_SECONDS); Serial.print("s");
+    if (diagnosticMemoryEvents) {
+      Serial.print(" heap="); Serial.print(bleDiagnosticLastHeapBefore);
+      Serial.print(" min="); Serial.print(ESP.getMinFreeHeap());
+      Serial.print(" largest="); Serial.print(bleDiagnosticLastLargestBefore);
+    }
+    Serial.println();
+  }
+
   startScanLed(BLE_SCAN_LED_PERIOD_TICKS);
+  uint32_t apiStartMs = millis();
   BLEScanResults* results = scan->start(BLE_SCAN_DURATION_SECONDS, false);
+  uint32_t apiEndMs = millis();
   stopScanLed();
 
+  bleDiagnosticLastApiDurationMs = (uint32_t)(apiEndMs - apiStartMs);
+  bleDiagnosticLastHeapAfterApi = ESP.getFreeHeap();
+  bleDiagnosticLastLargestAfterApi = diagnosticLargestFreeBlock();
+  int resultCount = results != nullptr ? results->getCount() : 0;
+  bleDiagnosticLastResultCount = resultCount < 0 ? 0 : (uint32_t)resultCount;
+
+  if (diagnosticStreamingEnabled && diagnosticBleEvents) {
+    diagnosticPrefix("BLE API RETURN");
+    Serial.print("wait="); Serial.print(bleDiagnosticLastApiDurationMs); Serial.print("ms");
+    Serial.print(" results="); Serial.print(resultCount);
+    if (diagnosticMemoryEvents) {
+      Serial.print(" heap="); Serial.print(bleDiagnosticLastHeapAfterApi);
+      Serial.print(" min="); Serial.print(ESP.getMinFreeHeap());
+      Serial.print(" largest="); Serial.print(bleDiagnosticLastLargestAfterApi);
+    }
+    Serial.println();
+  }
+
+  uint32_t processingStartMs = millis();
   bleScanCounter++;
   lastBleScanUptimeMs = surveySessionUptimeMs();
-  int resultCount = results != nullptr ? results->getCount() : 0;
 
   if (!bleScanMetadata || bleScanMetadataCapacity == 0) {
     if (results) scan->clearResults();
+    bleDiagnosticLastProcessingDurationMs = (uint32_t)(millis() - processingStartMs);
+    bleDiagnosticLastTotalDurationMs = (uint32_t)(millis() - totalStartMs);
+    bleDiagnosticScanActive = false;
+    bleDiagnosticLastScanEndMs = millis();
     return resultCount;
   }
 
@@ -2103,6 +2451,8 @@ int performLoggedBLEScan() {
   bleScanMetadata[scanSlot].scanNumber = bleScanCounter;
   bleScanMetadata[scanSlot].uptimeMs = lastBleScanUptimeMs;
 
+  size_t historyBefore = bleHistoryCount;
+  size_t dropsBefore = bleAddressTableFullDrops;
   if (results != nullptr) {
     for (int i = 0; i < resultCount; i++) {
       BLEAdvertisedDevice device = results->getDevice(i);
@@ -2127,13 +2477,51 @@ int performLoggedBLEScan() {
 
   scan->clearResults();
   updateBleUsageHighWaterMarks();
+
+  bleDiagnosticLastProcessingDurationMs = (uint32_t)(millis() - processingStartMs);
+  bleDiagnosticLastTotalDurationMs = (uint32_t)(millis() - totalStartMs);
+  bleDiagnosticLastHeapAfterProcessing = ESP.getFreeHeap();
+  bleDiagnosticLastLargestAfterProcessing = diagnosticLargestFreeBlock();
+  bleDiagnosticDurationCount++;
+  bleDiagnosticTotalDurationMs += bleDiagnosticLastTotalDurationMs;
+  if (bleDiagnosticLastTotalDurationMs < bleDiagnosticMinDurationMs) bleDiagnosticMinDurationMs = bleDiagnosticLastTotalDurationMs;
+  if (bleDiagnosticLastTotalDurationMs > bleDiagnosticMaxDurationMs) bleDiagnosticMaxDurationMs = bleDiagnosticLastTotalDurationMs;
+  bleDiagnosticScanActive = false;
+  bleDiagnosticLastScanEndMs = millis();
+
   bleStatusMessage =
     "BLE scan #" + String(bleScanCounter) + " complete: " +
     String(resultCount) + " address(es) observed.";
   if (bleAddressTableFullDrops > 0)
     bleStatusMessage += " WARN: " + String(bleAddressTableFullDrops) +
       " observation(s) dropped because the BLE Address Table was full.";
+
+  if (diagnosticStreamingEnabled && (diagnosticBleEvents || diagnosticSurveyEvents)) {
+    diagnosticPrefix("BLE SCAN END");
+    Serial.print("seq="); Serial.print(bleScanCounter);
+    Serial.print(" trigger="); Serial.print(trigger);
+    Serial.print(" api="); Serial.print(bleDiagnosticLastApiDurationMs); Serial.print("ms");
+    Serial.print(" process="); Serial.print(bleDiagnosticLastProcessingDurationMs); Serial.print("ms");
+    Serial.print(" total="); Serial.print(bleDiagnosticLastTotalDurationMs); Serial.print("ms");
+    Serial.print(" results="); Serial.print(resultCount);
+    Serial.print(" obsAdded="); Serial.print(bleHistoryCount >= historyBefore ? bleHistoryCount - historyBefore : 0);
+    Serial.print(" dropsDelta="); Serial.print(bleAddressTableFullDrops - dropsBefore);
+    Serial.print(" history="); Serial.print(bleHistoryCount); Serial.print("/"); Serial.print(bleHistoryRetentionLimit);
+    Serial.print(" addr="); Serial.print(countReferencedBleAddresses()); Serial.print("/"); Serial.print(bleAddressTableCapacity);
+    if (diagnosticMemoryEvents) {
+      Serial.print(" heap="); Serial.print(bleDiagnosticLastHeapAfterProcessing);
+      Serial.print(" min="); Serial.print(ESP.getMinFreeHeap());
+      Serial.print(" largest="); Serial.print(bleDiagnosticLastLargestAfterProcessing);
+    }
+    Serial.println();
+  }
+
   return resultCount;
+}
+
+// Purpose: Compatibility wrapper for BLE scan callers that do not need a specific trigger label.
+int performLoggedBLEScan() {
+  return performLoggedBLEScanWithTrigger("direct");
 }
 
 // Purpose: Prints a string to Serial and pads it to a fixed column width for readable text tables.
@@ -2884,7 +3272,7 @@ bool historyContainsBSSID(const String& bssid) {
   return false;
 }
 
-// Purpose: Returns the shared CSS used by all web-interface pages, including V34 view-depth visibility rules.
+// Purpose: Returns the shared CSS used by all web-interface pages, including view-depth visibility rules.
 String pageStyles() {
   return R"rawliteral(
 <style>
@@ -3374,7 +3762,7 @@ String pageStyles() {
     color: #777;
   }
 
-  /* V34 view-depth model: Standard < Advanced < Developer. */
+  /* View-depth model: Standard < Advanced < Developer. */
   .advanced-only, .developer-only { display: none !important; }
   html[data-view="advanced"] div.advanced-only,
   html[data-view="developer"] div.advanced-only,
@@ -4256,7 +4644,7 @@ void sendWifiChannelAnalysis() {
   server.sendContent("</tbody></table></div></div></div>");
 }
 
-// Purpose: Builds the Wi-Fi Survey page using the V34 information hierarchy and progressive view-depth content.
+// Purpose: Builds the Wi-Fi Survey page using the information hierarchy and progressive view-depth content.
 void handleWebScan() {
   markExplicitUserInteraction();
   ensureWiFiStationMode();
@@ -4663,7 +5051,7 @@ void handleBleScanStatus() {
   server.send(200, "application/json", json);
 }
 
-// Purpose: Builds either the disabled or enabled Bluetooth Survey page under the V34 information hierarchy.
+// Purpose: Builds either the disabled or enabled Bluetooth Survey page under the information hierarchy.
 void handleBLESurvey() {
   markExplicitUserInteraction();
   String selectedAddress = "";
@@ -4801,7 +5189,7 @@ void handleBLEScanNow() {
     return;
   }
 
-  performLoggedBLEScan();
+  performLoggedBLEScanWithTrigger("web-manual");
   redirectToBLEPage();
 }
 
@@ -4844,7 +5232,7 @@ String selfTestRow(const String& name, const String& state, const String& detail
   return "<div class=\"row\"><span class=\"label\">" + htmlEscape(name) + "</span><span class=\"value \"" + css + "\">" + state + " - " + htmlEscape(detail) + "</span></div>";
 }
 
-// Purpose: Builds the V34 System page: Device, System Health, Memory, Network, Session, and Developer test tools.
+// Purpose: Builds the System page: Device, System Health, Memory, Network, Session, and Developer test tools.
 void handleSystemStatus() {
   markExplicitUserInteraction();
   uint8_t primaryChannel = 0;
@@ -5670,7 +6058,7 @@ void handleStatusJsonExport() {
   server.sendContent("");
 }
 
-// Purpose: Builds the V34 Settings page with ordinary settings in Standard and maintenance/diagnostic tools in deeper views.
+// Purpose: Builds the Settings page with ordinary settings in Standard and maintenance/diagnostic tools in deeper views.
 void handleSettingsPage() {
   markExplicitUserInteraction();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -6071,41 +6459,41 @@ void startWebServer() {
     return;
   }
 
-  server.on("/", handleWebScan);
-  server.on("/scan", handleWebScan);
-  server.on("/system", HTTP_GET, handleSystemStatus);
-  server.on("/settings", HTTP_GET, handleSettingsPage);
-  server.on("/status.json", HTTP_GET, handleStatusJsonExport);
-  server.on("/config.json", HTTP_GET, handleConfigExport);
-  server.on("/config/import", HTTP_POST, handleConfigImport);
-  server.on("/wifi-save", HTTP_POST, handleSaveStationSettings);
-  server.on("/wifi-clear", HTTP_POST, handleClearStationSettings);
-  server.on("/hostname-save", HTTP_POST, handleHostnameSave);
-  server.on("/interface-settings", HTTP_POST, handleInterfaceSettings);
-  server.on("/led-test", HTTP_POST, handleLedSelfTest);
-  server.on("/scan-now", handleWebScanNow);
-  server.on("/api/wifi/status", HTTP_GET, handleWifiScanStatus);
-  server.on("/api/wifi/observed", HTTP_GET, handleWifiObservedFragment);
-  server.on("/api/wifi/plot", HTTP_GET, handleWifiPlotFragment);
-  server.on("/api/live-updates", HTTP_POST, handleLiveUpdatesSetting);
-  server.on("/api/wifi/interval", HTTP_POST, handleWifiIntervalSetting);
-  server.on("/scan-settings", handleScanSettings);
-  server.on("/scan-clear", handleClearScanHistory);
-  server.on("/scanlog.csv", handleScanCsv);
-  server.on("/history-prefill", HTTP_POST, handleHistoryPrefill);
-  server.on("/session-save", HTTP_POST, handleSessionCheckpointSave);
-  server.on("/session-discard", HTTP_POST, handleSessionCheckpointDiscard);
-  server.on("/ble", HTTP_GET, handleBLESurvey);
-  server.on("/api/ble/status", HTTP_GET, handleBleScanStatus);
-  server.on("/api/ble/observed", HTTP_GET, handleBleObservedFragment);
-  server.on("/api/ble/plot", HTTP_GET, handleBlePlotFragment);
-  server.on("/ble-mode", HTTP_POST, handleBleModeChange);
-  server.on("/ble-scan", HTTP_GET, handleBLEScanNow);
-  server.on("/ble-settings", HTTP_GET, handleBLESettings);
-  server.on("/ble-clear", HTTP_GET, handleClearBLEHistory);
-  server.on("/blelog.csv", HTTP_GET, handleBLEScanCsv);
-  server.on("/ap", HTTP_GET, handleAccessPointSettingsPage);
-  server.on("/ap-save", HTTP_POST, handleSaveAccessPointSettings);
+  server.on("/", []() { runDiagnosticWebHandler("/", handleWebScan); });
+  server.on("/scan", []() { runDiagnosticWebHandler("/scan", handleWebScan); });
+  server.on("/system", HTTP_GET, []() { runDiagnosticWebHandler("/system", handleSystemStatus); });
+  server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
+  server.on("/status.json", HTTP_GET, []() { runDiagnosticWebHandler("/status.json", handleStatusJsonExport); });
+  server.on("/config.json", HTTP_GET, []() { runDiagnosticWebHandler("/config.json", handleConfigExport); });
+  server.on("/config/import", HTTP_POST, []() { runDiagnosticWebHandler("/config/import", handleConfigImport); });
+  server.on("/wifi-save", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-save", handleSaveStationSettings); });
+  server.on("/wifi-clear", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-clear", handleClearStationSettings); });
+  server.on("/hostname-save", HTTP_POST, []() { runDiagnosticWebHandler("/hostname-save", handleHostnameSave); });
+  server.on("/interface-settings", HTTP_POST, []() { runDiagnosticWebHandler("/interface-settings", handleInterfaceSettings); });
+  server.on("/led-test", HTTP_POST, []() { runDiagnosticWebHandler("/led-test", handleLedSelfTest); });
+  server.on("/scan-now", []() { runDiagnosticWebHandler("/scan-now", handleWebScanNow); });
+  server.on("/api/wifi/status", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/status", handleWifiScanStatus); });
+  server.on("/api/wifi/observed", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/observed", handleWifiObservedFragment); });
+  server.on("/api/wifi/plot", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/plot", handleWifiPlotFragment); });
+  server.on("/api/live-updates", HTTP_POST, []() { runDiagnosticWebHandler("/api/live-updates", handleLiveUpdatesSetting); });
+  server.on("/api/wifi/interval", HTTP_POST, []() { runDiagnosticWebHandler("/api/wifi/interval", handleWifiIntervalSetting); });
+  server.on("/scan-settings", []() { runDiagnosticWebHandler("/scan-settings", handleScanSettings); });
+  server.on("/scan-clear", []() { runDiagnosticWebHandler("/scan-clear", handleClearScanHistory); });
+  server.on("/scanlog.csv", []() { runDiagnosticWebHandler("/scanlog.csv", handleScanCsv); });
+  server.on("/history-prefill", HTTP_POST, []() { runDiagnosticWebHandler("/history-prefill", handleHistoryPrefill); });
+  server.on("/session-save", HTTP_POST, []() { runDiagnosticWebHandler("/session-save", handleSessionCheckpointSave); });
+  server.on("/session-discard", HTTP_POST, []() { runDiagnosticWebHandler("/session-discard", handleSessionCheckpointDiscard); });
+  server.on("/ble", HTTP_GET, []() { runDiagnosticWebHandler("/ble", handleBLESurvey); });
+  server.on("/api/ble/status", HTTP_GET, []() { runDiagnosticWebHandler("/api/ble/status", handleBleScanStatus); });
+  server.on("/api/ble/observed", HTTP_GET, []() { runDiagnosticWebHandler("/api/ble/observed", handleBleObservedFragment); });
+  server.on("/api/ble/plot", HTTP_GET, []() { runDiagnosticWebHandler("/api/ble/plot", handleBlePlotFragment); });
+  server.on("/ble-mode", HTTP_POST, []() { runDiagnosticWebHandler("/ble-mode", handleBleModeChange); });
+  server.on("/ble-scan", HTTP_GET, []() { runDiagnosticWebHandler("/ble-scan", handleBLEScanNow); });
+  server.on("/ble-settings", HTTP_GET, []() { runDiagnosticWebHandler("/ble-settings", handleBLESettings); });
+  server.on("/ble-clear", HTTP_GET, []() { runDiagnosticWebHandler("/ble-clear", handleClearBLEHistory); });
+  server.on("/blelog.csv", HTTP_GET, []() { runDiagnosticWebHandler("/blelog.csv", handleBLEScanCsv); });
+  server.on("/ap", HTTP_GET, []() { runDiagnosticWebHandler("/ap", handleAccessPointSettingsPage); });
+  server.on("/ap-save", HTTP_POST, []() { runDiagnosticWebHandler("/ap-save", handleSaveAccessPointSettings); });
 
   server.onNotFound([]() {
     server.send(
@@ -6150,6 +6538,7 @@ void printSerialMainMenu() {
   Serial.println("2 - Bluetooth Survey");
   Serial.println("3 - System");
   Serial.println("4 - Settings");
+  Serial.println("5 - Developer");
   Serial.println();
   Serial.println("h/help - Show this menu");
   Serial.println("restart - Restart ESP32");
@@ -6266,7 +6655,7 @@ void printBluetoothSurveySerial() {
   Serial.println(" Bluetooth Survey");
   Serial.println("============================================================");
   Serial.print("Bluetooth Survey:     ");
-  Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled (Wi-Fi-first mode)");
+  Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled");
   if (bleSurveyEnabled) {
     Serial.print("BLE initialized:      ");
     Serial.println(bleInitialized ? "Yes" : "No");
@@ -6275,6 +6664,12 @@ void printBluetoothSurveySerial() {
     Serial.print("Scan interval:       ");
     Serial.print(bleScanIntervalSeconds);
     Serial.println(" s");
+    Serial.print("Last BLE API wait:  "); Serial.print(bleDiagnosticLastApiDurationMs); Serial.println(" ms");
+    Serial.print("Last BLE processing:"); Serial.print(" "); Serial.print(bleDiagnosticLastProcessingDurationMs); Serial.println(" ms");
+    Serial.print("Last BLE total:     "); Serial.print(bleDiagnosticLastTotalDurationMs); Serial.println(" ms");
+    Serial.print("BLE total min/avg/max: ");
+    if (bleDiagnosticDurationCount == 0) Serial.println("n/a");
+    else { Serial.print(bleDiagnosticMinDurationMs); Serial.print(" / "); Serial.print((uint32_t)(bleDiagnosticTotalDurationMs/bleDiagnosticDurationCount)); Serial.print(" / "); Serial.print(bleDiagnosticMaxDurationMs); Serial.println(" ms"); }
     Serial.print("History:             ");
     Serial.print(bleHistoryCount); Serial.print(" / "); Serial.print(bleHistoryRetentionLimit);
     Serial.print(" retained; "); Serial.print(bleHistoryCapacity); Serial.println(" physical");
@@ -6292,7 +6687,7 @@ void printBluetoothSurveySerial() {
     Serial.println("  ble off              - Disable BLE Survey and restart");
   } else {
     Serial.println();
-    Serial.println("BLE is not initialized, preserving approximately 83 KB of heap for Wi-Fi surveying.");
+    Serial.println("BLE is not initialized; its heap remains available to Wi-Fi surveying.");
     Serial.println("  ble on               - Enable BLE Survey and restart");
   }
   Serial.println("  0/back               - Main menu");
@@ -6328,7 +6723,7 @@ void printSystemSerial() {
   Serial.print("Free heap:            "); Serial.print(freeHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Minimum free heap:    "); Serial.print(minHeap/1024.0, 1); Serial.println(" KB");
   Serial.print("Largest free block:   "); Serial.print(largest/1024.0, 1); Serial.println(" KB");
-  Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE (limited)" : "Wi-Fi only");
+  Serial.print("Survey memory mode:   "); Serial.println(bleSurveyEnabled ? "Wi-Fi + BLE" : "Wi-Fi only");
   Serial.print("History reserve target:"); Serial.print(" "); Serial.print((bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES)/1024); Serial.println(" KB at allocation");
   if (bleSurveyEnabled) {
     Serial.print("Low-water WARN below: "); Serial.print(DUAL_RADIO_MIN_HEAP_WARN_BYTES/1024); Serial.println(" KB minimum free heap");
@@ -6411,8 +6806,8 @@ void printSettingsSerial() {
   Serial.println("============================================================");
   Serial.print("Infrastructure Wi-Fi: "); Serial.println(WiFi.status()==WL_CONNECTED ? "Connected" : "Disconnected");
   if (WiFi.status()==WL_CONNECTED) { Serial.print("  SSID:              "); Serial.println(WiFi.SSID()); }
-  Serial.print("Survey AP:             "); Serial.println(apRunning ? "Running" : "Disabled");
-  Serial.print("  SSID:                "); Serial.println(apSSID);
+  Serial.print("Device AP:             "); Serial.println(apRunning ? "Running" : "Disabled");
+  Serial.print("  Broadcast SSID:      "); Serial.println(apSSID);
   Serial.print("Bluetooth Survey:      "); Serial.println(bleSurveyEnabled ? "Enabled" : "Disabled");
   Serial.print("Status LED:            "); Serial.println(statusLedEnabled ? "Enabled" : "Disabled");
   Serial.print("Web live updates:      "); Serial.println(webAutoRefreshEnabled ? "Enabled" : "Disabled");
@@ -6426,9 +6821,9 @@ void printSettingsSerial() {
   Serial.println("  led on|off|test       - Status LED control/self-test");
   Serial.println("  refresh on|off        - Survey web-page live updates");
   Serial.println("  hostname <name>       - Set mDNS hostname and restart");
-  Serial.println("  ap on|off             - Enable/disable Survey AP and restart");
-  Serial.println("  apssid <name>         - Change Survey AP SSID and restart");
-  Serial.println("  appass <password>     - Change Survey AP password and restart");
+  Serial.println("  ap on|off             - Enable/disable Device AP and restart");
+  Serial.println("  apssid <name>         - Change Device AP broadcast SSID and restart");
+  Serial.println("  appass <password>     - Change Device AP password and restart");
   Serial.println("  0/back                - Main menu");
   Serial.println();
   Serial.print("> ");
@@ -6457,7 +6852,44 @@ void handleSerialCommand() {
   if (command == "2" || command.equalsIgnoreCase("bluetooth") || command.equalsIgnoreCase("ble-survey")) { printBluetoothSurveySerial(); return; }
   if (command == "3" || command.equalsIgnoreCase("system")) { printSystemSerial(); return; }
   if (command == "4" || command.equalsIgnoreCase("settings")) { printSettingsSerial(); return; }
+  if (command == "5" || command.equalsIgnoreCase("developer") || command.equalsIgnoreCase("dev")) { printDeveloperDiagnosticSummary(); return; }
   if (command == "0" || command.equalsIgnoreCase("back") || command.equalsIgnoreCase("h") || command.equalsIgnoreCase("help")) { printSerialMainMenu(); return; }
+
+  if (command.equalsIgnoreCase("diag on") || command.equalsIgnoreCase("diag off")) {
+    diagnosticStreamingEnabled = command.substring(command.length()-2).equalsIgnoreCase("on");
+    saveDiagnosticStreamingSettings();
+    diagnosticLastSnapshotMs = millis();
+    Serial.print("Diagnostic streaming "); Serial.println(diagnosticStreamingEnabled ? "enabled." : "disabled.");
+    if (diagnosticStreamingEnabled) printDiagnosticSnapshot();
+    printDeveloperDiagnosticSummary(); return;
+  }
+  if (command.equalsIgnoreCase("diag snapshot")) { printDiagnosticSnapshot(); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("diag summary")) { printDeveloperDiagnosticSummary(); return; }
+  if (command.equalsIgnoreCase("diag reset")) { resetDeveloperDiagnostics(); Serial.println("Diagnostic timing counters reset."); printDeveloperDiagnosticSummary(); return; }
+  if (command.startsWith("diag interval ")) {
+    long seconds = commandArgument(command, "diag interval").toInt();
+    if (seconds < 0 || seconds > 3600) Serial.println("Diagnostic snapshot interval must be 0-3600 seconds.");
+    else { diagnosticSnapshotIntervalMs = (uint32_t)seconds * 1000UL; saveDiagnosticStreamingSettings(); diagnosticLastSnapshotMs = millis(); Serial.println(seconds == 0 ? "Periodic diagnostic snapshots disabled." : "Periodic diagnostic snapshot interval updated."); }
+    printDeveloperDiagnosticSummary(); return;
+  }
+  if (command.startsWith("diag ")) {
+    int lastSpace = command.lastIndexOf(' ');
+    String category = command.substring(5, lastSpace); category.trim();
+    String state = command.substring(lastSpace + 1); state.trim();
+    if (!state.equalsIgnoreCase("on") && !state.equalsIgnoreCase("off")) { Serial.println("Use on or off for a diagnostic category."); printDeveloperDiagnosticSummary(); return; }
+    bool enabled = state.equalsIgnoreCase("on");
+    bool matched = true;
+    if (category.equalsIgnoreCase("survey")) diagnosticSurveyEvents = enabled;
+    else if (category.equalsIgnoreCase("ble")) diagnosticBleEvents = enabled;
+    else if (category.equalsIgnoreCase("memory")) diagnosticMemoryEvents = enabled;
+    else if (category.equalsIgnoreCase("web")) diagnosticWebEvents = enabled;
+    else if (category.equalsIgnoreCase("scheduler")) diagnosticSchedulerEvents = enabled;
+    else if (category.equalsIgnoreCase("checkpoint")) diagnosticCheckpointEvents = enabled;
+    else matched = false;
+    if (!matched) Serial.println("Unknown diagnostic category.");
+    else { saveDiagnosticStreamingSettings(); Serial.print("Diagnostic category '"); Serial.print(category); Serial.print("' "); Serial.println(enabled ? "enabled." : "disabled."); }
+    printDeveloperDiagnosticSummary(); return;
+  }
 
   if (command.equalsIgnoreCase("scan")) { performLoggedScan(); WiFi.scanDelete(); printWifiSurveySerial(); return; }
   if (command.equalsIgnoreCase("wclear")) { clearScanHistory(); Serial.println("Wi-Fi history cleared."); printWifiSurveySerial(); return; }
@@ -6478,7 +6910,7 @@ void handleSerialCommand() {
 
   if (command.equalsIgnoreCase("blescan")) {
     if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled. Use 'ble on' to enable it and restart.");
-    else performLoggedBLEScan();
+    else performLoggedBLEScanWithTrigger("serial-manual");
     printBluetoothSurveySerial(); return;
   }
   if (command.equalsIgnoreCase("bleclear")) { if (bleSurveyEnabled) clearBleHistory(); Serial.println("BLE history cleared."); printBluetoothSurveySerial(); return; }
@@ -6531,7 +6963,7 @@ void handleSerialCommand() {
 
   if (command.equalsIgnoreCase("ap on") || command.equalsIgnoreCase("ap off")) {
     bool requested=command.endsWith("on"); saveAccessPointSettings(requested,apSSID,apPassword);
-    Serial.println("Survey AP setting saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    Serial.println("Device AP setting saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
   }
   if (command.startsWith("apssid ")) {
     String requested=commandArgument(command,"apssid"); requested.trim();
@@ -6564,6 +6996,7 @@ void setup() {
 
   captureBootHeapCheckpoint("Startup");
   loadSurveyModeSettings();
+  loadDiagnosticStreamingSettings();
   captureBootHeapCheckpoint("Settings loaded");
   initializeStatusLed();
   captureBootHeapCheckpoint("Status LED initialized");
@@ -6581,6 +7014,14 @@ void setup() {
   Serial.print("Built:    ");
   Serial.println(firmwareBuildTimestamp());
   Serial.println();
+  if (diagnosticStreamingEnabled) {
+    diagnosticPrefix("BOOT");
+    Serial.print("firmware=V"); Serial.print(FIRMWARE_VERSION);
+    Serial.print(" bleMode="); Serial.print(bleSurveyEnabled ? 1 : 0);
+    Serial.print(" snapshot="); Serial.print(diagnosticSnapshotIntervalMs / 1000); Serial.print("s ");
+    diagnosticPrintHeapTriplet();
+    Serial.println();
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -6591,7 +7032,9 @@ void setup() {
 
   loadAccessPointSettings();
   Serial.print("Bluetooth Survey mode: ");
-  Serial.println(bleSurveyEnabled ? "enabled" : "disabled (Wi-Fi-first)");
+  Serial.println(bleSurveyEnabled ? "enabled" : "disabled");
+  Serial.print("Diagnostic streaming: ");
+  Serial.println(diagnosticStreamingEnabled ? "enabled (persisted)" : "disabled");
   if (apEnabled) startAccessPoint();
   captureBootHeapCheckpoint("AP setup complete");
 
@@ -6713,8 +7156,8 @@ void serviceInitialSurveyScans() {
     !userInteractionDeferActive()
   ) {
     initialBleScanPending = false;
-    Serial.println("Initial headless BLE survey scan (limited mode)...");
-    performLoggedBLEScan();
+    Serial.println("Initial headless BLE survey scan...");
+    performLoggedBLEScanWithTrigger("initial");
     lastAutoBleScanMs = millis();
     captureBootHeapCheckpoint("Initial BLE scan");
   }
@@ -6741,14 +7184,19 @@ void serviceAutomaticScan() {
 
 // Purpose: Schedules periodic BLE scans when Bluetooth Survey and automatic BLE surveying are enabled.
 void serviceAutomaticBLEScan() {
-  if (!bleSurveyEnabled || !autoBleScanEnabled || wifiScanInProgress ||
-      csvExportInProgress || userInteractionDeferActive()) return;
+  if (!bleSurveyEnabled) { diagnosticBleSchedulerState(1, "disabled"); return; }
+  if (!autoBleScanEnabled) { diagnosticBleSchedulerState(2, "automatic-off"); return; }
 
   unsigned long intervalMs = bleScanIntervalSeconds * 1000UL;
-  if (millis() - lastAutoBleScanMs < intervalMs) return;
+  if ((uint32_t)(millis() - lastAutoBleScanMs) < intervalMs) { diagnosticBleSchedulerState(3, "waiting-interval"); return; }
+  if (wifiScanInProgress) { diagnosticBleSchedulerState(4, "deferred-wifi-scan"); return; }
+  if (csvExportInProgress) { diagnosticBleSchedulerState(5, "deferred-csv"); return; }
+  if (userInteractionDeferActive()) { diagnosticBleSchedulerState(6, "deferred-user-interaction"); return; }
 
+  diagnosticBleSchedulerState(7, "starting");
   lastAutoBleScanMs = millis();
-  performLoggedBLEScan();
+  performLoggedBLEScanWithTrigger("automatic");
+  diagnosticBleSchedulerState(3, "waiting-interval");
 }
 
 
@@ -6758,11 +7206,14 @@ void serviceAutomaticBLEScan() {
 
 // Purpose: Arduino main loop that continuously services web requests, serial commands, scan completion, reconnect diagnostics, and automatic survey scheduling.
 void loop() {
+  serviceLoopGapDiagnostics();
+
   if (webServerStarted) {
     server.handleClient();
     armUserInteractionDeferAfterWebService();
   }
 
+  serviceDiagnosticSnapshot();
   serviceLoggedWifiScan();
   serviceNativeReconnectDiagnostics();
   serviceInitialSurveyScans();
