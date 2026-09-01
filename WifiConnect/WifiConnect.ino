@@ -1,14 +1,13 @@
 // ESP32 Wireless Surveyor firmware.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
-// Complete live survey updates and harden retained history
+// Reduce full-history page work and expose Bluetooth disable control
 //
-// - refresh dynamic Wi-Fi and Bluetooth survey values while Live Updates is enabled
-// - apply Bluetooth scan interval changes immediately and keep surveying automatic when enabled
-// - correct Wi-Fi scan-metadata slot mapping and detect retained-history ordering anomalies
-// - use consumable restart checkpoints so stale saved history is not restored indefinitely
-// - move diagnostics export to System and include a bounded recent diagnostic event history
-// - normalize infrastructure network context across survey pages
+// - count retained Wi-Fi scan groups directly from compact scan metadata and cache the result while history is unchanged
+// - resolve retained BSSID membership and SSID selection through AP-table indices instead of synthesized records
+// - avoid per-observation infrastructure Wi-Fi queries during generic history reconstruction and CSV export
+// - analyze the latest Wi-Fi scan directly from compact observation and metadata tables
+// - provide Disable Bluetooth Survey directly on the active Bluetooth survey page
 //
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
@@ -33,8 +32,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38_ui_live_history_integrity.ino";
-const char* FIRMWARE_VERSION = "38";
+const char* FIRMWARE_FILE = "WifiConnect38d_wifi_history_hotpaths_ble_control.ino";
+const char* FIRMWARE_VERSION = "38d";
 
 
 Preferences preferences;
@@ -101,6 +100,10 @@ const size_t MIN_BLE_HISTORY_RECORDS = 50;
 const size_t MAX_BLE_HISTORY_RECORDS = 12000;
 const size_t BLE_ADDRESS_TABLE_TARGET = 128;
 const size_t BLE_SCAN_METADATA_SLOTS = 256;
+const size_t WIFI_ONLY_AP_TABLE_TARGET = 512;
+const size_t WIFI_ONLY_SCAN_METADATA_SLOTS = 1024;
+const size_t DUAL_RADIO_WIFI_AP_TABLE_TARGET = 64;
+const size_t DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS = 64;
 // Dual-radio history sizing deliberately leaves additional heap unallocated.
 // Web page generation, mDNS, radio activity, and transient String buffers need
 // substantial headroom after the survey tables are created. This allocation-
@@ -108,7 +111,9 @@ const size_t BLE_SCAN_METADATA_SLOTS = 256;
 // margin because web and network services consume additional heap afterward.
 const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 88 * 1024;
 
-const size_t HISTORY_HEAP_RESERVE_BYTES = 96 * 1024;
+// Wi-Fi-only mode can devote substantially more RAM to retained observations
+// because the BLE stack and BLE history tables are absent.
+const size_t HISTORY_HEAP_RESERVE_BYTES = 64 * 1024;
 
 const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
 const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
@@ -251,6 +256,9 @@ void appendWifiObservation(const WifiObservation& observation);
 const BleObservation& compactBleHistoryRecord(size_t logicalIndex);
 BleScanRecord bleHistoryRecord(size_t logicalIndex);
 void appendBleObservation(const BleObservation& observation);
+void discardBleObservationsForScanSlot(uint16_t scanSlot);
+void updateBleUsageHighWaterMarks();
+int findOrCreateBleAddress(const uint8_t address[6], const String& name, uint8_t addressType);
 int findWifiApByTextBssid(const String& bssid);
 bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
 void serviceLoggedWifiScan();
@@ -1236,7 +1244,7 @@ bool checkpointBeforeControlledRestart() {
 }
 
 // ============================================================
-// Synthetic Wi-Fi history test tools
+// Synthetic history test tools
 // ============================================================
 
 // Purpose: Adds deterministic synthetic Wi-Fi observations until the requested percentage of history capacity is filled.
@@ -1281,13 +1289,62 @@ bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
   return true;
 }
 
+// Purpose: Adds deterministic synthetic BLE observations until the requested percentage of history capacity is filled.
+bool prefillBleHistoryToPercent(uint8_t percent, String& detail) {
+  if (percent != 50 && percent != 75 && percent != 95) { detail = "Unsupported target."; return false; }
+  if (!bleSurveyEnabled || !bleHistory || !bleAddressTable || !bleScanMetadata ||
+      bleHistoryRetentionLimit == 0 || bleScanMetadataCapacity == 0 ||
+      bleDiagnosticScanActive || csvExportInProgress) {
+    detail = "Bluetooth history storage is unavailable, disabled, or busy.";
+    return false;
+  }
+
+  size_t target = (bleHistoryRetentionLimit * percent) / 100;
+  if (bleHistoryCount >= target) { detail = "Bluetooth history is already at or above the requested target."; return true; }
+
+  const uint8_t syntheticAddressCount = 16;
+  uint16_t addressIndexes[syntheticAddressCount];
+  for (uint8_t a = 0; a < syntheticAddressCount; a++) {
+    uint8_t address[6] = {0xC2, 0x42, 0x4C, 0x45, 0x00, a};
+    String name = "TEST-PREFILL-BLE-" + String(a + 1);
+    int idx = findOrCreateBleAddress(address, name, 1);
+    if (idx < 0) { detail = "BLE address table has no room for synthetic test identities."; return false; }
+    addressIndexes[a] = (uint16_t)idx;
+  }
+
+  while (bleHistoryCount < target) {
+    bleScanCounter++;
+    uint16_t slot = (uint16_t)((bleScanCounter - 1) % bleScanMetadataCapacity);
+    if (bleScanMetadata[slot].scanNumber != 0 && bleScanMetadata[slot].scanNumber != bleScanCounter)
+      discardBleObservationsForScanSlot(slot);
+    bleScanMetadata[slot].scanNumber = bleScanCounter;
+    bleScanMetadata[slot].uptimeMs = surveySessionUptimeMs();
+    lastBleScanUptimeMs = bleScanMetadata[slot].uptimeMs;
+
+    for (uint8_t a = 0; a < syntheticAddressCount && bleHistoryCount < target; a++) {
+      BleObservation test = {};
+      test.addressIndex = addressIndexes[a];
+      test.scanSlot = slot;
+      test.rssi = (int8_t)(-38 - ((bleScanCounter + a * 9) % 52));
+      appendBleObservation(test);
+    }
+  }
+
+  updateBleUsageHighWaterMarks();
+  detail = "Synthetic Bluetooth test data filled history to " + String(percent) + "% (" + String(bleHistoryCount) + " observations).";
+  return true;
+}
+
 // Purpose: HTTP handler for the Developer synthetic-history prefill controls.
 void handleHistoryPrefill() {
   markExplicitUserInteraction();
   if (!server.hasArg("percent")) { server.send(400, "text/plain", "Missing target percent."); return; }
   int percent = server.arg("percent").toInt();
+  String radio = server.hasArg("radio") ? server.arg("radio") : "wifi";
   String detail;
-  bool ok = prefillWifiHistoryToPercent((uint8_t)percent, detail);
+  bool ok = radio == "ble"
+    ? prefillBleHistoryToPercent((uint8_t)percent, detail)
+    : prefillWifiHistoryToPercent((uint8_t)percent, detail);
   server.sendHeader("Location", "/system");
   server.send(ok ? 303 : 409, "text/plain", detail);
 }
@@ -1902,29 +1959,47 @@ ScanRecord historyRecord(size_t logicalIndex) {
   record.channel = ap.channel;
   record.authMode = ap.authMode;
   record.hidden = (ap.ssid[0] == '\0');
-  record.connected =
-      WiFi.status() == WL_CONNECTED &&
-      WiFi.BSSIDstr().equalsIgnoreCase(String(record.bssid));
+  record.connected = false;
   return record;
 }
 
-// Purpose: Counts distinct retained Wi-Fi scan numbers represented in the observation ring.
+// Purpose: Counts distinct retained Wi-Fi scan numbers directly from compact scan metadata.
 size_t countRetainedScanGroups() {
-  if (historyCount == 0 || scanHistory == nullptr) return 0;
+  static size_t cachedHistoryStart = SIZE_MAX;
+  static size_t cachedHistoryCount = SIZE_MAX;
+  static uint32_t cachedScanCounter = UINT32_MAX;
+  static size_t cachedGroups = 0;
+
+  if (
+    cachedHistoryStart == historyStart &&
+    cachedHistoryCount == historyCount &&
+    cachedScanCounter == scanCounter
+  ) {
+    return cachedGroups;
+  }
 
   size_t groups = 0;
   uint32_t previousScan = 0;
   bool havePrevious = false;
 
-  for (size_t i = 0; i < historyCount; i++) {
-    ScanRecord current = historyRecord(i);
-    if (!havePrevious || current.scanNumber != previousScan) {
-      groups++;
-      previousScan = current.scanNumber;
-      havePrevious = true;
+  if (scanHistory != nullptr && wifiScanMetadata != nullptr) {
+    for (size_t i = 0; i < historyCount; i++) {
+      const WifiObservation& observation = compactHistoryRecord(i);
+      if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
+      uint32_t currentScan = wifiScanMetadata[observation.scanSlot].scanNumber;
+      if (!havePrevious || currentScan != previousScan) {
+        groups++;
+        previousScan = currentScan;
+        havePrevious = true;
+      }
     }
   }
-  return groups;
+
+  cachedHistoryStart = historyStart;
+  cachedHistoryCount = historyCount;
+  cachedScanCounter = scanCounter;
+  cachedGroups = groups;
+  return cachedGroups;
 }
 
 // Purpose: Evicts the oldest Wi-Fi observation from the ring buffer.
@@ -2127,11 +2202,7 @@ int findOrCreateWifiAp(
 }
 
 // Purpose: Allocates the compact Wi-Fi observation ring, AP table, and scan-metadata table within the chosen RAM budget.
-bool initializeCompactWifiHistory(size_t budgetBytes) {
-  // Scale metadata overhead down in BLE mode, where the available Wi-Fi
-  // history budget is intentionally small. Wi-Fi-only mode uses larger tables.
-  size_t apCapacity = budgetBytes >= 24 * 1024 ? 512 : 64;
-  size_t scanCapacity = budgetBytes >= 24 * 1024 ? 1024 : 64;
+bool initializeCompactWifiHistory(size_t budgetBytes, size_t apCapacity, size_t scanCapacity) {
 
   size_t metadataBytes =
       apCapacity * sizeof(WifiApEntry) +
@@ -2276,7 +2347,7 @@ int performLoggedScan() {
 
   startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
   uint32_t scanStartMs = millis();
-  int networkCount = WiFi.scanNetworks();
+  int networkCount = WiFi.scanNetworks(false, true);
   uint32_t scanDurationMs = millis() - scanStartMs;
   stopScanLed();
 
@@ -2295,7 +2366,7 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   ensureWiFiStationMode();
   WiFi.scanDelete();
 
-  int result = WiFi.scanNetworks(true);
+  int result = WiFi.scanNetworks(true, true);
   if (result == WIFI_SCAN_FAILED) {
     wifiScanStatusMessage = "Failed to start";
     if (automaticTrigger) {
@@ -2687,15 +2758,17 @@ void initializeAutoSizedHistories() {
   size_t freeHeap = ESP.getFreeHeap();
 
   if (!bleSurveyEnabled) {
+    const size_t wifiMetadata =
+        WIFI_ONLY_AP_TABLE_TARGET * sizeof(WifiApEntry) +
+        WIFI_ONLY_SCAN_METADATA_SLOTS * sizeof(WifiScanMetadata);
+    const size_t minimumWifiObs =
+        MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
+    const size_t minimumCompactBytes = wifiMetadata + minimumWifiObs;
     size_t available = freeHeap > HISTORY_HEAP_RESERVE_BYTES
       ? freeHeap - HISTORY_HEAP_RESERVE_BYTES : 0;
-    size_t minimumCompactBytes =
-        64 * sizeof(WifiApEntry) +
-        64 * sizeof(WifiScanMetadata) +
-        MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
     if (available < minimumCompactBytes) available = minimumCompactBytes;
-    if (!initializeCompactWifiHistory(available))
-      initializeCompactWifiHistory(minimumCompactBytes);
+    if (!initializeCompactWifiHistory(available, WIFI_ONLY_AP_TABLE_TARGET, WIFI_ONLY_SCAN_METADATA_SLOTS))
+      initializeCompactWifiHistory(minimumCompactBytes, WIFI_ONLY_AP_TABLE_TARGET, WIFI_ONLY_SCAN_METADATA_SLOTS);
   } else {
     // Keep a deliberate allocation-time reserve so later web, mDNS, scan, and
     // transient presentation allocations do not have to compete with oversized
@@ -2705,7 +2778,8 @@ void initializeAutoSizedHistories() {
       ? freeHeap - DUAL_RADIO_HEAP_RESERVE_BYTES : 0;
 
     const size_t wifiMetadata =
-        64 * sizeof(WifiApEntry) + 64 * sizeof(WifiScanMetadata);
+        DUAL_RADIO_WIFI_AP_TABLE_TARGET * sizeof(WifiApEntry) +
+        DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS * sizeof(WifiScanMetadata);
     const size_t bleMetadata =
         BLE_ADDRESS_TABLE_TARGET * sizeof(BleAddressEntry) +
         BLE_SCAN_METADATA_SLOTS * sizeof(SurveyScanMetadata);
@@ -2722,8 +2796,8 @@ void initializeAutoSizedHistories() {
     size_t wifiBudget = wifiMetadata + minimumWifiObs + wifiExtra;
     size_t bleBudget = bleMetadata + minimumBleObs + bleExtra;
 
-    if (!initializeCompactWifiHistory(wifiBudget))
-      initializeCompactWifiHistory(wifiMetadata + minimumWifiObs);
+    if (!initializeCompactWifiHistory(wifiBudget, DUAL_RADIO_WIFI_AP_TABLE_TARGET, DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS))
+      initializeCompactWifiHistory(wifiMetadata + minimumWifiObs, DUAL_RADIO_WIFI_AP_TABLE_TARGET, DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS);
     if (!initializeCompactBleHistory(bleBudget))
       initializeCompactBleHistory(bleMetadata + minimumBleObs);
   }
@@ -3701,17 +3775,18 @@ String urlEncode(const String& input) {
 
 // Purpose: Returns the latest retained SSID associated with a specific BSSID.
 String latestSSIDForBSSID(const String& bssid) {
+  if (bssid.length() == 0 || wifiApTable == nullptr || scanHistory == nullptr) return "";
+
+  int apIndex = findWifiApByTextBssid(bssid);
+  if (apIndex < 0) return "";
+
   for (size_t offset = 0; offset < historyCount; offset++) {
     size_t logicalIndex = historyCount - 1 - offset;
-    const ScanRecord& record = historyRecord(logicalIndex);
+    const WifiObservation& observation = compactHistoryRecord(logicalIndex);
+    if (observation.apIndex != (uint16_t)apIndex) continue;
 
-    if (String(record.bssid).equalsIgnoreCase(bssid)) {
-      if (record.hidden) {
-        return "(hidden)";
-      }
-
-      return String(record.ssid);
-    }
+    const WifiApEntry& ap = wifiApTable[apIndex];
+    return ap.ssid[0] == '\0' ? String("(hidden)") : String(ap.ssid);
   }
 
   return "";
@@ -3719,14 +3794,13 @@ String latestSSIDForBSSID(const String& bssid) {
 
 // Purpose: Checks whether a BSSID is represented anywhere in retained Wi-Fi history.
 bool historyContainsBSSID(const String& bssid) {
-  if (bssid.length() == 0) {
-    return false;
-  }
+  if (bssid.length() == 0 || scanHistory == nullptr) return false;
+
+  int apIndex = findWifiApByTextBssid(bssid);
+  if (apIndex < 0) return false;
 
   for (size_t i = 0; i < historyCount; i++) {
-    if (String(historyRecord(i).bssid).equalsIgnoreCase(bssid)) {
-      return true;
-    }
+    if (compactHistoryRecord(i).apIndex == (uint16_t)apIndex) return true;
   }
 
   return false;
@@ -3856,6 +3930,31 @@ String pageStyles() {
 
   .buttons {
     text-align: center;
+  }
+
+  .test-tool-group {
+    margin-top: 18px;
+  }
+
+  .test-tool-group h3 {
+    margin: 0 0 8px 0;
+    font-size: 1em;
+  }
+
+  .test-tool-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .test-tool-actions form {
+    margin: 0;
+  }
+
+  .test-tool-actions button {
+    min-height: 44px;
+    padding: 10px 18px;
   }
 
   .survey-control-row {
@@ -4466,8 +4565,14 @@ void handleScanCsv() {
     bytesSent
   );
 
+  int connectedApIndex = -1;
+  if (WiFi.status() == WL_CONNECTED) {
+    connectedApIndex = findWifiApByTextBssid(WiFi.BSSIDstr());
+  }
+
   for (size_t i = 0; i < exportCount; i++) {
     const ScanRecord& record = historyRecord(i);
+    const WifiObservation& observation = compactHistoryRecord(i);
 
     String line;
     line.reserve(180);
@@ -4490,7 +4595,7 @@ void handleScanCsv() {
       securityLabel((wifi_auth_mode_t)record.authMode)
     );
     line += ",";
-    line += record.connected ? "YES" : "NO";
+    line += (connectedApIndex >= 0 && observation.apIndex == (uint16_t)connectedApIndex) ? "YES" : "NO";
     line += ",";
     line += record.hidden ? "YES" : "NO";
     line += "\r\n";
@@ -5088,19 +5193,45 @@ ChannelAnalysis analyzeLatestWifiScan() {
   ChannelAnalysis a = {};
   a.suggestedChannel = 0;
   for (int ch = 1; ch <= 11; ch++) a.strongestRssi[ch] = -127;
-  if (historyCount == 0 || scanHistory == nullptr) { cached = a; cachedScanCounter = scanCounter; return cached; }
+  if (
+    historyCount == 0 ||
+    scanHistory == nullptr ||
+    wifiScanMetadata == nullptr ||
+    wifiApTable == nullptr
+  ) {
+    cached = a;
+    cachedScanCounter = scanCounter;
+    return cached;
+  }
 
-  uint32_t latestScan = historyRecord(historyCount - 1).scanNumber;
+  const WifiObservation& latestObservation = compactHistoryRecord(historyCount - 1);
+  if (latestObservation.scanSlot >= wifiScanMetadataCapacity) {
+    cached = a;
+    cachedScanCounter = scanCounter;
+    return cached;
+  }
+
+  uint32_t latestScan = wifiScanMetadata[latestObservation.scanSlot].scanNumber;
   a.scanNumber = latestScan;
   for (size_t i = 0; i < historyCount; i++) {
-    const ScanRecord& r = historyRecord(i);
-    if (r.scanNumber != latestScan || r.channel < 1 || r.channel > 11) continue;
+    const WifiObservation& observation = compactHistoryRecord(i);
+    if (
+      observation.scanSlot >= wifiScanMetadataCapacity ||
+      observation.apIndex >= wifiApCount
+    ) continue;
+
+    const WifiScanMetadata& metadata = wifiScanMetadata[observation.scanSlot];
+    if (metadata.scanNumber != latestScan) continue;
+
+    const WifiApEntry& ap = wifiApTable[observation.apIndex];
+    if (ap.channel < 1 || ap.channel > 11) continue;
+
     a.valid = true;
-    a.apCount[r.channel]++;
-    if (r.rssi > a.strongestRssi[r.channel]) a.strongestRssi[r.channel] = r.rssi;
-    float w = rssiInterferenceWeight(r.rssi);
+    a.apCount[ap.channel]++;
+    if (observation.rssi > a.strongestRssi[ap.channel]) a.strongestRssi[ap.channel] = observation.rssi;
+    float w = rssiInterferenceWeight(observation.rssi);
     for (int candidate = 1; candidate <= 11; candidate++) {
-      int d = abs(candidate - r.channel);
+      int d = abs(candidate - ap.channel);
       float overlap = channelOverlapFactor(d);
       if (overlap <= 0.0f) continue;
       if (d == 0) a.coChannelScore[candidate] += w;
@@ -5666,6 +5797,7 @@ void handleBLESurvey() {
     "<input id=\"ble-interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(bleScanIntervalSeconds) + "\"></div>"
     "<span id=\"ble-interval-save-state\" class=\"save-state\"></span></div>"
     "<div class=\"buttons\"><a class=\"button\" href=\"/ble-scan\">Scan Now</a><a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
+    "<form class=\"controls\" action=\"/ble-mode\" method=\"post\"><input type=\"hidden\" name=\"enabled\" value=\"0\"><button type=\"submit\">Disable Bluetooth Survey</button></form>"
     "<div id=\"ble-scan-state\" class=\"scan-state\"></div>"
     "<div class=\"note\">Bluetooth surveying runs automatically whenever Bluetooth Survey is enabled. Changing the interval saves immediately. Bluetooth surveying significantly reduces available Wi-Fi history capacity.</div>"
     "<div id=\"ble-status-note\" class=\"note\">" + htmlEscape(bleStatusMessage) + "</div></div>";
@@ -5981,8 +6113,24 @@ void handleSystemStatus() {
   markWebResponsePhase("boot-checkpoints");
 
   diagnosticSendContent("<div class=\"card advanced-only\"><h2>Session</h2><div class=\"row\"><span class=\"label\">Restart Checkpoint</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div><div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
-    "<div class=\"developer-only\"><div class=\"buttons\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are consumed after successful restore. Persistent logging is a separate future feature.</div></div></div>");
-  diagnosticSendContent("<div class=\"card developer-only\"><h2>History Test Tools</h2><div class=\"buttons\"><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form></div><div class=\"note\"><strong>TEST FEATURE:</strong> inserts synthetic TEST-PREFILL Wi-Fi observations into the real compact history.</div></div>");
+    "<div class=\"developer-only\"><div class=\"test-tool-actions\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are consumed after successful restore. Persistent logging is a separate future feature.</div></div></div>");
+  String historyTestTools = "<div class=\"card developer-only\"><h2>History Test Tools</h2>"
+    "<div class=\"test-tool-group\"><h3>Wi-Fi History</h3><div class=\"test-tool-actions\">"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
+    "</div></div>";
+  if (bleSurveyEnabled && bleHistory && bleAddressTable && bleScanMetadata) {
+    historyTestTools += "<div class=\"test-tool-group\"><h3>Bluetooth History</h3><div class=\"test-tool-actions\">"
+      "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
+      "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
+      "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
+      "</div></div>";
+  } else {
+    historyTestTools += "<div class=\"test-tool-group\"><h3>Bluetooth History</h3><div class=\"note\">Enable Bluetooth Survey to use Bluetooth history prefill.</div></div>";
+  }
+  historyTestTools += "<div class=\"note\"><strong>TEST FEATURE:</strong> inserts synthetic TEST-PREFILL observations directly into the real compact Wi-Fi or Bluetooth history. Synthetic data is not a substitute for radio/endurance testing and remains in UI/CSV output until cleared or rolled out.</div></div>";
+  diagnosticSendContent(historyTestTools);
   diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
   sendThemeScript(); diagnosticSendContent("</div></body></html>"); diagnosticSendContent("");
   markWebResponsePhase("session-tools-footer");
