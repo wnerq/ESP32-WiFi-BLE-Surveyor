@@ -1,13 +1,14 @@
 // ESP32 Wireless Surveyor firmware.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
-// Reduce full-history page work and expose Bluetooth disable control
+// Improve mobile survey resilience, freshness, and AP identity reuse
 //
-// - count retained Wi-Fi scan groups directly from compact scan metadata and cache the result while history is unchanged
-// - resolve retained BSSID membership and SSID selection through AP-table indices instead of synthesized records
-// - avoid per-observation infrastructure Wi-Fi queries during generic history reconstruction and CSV export
-// - analyze the latest Wi-Fi scan directly from compact observation and metadata tables
-// - provide Disable Bluetooth Survey directly on the active Bluetooth survey page
+// - reclaim the least-recently-seen unreferenced AP-table identity safely
+// - default hidden-network history capture off while preserving live RF analysis
+// - expose newest-observation and per-scan new/known/logged/drop diagnostics
+// - recover asynchronous Wi-Fi scans that remain pending for 60 seconds
+// - invoke saved-infrastructure reconnect detection after completed surveys
+// - add explicit mobile-friendly Apply controls
 //
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
@@ -32,8 +33,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38d_wifi_history_hotpaths_ble_control.ino";
-const char* FIRMWARE_VERSION = "38d";
+const char* FIRMWARE_FILE = "WifiConnect38e_mobile_survey_resilience.ino";
+const char* FIRMWARE_VERSION = "38e";
 
 
 Preferences preferences;
@@ -165,6 +166,7 @@ struct WifiApEntry {
   uint8_t bssid[6];
   uint8_t channel;
   uint8_t authMode;
+  uint16_t lastSeenScanLow;
 };
 
 // Generic scan metadata shared by Wi-Fi and BLE. Each radio has its own
@@ -260,6 +262,9 @@ void discardBleObservationsForScanSlot(uint16_t scanSlot);
 void updateBleUsageHighWaterMarks();
 int findOrCreateBleAddress(const uint8_t address[6], const String& name, uint8_t addressType);
 int findWifiApByTextBssid(const String& bssid);
+int findOrCreateWifiAp(const uint8_t bssid[6], const String& ssid, uint8_t channel, uint8_t authMode, bool* created = nullptr, bool* reclaimed = nullptr);
+float rssiInterferenceWeight(int rssi);
+float channelOverlapFactor(int distance);
 bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
 void serviceLoggedWifiScan();
 String jsonQuoted(const String& value);
@@ -306,6 +311,7 @@ uint32_t lastWifiAutoScanFailureMs = 0;
 const uint32_t USER_INTERACTION_DEFER_MS = 2000;
 const uint32_t WIFI_AUTOSCAN_RETRY_BACKOFF_MS = 2000;
 const uint32_t WIFI_AUTOSCAN_DIAG_GRACE_MS = USER_INTERACTION_DEFER_MS + 1000;
+const uint32_t WIFI_SCAN_WATCHDOG_MS = 60000;
 const size_t CSV_STREAM_BUFFER_BYTES = 2048;
 
 bool explicitUserInteractionHandled = false;
@@ -331,11 +337,29 @@ size_t wifiApCount = 0;
 WifiScanMetadata* wifiScanMetadata = nullptr;
 size_t wifiScanMetadataCapacity = 0;
 size_t wifiApTableFullDrops = 0;
+size_t wifiApReclamationCount = 0;
+bool captureHiddenNetworks = false;
+uint16_t wifiLastScanFound = 0;
+uint16_t wifiLastScanLogged = 0;
+uint16_t wifiLastScanDropped = 0;
+uint16_t wifiLastScanNewAps = 0;
+uint16_t wifiLastScanPreviouslySeenAps = 0;
+uint16_t wifiLastScanHiddenSkipped = 0;
+uint16_t wifiLastScanReclaimedAps = 0;
+
+// Latest-scan RF aggregates remain valid even when hidden-network history
+// capture is disabled. This keeps channel analysis representative without
+// spending AP-table or history capacity on hidden BSSIDs.
+uint32_t wifiLatestAnalysisScan = 0;
+uint16_t wifiLatestChannelApCount[12] = {};
+int16_t wifiLatestChannelStrongestRssi[12] = {};
+float wifiLatestCoChannelScore[12] = {};
+float wifiLatestAdjacentScore[12] = {};
 
 // Session checkpoint / restore and test-tool diagnostics.
 const char* SESSION_CHECKPOINT_PATH = "/survey_session.bin";
 const uint32_t SESSION_CHECKPOINT_MAGIC = 0x53565233; // "SVR3"
-const uint16_t SESSION_CHECKPOINT_VERSION = 2;
+const uint16_t SESSION_CHECKPOINT_VERSION = 3;
 bool spiffsMounted = false;
 bool sessionRestoredThisBoot = false;
 String sessionCheckpointStatus = "Filesystem not initialized";
@@ -735,6 +759,7 @@ void loadSurveyModeSettings() {
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
+  captureHiddenNetworks = preferences.getBool("captureHidden", false);
   scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
   bleScanIntervalSeconds = preferences.getULong("bleInterval", bleScanIntervalSeconds);
   if (scanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS) scanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
@@ -750,6 +775,13 @@ void loadSurveyModeSettings() {
     mdnsHostnameUserConfigured = false;
   }
   autoBleScanEnabled = bleSurveyEnabled;
+}
+
+void saveCaptureHiddenNetworks(bool enabled) {
+  captureHiddenNetworks = enabled;
+  preferences.begin("survey", false);
+  preferences.putBool("captureHidden", captureHiddenNetworks);
+  preferences.end();
 }
 
 // Purpose: Builds a unique default hostname from the ESP32 identity.
@@ -2121,6 +2153,7 @@ void clearScanHistory() {
   lastScanUptimeMs = 0;
   wifiApCount = 0;
   wifiApTableFullDrops = 0;
+  wifiApReclamationCount = 0;
   if (wifiScanMetadata && wifiScanMetadataCapacity)
     memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
 }
@@ -2146,8 +2179,12 @@ int findOrCreateWifiAp(
   const uint8_t bssid[6],
   const String& ssid,
   uint8_t channel,
-  uint8_t authMode
+  uint8_t authMode,
+  bool* created,
+  bool* reclaimed
 ) {
+  if (created) *created = false;
+  if (reclaimed) *reclaimed = false;
   int existing = findWifiApByBssid(bssid);
 
   if (existing >= 0) {
@@ -2167,6 +2204,7 @@ int findOrCreateWifiAp(
     ssid.toCharArray(ap.ssid, sizeof(ap.ssid));
     ap.channel = channel;
     ap.authMode = authMode;
+    ap.lastSeenScanLow = (uint16_t)scanCounter;
     return existing;
   }
 
@@ -2178,16 +2216,22 @@ int findOrCreateWifiAp(
   size_t targetIndex = wifiApCount;
   if (wifiApCount >= wifiApTableCapacity) {
     targetIndex = wifiApTableCapacity;
+    uint16_t oldestAge = 0;
     for (size_t i = 0; i < wifiApTableCapacity; i++) {
       if (!wifiApIndexIsReferenced(i)) {
-        targetIndex = i;
-        break;
+        uint16_t age = (uint16_t)((uint16_t)scanCounter - wifiApTable[i].lastSeenScanLow);
+        if (targetIndex >= wifiApTableCapacity || age > oldestAge) {
+          oldestAge = age;
+          targetIndex = i;
+        }
       }
     }
     if (targetIndex >= wifiApTableCapacity) {
       wifiApTableFullDrops++;
       return -1;
     }
+    wifiApReclamationCount++;
+    if (reclaimed) *reclaimed = true;
   } else {
     wifiApCount++;
   }
@@ -2198,6 +2242,8 @@ int findOrCreateWifiAp(
   memcpy(ap.bssid, bssid, 6);
   ap.channel = channel;
   ap.authMode = authMode;
+  ap.lastSeenScanLow = (uint16_t)scanCounter;
+  if (created) *created = true;
   return (int)targetIndex;
 }
 
@@ -2287,6 +2333,19 @@ int processCompletedWifiScan(int networkCount) {
   wifiScanMetadata[scanSlot].scanNumber = scanCounter;
   wifiScanMetadata[scanSlot].uptimeMs = lastScanUptimeMs;
 
+  wifiLastScanFound = networkCount > 0 ? (uint16_t)networkCount : 0;
+  wifiLastScanLogged = 0;
+  wifiLastScanDropped = 0;
+  wifiLastScanNewAps = 0;
+  wifiLastScanPreviouslySeenAps = 0;
+  wifiLastScanHiddenSkipped = 0;
+  wifiLastScanReclaimedAps = 0;
+  wifiLatestAnalysisScan = scanCounter;
+  memset(wifiLatestChannelApCount, 0, sizeof(wifiLatestChannelApCount));
+  memset(wifiLatestCoChannelScore, 0, sizeof(wifiLatestCoChannelScore));
+  memset(wifiLatestAdjacentScore, 0, sizeof(wifiLatestAdjacentScore));
+  for (int ch = 0; ch < 12; ch++) wifiLatestChannelStrongestRssi[ch] = -127;
+
   if (networkCount <= 0) return networkCount;
 
   for (int i = 0; i < networkCount; i++) {
@@ -2294,16 +2353,47 @@ int processCompletedWifiScan(int networkCount) {
     if (rawBssid == nullptr) continue;
 
     String ssid = WiFi.SSID(i);
+    int channel = WiFi.channel(i);
+    int rssi = WiFi.RSSI(i);
+    if (channel >= 1 && channel <= 11) {
+      wifiLatestChannelApCount[channel]++;
+      if (rssi > wifiLatestChannelStrongestRssi[channel]) wifiLatestChannelStrongestRssi[channel] = rssi;
+      float w = rssiInterferenceWeight(rssi);
+      for (int candidate = 1; candidate <= 11; candidate++) {
+        int d = abs(candidate - channel);
+        float overlap = channelOverlapFactor(d);
+        if (d == 0) wifiLatestCoChannelScore[candidate] += w;
+        else if (overlap > 0.0f) wifiLatestAdjacentScore[candidate] += w * overlap;
+      }
+    }
+
+    if (ssid.length() == 0 && !captureHiddenNetworks) {
+      wifiLastScanHiddenSkipped++;
+      continue;
+    }
+
+    // Make the ring slot available before AP allocation. This can release the
+    // final reference to an old AP identity, allowing that identity slot to be
+    // reclaimed for the incoming BSSID without ever retargeting live history.
+    while (historyCount >= scanHistoryRetentionLimit)
+      discardOldestWifiObservation();
+
+    bool created = false;
+    bool reclaimed = false;
     int apIndex = findOrCreateWifiAp(
       rawBssid,
       ssid,
-      (uint8_t)WiFi.channel(i),
-      (uint8_t)WiFi.encryptionType(i)
+      (uint8_t)channel,
+      (uint8_t)WiFi.encryptionType(i),
+      &created,
+      &reclaimed
     );
 
-    if (apIndex < 0) continue;
+    if (apIndex < 0) { wifiLastScanDropped++; continue; }
+    if (created) wifiLastScanNewAps++;
+    else wifiLastScanPreviouslySeenAps++;
+    if (reclaimed) wifiLastScanReclaimedAps++;
 
-    int rssi = WiFi.RSSI(i);
     if (rssi < -128) rssi = -128;
     if (rssi > 127) rssi = 127;
 
@@ -2312,6 +2402,7 @@ int processCompletedWifiScan(int networkCount) {
     observation.scanSlot = scanSlot;
     observation.rssi = (int8_t)rssi;
     appendWifiObservation(observation);
+    wifiLastScanLogged++;
   }
 
   return networkCount;
@@ -2397,7 +2488,22 @@ void serviceLoggedWifiScan() {
   if (!wifiScanInProgress) return;
 
   int result = WiFi.scanComplete();
-  if (result == WIFI_SCAN_RUNNING) return;
+  if (result == WIFI_SCAN_RUNNING) {
+    uint32_t elapsedMs = millis() - wifiCurrentScanStartMs;
+    if (elapsedMs < WIFI_SCAN_WATCHDOG_MS) return;
+    stopScanLed();
+    WiFi.scanDelete();
+    wifiScanInProgress = false;
+    wifiScanStatusMessage = "Timed out; recovery scheduled";
+    wifiInitialScanCheckpointPending = false;
+    recordDiagnosticEvent("WIFI TIMEOUT", "elapsed=" + String(elapsedMs) + "ms auto=" + String(wifiCurrentScanAutomatic ? "yes" : "no"));
+    if (wifiCurrentScanAutomatic) {
+      wifiAutoScanCompletionFailureCount++;
+      noteAutomaticScanFailure();
+    }
+    wifiCurrentScanAutomatic = false;
+    return;
+  }
 
   uint32_t scanDurationMs = millis() - wifiCurrentScanStartMs;
   stopScanLed();
@@ -2416,14 +2522,15 @@ void serviceLoggedWifiScan() {
   }
 
   processCompletedWifiScan(result);
+  considerInfrastructureReconnectAfterScan(result);
   recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
     lastWifiAutoScanCompletionMs = millis();
   }
   wifiScanStatusMessage = "Complete";
-  if (diagnosticStreamingEnabled && diagnosticSurveyEvents)
-    recordDiagnosticEvent("WIFI SCAN", "seq=" + String(scanCounter) + " duration=" + String(scanDurationMs) + "ms observations=" + String(historyCount));
+  if (scanDurationMs >= 15000 || (diagnosticStreamingEnabled && diagnosticSurveyEvents))
+    recordDiagnosticEvent("WIFI SCAN", "seq=" + String(scanCounter) + " dur=" + String(scanDurationMs) + "ms found=" + String(wifiLastScanFound) + " log=" + String(wifiLastScanLogged) + " drop=" + String(wifiLastScanDropped));
   WiFi.scanDelete();
   lastAutoScanMs = millis();
   wifiAutoScanRetryPending = false;
@@ -4411,11 +4518,13 @@ void redirectToScanPage() {
 void handleWifiScanStatus() {
   bool connected = WiFi.status() == WL_CONNECTED;
   String oldestLabel = "Never";
+  String newestLabel = "Never";
   String windowLabel = "-";
   if (historyCount > 0) {
     const ScanRecord& oldest = historyRecord(0);
     const ScanRecord& newest = historyRecord(historyCount - 1);
     oldestLabel = observationAgeLabel(oldest.uptimeMs);
+    newestLabel = observationAgeLabel(newest.uptimeMs);
     windowLabel = retainedWindowLabel(oldest.uptimeMs, newest.uptimeMs);
   }
   String json = "{";
@@ -4425,6 +4534,7 @@ void handleWifiScanStatus() {
   json += ",\"retainedScans\":" + String(countRetainedScanGroups());
   json += ",\"lastScan\":" + jsonQuoted(scanCounter ? observationAgeLabel(lastScanUptimeMs) : String("Never"));
   json += ",\"oldestData\":" + jsonQuoted(oldestLabel);
+  json += ",\"newestData\":" + jsonQuoted(newestLabel);
   json += ",\"retainedWindow\":" + jsonQuoted(windowLabel);
   json += ",\"interval\":" + String(scanIntervalSeconds);
   json += ",\"scanning\":" + String(wifiScanInProgress ? "true" : "false");
@@ -4446,6 +4556,14 @@ void handleWifiScanStatus() {
   json += ",\"apCount\":" + String(wifiApCount);
   json += ",\"apCapacity\":" + String(wifiApTableCapacity);
   json += ",\"apDrops\":" + String(wifiApTableFullDrops);
+  json += ",\"apReclaims\":" + String(wifiApReclamationCount);
+  json += ",\"lastFound\":" + String(wifiLastScanFound);
+  json += ",\"lastLogged\":" + String(wifiLastScanLogged);
+  json += ",\"lastDropped\":" + String(wifiLastScanDropped);
+  json += ",\"lastNewAps\":" + String(wifiLastScanNewAps);
+  json += ",\"lastSeenAps\":" + String(wifiLastScanPreviouslySeenAps);
+  json += ",\"lastHiddenSkipped\":" + String(wifiLastScanHiddenSkipped);
+  json += ",\"lastReclaimedAps\":" + String(wifiLastScanReclaimedAps);
   json += ",\"historyIntegrityAnomalies\":" + String(wifiHistoryIntegrityAnomalies());
   json += ",\"freeHeap\":" + String(ESP.getFreeHeap());
   json += ",\"largestBlock\":" + String(diagnosticLargestFreeBlock());
@@ -5193,12 +5311,28 @@ ChannelAnalysis analyzeLatestWifiScan() {
   ChannelAnalysis a = {};
   a.suggestedChannel = 0;
   for (int ch = 1; ch <= 11; ch++) a.strongestRssi[ch] = -127;
-  if (
-    historyCount == 0 ||
-    scanHistory == nullptr ||
-    wifiScanMetadata == nullptr ||
-    wifiApTable == nullptr
-  ) {
+  if (wifiLatestAnalysisScan == scanCounter && scanCounter > 0) {
+    a.scanNumber = scanCounter;
+    for (int ch = 1; ch <= 11; ch++) {
+      a.apCount[ch] = wifiLatestChannelApCount[ch];
+      a.strongestRssi[ch] = wifiLatestChannelStrongestRssi[ch];
+      a.coChannelScore[ch] = wifiLatestCoChannelScore[ch];
+      a.adjacentScore[ch] = wifiLatestAdjacentScore[ch];
+      a.totalScore[ch] = a.coChannelScore[ch] + a.adjacentScore[ch];
+      if (a.apCount[ch]) a.valid = true;
+    }
+    if (a.valid) {
+      const int preferred[3] = {1, 6, 11};
+      int best = preferred[0];
+      for (int i = 1; i < 3; i++) if (a.totalScore[preferred[i]] < a.totalScore[best]) best = preferred[i];
+      a.suggestedChannel = best;
+    }
+    cached = a;
+    cachedScanCounter = scanCounter;
+    return cached;
+  }
+
+  if (historyCount == 0 || scanHistory == nullptr || wifiScanMetadata == nullptr || wifiApTable == nullptr) {
     cached = a;
     cachedScanCounter = scanCounter;
     return cached;
@@ -5297,11 +5431,13 @@ void handleWebScan() {
 
   String selectedSSID = latestSSIDForBSSID(selectedBSSID);
   String oldestLabel = "Never";
+  String newestLabel = "Never";
   String windowLabel = "-";
   if (historyCount > 0) {
     const ScanRecord& oldest = historyRecord(0);
     const ScanRecord& newest = historyRecord(historyCount - 1);
     oldestLabel = observationAgeLabel(oldest.uptimeMs);
+    newestLabel = observationAgeLabel(newest.uptimeMs);
     windowLabel = retainedWindowLabel(oldest.uptimeMs, newest.uptimeMs);
   }
 
@@ -5323,17 +5459,18 @@ void handleWebScan() {
     "<div class=\"row\"><span class=\"label\">Last Scan</span><span id=\"wifi-last-scan\" class=\"value\">" + (scanCounter ? htmlEscape(observationAgeLabel(lastScanUptimeMs)) : String("Never")) + "</span></div>"
     "<div class=\"survey-control-row\"><div class=\"control\"><label for=\"interval\">Scan Interval (seconds)</label>"
     "<input id=\"interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(scanIntervalSeconds) + "\"></div>"
-    "<span id=\"interval-save-state\" class=\"save-state\"></span></div>"
+    "<button class=\"button\" type=\"button\" id=\"wifi-interval-apply\">Apply Interval</button><span id=\"interval-save-state\" class=\"save-state\"></span></div>"
     "<div class=\"buttons\"><button class=\"button\" type=\"button\" id=\"wifi-scan-now\">Scan Now</button>"
     "<a class=\"button\" href=\"/\">Refresh Page</a></div><div id=\"wifi-scan-state\" class=\"scan-state\"></div>"
-    "<div class=\"note\">Surveying runs automatically whenever the device is operating. Changing the interval saves immediately.</div>"
+    "<div class=\"note\">Surveying runs automatically whenever the device is operating. Use Apply Interval to save a change.</div>"
     "<div id=\"wifi-auto-warning\" class=\"diagnostic-warning\"" + String(wifiAutoScanDiagnosticLabel().startsWith("WARN") ? "" : " style=\"display:none\"") + ">" + htmlEscape(wifiAutoScanDiagnosticLabel()) + "</div>"
     "<div id=\"wifi-ap-drop-warning\" class=\"diagnostic-warning\"" + String(wifiApTableFullDrops ? "" : " style=\"display:none\"") + ">" + (wifiApTableFullDrops ? String(wifiApTableFullDrops) + " Wi-Fi observation(s) were not logged because no AP table slot was available." : String("")) + "</div></div>";
 
   card += "<div class=\"card\"><h2>History</h2>"
     "<div class=\"row\"><span class=\"label\">Stored Observations</span><span id=\"wifi-history-count\" class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Retained Scans</span><span id=\"wifi-retained-scans\" class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Oldest Data</span><span id=\"wifi-oldest-data\" class=\"value\">" + htmlEscape(oldestLabel) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Oldest Observation</span><span id=\"wifi-oldest-data\" class=\"value\">" + htmlEscape(oldestLabel) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Newest Observation</span><span id=\"wifi-newest-data\" class=\"value\">" + htmlEscape(newestLabel) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span id=\"wifi-retained-window\" class=\"value\">" + htmlEscape(windowLabel) + "</span></div>"
     "<div class=\"buttons\"><a class=\"button\" href=\"/scanlog.csv\">Download CSV</a><a class=\"button\" href=\"/scan-clear\">Clear History</a></div>"
     "<div class=\"note\">History is retained in RAM during normal operation. Restart checkpoints preserve the current working history through controlled restarts and are consumed after successful restore.</div></div>";
@@ -5371,6 +5508,9 @@ void handleWebScan() {
   String health;
   health.reserve(2300);
   health += "<div class=\"card advanced-only\"><h2>Survey Health</h2>"
+    "<div class=\"row\"><span class=\"label\">Last Scan Results</span><span id=\"wifi-last-scan-results\" class=\"value\">" + String(wifiLastScanFound) + " found; " + String(wifiLastScanLogged) + " logged; " + String(wifiLastScanDropped) + " dropped</span></div>"
+    "<div class=\"row\"><span class=\"label\">APs in Last Scan</span><span id=\"wifi-last-ap-results\" class=\"value\">" + String(wifiLastScanNewAps) + " new; " + String(wifiLastScanPreviouslySeenAps) + " previously seen</span></div>"
+    "<div class=\"row\"><span class=\"label\">Hidden / Reclaimed</span><span id=\"wifi-last-filter-results\" class=\"value\">" + String(wifiLastScanHiddenSkipped) + " hidden skipped; " + String(wifiLastScanReclaimedAps) + " slots reclaimed</span></div>"
     "<div class=\"row\"><span class=\"label\">Auto-Scan Diagnostic</span><span id=\"wifi-health-auto\" class=\"value\">" + htmlEscape(wifiAutoScanDiagnosticLabel()) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Automatic Scan Starts</span><span id=\"wifi-health-starts\" class=\"value\">" + String(wifiAutoScanStartCount) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Automatic Scan Completions</span><span id=\"wifi-health-completions\" class=\"value\">" + String(wifiAutoScanCompletionCount) + "</span></div>"
@@ -5413,13 +5553,14 @@ void handleWebScan() {
       "const scanButton=document.getElementById('wifi-scan-now');"
       "const scanState=document.getElementById('wifi-scan-state');"
       "const intervalInput=document.getElementById('interval');"
+      "const intervalApply=document.getElementById('wifi-interval-apply');"
       "const intervalState=document.getElementById('interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
       "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
       "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-retained-window',s.retainedWindow);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Scanning…':'');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
-      "if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
+      "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Scanning…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
       "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;}),fetch('/api/wifi/channel',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-channel-region');if(e)e.innerHTML=h;})];if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
       "setInterval(function(){fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);else showScanState(!!s.scanning,s.scanning?'Scanning…':'');if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);"
@@ -6962,6 +7103,13 @@ void handleSettingsPage() {
   diagnosticSendContent(s); s.remove(0);
   markWebResponsePhase("survey-mode");
 
+  s += "<div class=\"card advanced-only\"><h2>Wi-Fi Capture</h2><form class=\"controls\" action=\"/wifi-capture-settings\" method=\"post\">"
+    "<div class=\"control\"><label><input type=\"checkbox\" name=\"captureHidden\" value=\"1\" " + String(captureHiddenNetworks ? "checked" : "") + "> Capture Hidden Networks</label></div>"
+    "<button type=\"submit\">Apply Wi-Fi Capture Settings</button></form>"
+    "<div class=\"note\">When disabled, networks without an advertised SSID still contribute to current RF/channel analysis but do not consume retained-history or AP-table capacity. Existing hidden observations age out normally.</div></div>";
+  diagnosticSendContent(s); s.remove(0);
+  markWebResponsePhase("wifi-capture");
+
   s += "<div class=\"card\"><h2>Interface &amp; Indicators</h2><div class=\"control\"><label><input id=\"status-led-enabled\" type=\"checkbox\" " + String(statusLedEnabled ? "checked" : "") + " onchange=\"setStatusLed(this)\"> Enable status LED indicators</label><span id=\"status-led-save-state\" class=\"save-state\"></span></div>"
     "<div class=\"row\"><span class=\"label\">Status LED</span><span id=\"status-led-state\" class=\"value\">" + String(STATUS_LED_AVAILABLE ? (statusLedEnabled ? "Enabled" : "Disabled") : "Not available") + "</span></div>"
     "<form class=\"controls advanced-only\" action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form>"
@@ -7021,6 +7169,13 @@ void handleInterfaceSettings() {
   if (!statusLedEnabled) stopScanLed();
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", String("{\"saved\":true,\"enabled\":") + (statusLedEnabled ? "true" : "false") + "}");
+}
+
+void handleWifiCaptureSettings() {
+  markExplicitUserInteraction();
+  saveCaptureHiddenNetworks(server.hasArg("captureHidden"));
+  server.sendHeader("Location", "/settings");
+  server.send(303, "text/plain", "Wi-Fi capture settings saved.");
 }
 
 // Purpose: Runs the status LED self-test requested from the Settings page.
@@ -7192,6 +7347,7 @@ void startWebServer() {
   server.on("/wifi-clear", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-clear", handleClearStationSettings); });
   server.on("/hostname-save", HTTP_POST, []() { runDiagnosticWebHandler("/hostname-save", handleHostnameSave); });
   server.on("/interface-settings", HTTP_POST, []() { runDiagnosticWebHandler("/interface-settings", handleInterfaceSettings); });
+  server.on("/wifi-capture-settings", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-capture-settings", handleWifiCaptureSettings); });
   server.on("/led-test", HTTP_POST, []() { runDiagnosticWebHandler("/led-test", handleLedSelfTest); });
   server.on("/scan-now", []() { runDiagnosticWebHandler("/scan-now", handleWebScanNow); });
   server.on("/api/wifi/status", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/status", handleWifiScanStatus); });
