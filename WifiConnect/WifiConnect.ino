@@ -1,4 +1,5 @@
 // ESP32 Wireless Surveyor firmware.
+// V39e: replaces self-referential Help-page ? links with a compact return arrow that goes back to the originating page.
 // V39b: adds a fixed-size server-side web stall trace so abnormal sends survive until diagnostics can be downloaded.
 // V39a added the Developer-view sticky Capture Diagnostics button; V39b preserves that behavior.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
@@ -49,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39d_memory_headroom_experiment_20260903_2159.ino";
-const char* FIRMWARE_VERSION = "39d";
+const char* FIRMWARE_FILE = "WifiConnect39e_help_return_link_20260906_2100.ino";
+const char* FIRMWARE_VERSION = "39e";
 
 
 Preferences preferences;
@@ -4614,6 +4615,10 @@ String pageStyles() {
     font-weight: bold;
   }
 
+  .card-help-link.help-return-link {
+    font-size: 1.05em;
+  }
+
   .card-help-standard, .card-help-developer {
     color: var(--muted);
     font-size: 0.92em;
@@ -5486,7 +5491,14 @@ String contextHelpScript() {
     if(!card)return;
     const h=card.querySelector(':scope > h2'); if(!h||h.querySelector('.card-help-link'))return;
     const key=baseTitle(h.textContent); const d=help[key]||['about-cards','This card groups information or controls related to '+key+'. Use it to understand or operate this part of the surveyor.','Developer view exposes additional implementation and diagnostic detail for this card.'];
-    const a=document.createElement('a');a.className='card-help-link';a.href='/help#'+d[0];a.textContent='?';a.title='Help: '+key;a.setAttribute('aria-label','Help: '+key);h.appendChild(a);
+    const a=document.createElement('a');a.className='card-help-link';
+    if(location.pathname==='/help'){
+      a.classList.add('help-return-link');a.href='#';a.textContent='←';a.title='Return to previous page';a.setAttribute('aria-label','Return to previous page');
+      a.addEventListener('click',function(e){e.preventDefault();if(document.referrer&&document.referrer.indexOf(location.origin)===0&&history.length>1){history.back();}else{location.href='/';}});
+    }else{
+      a.href='/help#'+d[0];a.textContent='?';a.title='Help: '+key;a.setAttribute('aria-label','Help: '+key);
+    }
+    h.appendChild(a);
     const std=document.createElement('div');std.className='card-help-standard';std.textContent=d[1];h.insertAdjacentElement('afterend',std);
     const dev=document.createElement('div');dev.className='card-help-developer developer-only';dev.textContent=d[2];std.insertAdjacentElement('afterend',dev);
     card.dataset.helpReady='1';
@@ -8142,10 +8154,10 @@ void handleHelpPage() {
   diagnosticSendContent(pageStyles());
   diagnosticSendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("help");
-  diagnosticSendContent("<h1>Help</h1><div class=\"card\"><h2>Using this Help page</h2><p>This page explains what each part of the surveyor shows, why it matters, and how to use it. The ? button on a card opens the matching section here.</p></div>");
+  diagnosticSendContent("<h1>Help</h1><div class=\"card\"><h2>Using this Help page</h2><p>This page explains what each part of the surveyor shows, why it matters, and how to use it. When Help is opened from a card, use the return arrow to go back to the originating page.</p></div>");
 
   const char* sections[] = {
-    "about-cards|About cards|Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. Use the ? button on a card to jump into Help.",
+    "about-cards|About cards|Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. On surveyor pages, use the ? button on a card to jump into Help; on Help, use the return arrow to go back.",
     "survey-controls|Survey Status & Controls|Use this card to confirm that scanning is active, see when the last scan completed, change the automatic scan interval, and request a manual scan. Live Updates refresh the browser display; they do not trigger radio scans.",
     "history|History|History is the rolling RAM record used by the web interface and CSV export. When the buffer fills, older observations age out as new observations arrive. The retained time window therefore depends on scan rate and how many observations each scan produces.",
     "rssi-history|RSSI History|RSSI is received signal strength in dBm. Values closer to zero are stronger. Select an entry in Observed Networks or Observed Devices to plot its retained observations, then hover over a graph point to see scan and signal details.",
