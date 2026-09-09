@@ -1,5 +1,6 @@
 // ESP32 Wireless Surveyor firmware.
-// V39a: adds a Developer-view sticky Capture Diagnostics button; otherwise preserves V39 baseline behavior.
+// V39b: adds a fixed-size server-side web stall trace so abnormal sends survive until diagnostics can be downloaded.
+// V39a added the Developer-view sticky Capture Diagnostics button; V39b preserves that behavior.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
@@ -20,6 +21,10 @@
 // - service completed Wi-Fi scans between response chunks
 // - retain fixed-size current/last web-operation diagnostics in status.json
 // - skip optional serial snapshots while the UART transmit buffer is congested
+// - retain the last 8 abnormal server-side web stalls without dynamic allocation
+// - record individual response sends >=150 ms and profiled responses >=500 ms
+// - export retained stall evidence in status.json after the browser/server recovers
+// - detect long repaint-to-first-fragment arrival gaps even when the ESP32 main loop remains free
 //
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
@@ -44,8 +49,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39a_capture_diagnostics_button.ino";
-const char* FIRMWARE_VERSION = "39a";
+const char* FIRMWARE_FILE = "WifiConnect39b_server_stall_trace.ino";
+const char* FIRMWARE_VERSION = "39b";
 
 
 Preferences preferences;
@@ -1668,6 +1673,9 @@ struct WebTransportDiagnostics {
   uint32_t lastGuardPageId = 0;
   uint32_t lastLoaderPageId = 0;
   uint32_t lastRepaintPageId = 0;
+  uint32_t lastRepaintReportMs = 0;
+  uint32_t lastObservedArrivalMs = 0;
+  uint32_t lastRepaintToObservedMs = 0;
   uint32_t lastTailPageId = 0;
   uint32_t lastObservedRequestPageId = 0;
   uint32_t lastChannelRequestPageId = 0;
@@ -1676,6 +1684,61 @@ struct WebTransportDiagnostics {
 
 WebTransportDiagnostics webTransportDiagnostics;
 size_t webCurrentFooterStartBytes = 0;
+
+// V39b: Fixed-size abnormal web-stall recorder. This intentionally avoids String
+// allocation so evidence survives the same low-memory/socket-pressure conditions
+// that can delay the browser-side Capture Diagnostics request.
+const uint32_t WEB_STALL_SEND_THRESHOLD_MS = 150;
+const uint32_t WEB_STALL_RESPONSE_THRESHOLD_MS = 500;
+const uint32_t WEB_STALL_ARRIVAL_THRESHOLD_MS = 1000;
+const size_t WEB_STALL_TRACE_CAPACITY = 8;
+
+struct WebStallTraceRecord {
+  uint32_t sequence = 0;
+  uint32_t uptimeMs = 0;
+  char kind[12] = "";
+  char route[40] = "";
+  char phase[32] = "";
+  uint32_t totalMs = 0;
+  uint32_t sendMs = 0;
+  uint32_t bytes = 0;
+  uint32_t freeHeapBytes = 0;
+  uint32_t largestFreeBlockBytes = 0;
+  bool wifiScanActive = false;
+};
+
+WebStallTraceRecord webStallTrace[WEB_STALL_TRACE_CAPACITY];
+size_t webStallTraceNext = 0;
+size_t webStallTraceCount = 0;
+uint32_t webStallTraceSequence = 0;
+
+bool suppressWebStallTraceForRoute(const char* route) {
+  return route && strcmp(route, "/status.json") == 0;
+}
+
+void recordWebStallTrace(const char* kind, const char* route, const char* phase,
+                         uint32_t totalMs, uint32_t sendMs, size_t bytes) {
+  if (suppressWebStallTraceForRoute(route)) return;
+  WebStallTraceRecord& record = webStallTrace[webStallTraceNext];
+  record.sequence = ++webStallTraceSequence;
+  record.uptimeMs = millis();
+  snprintf(record.kind, sizeof(record.kind), "%s", kind ? kind : "");
+  snprintf(record.route, sizeof(record.route), "%s", route ? route : "");
+  snprintf(record.phase, sizeof(record.phase), "%s", phase ? phase : "");
+  record.totalMs = totalMs;
+  record.sendMs = sendMs;
+  record.bytes = bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
+  record.freeHeapBytes = ESP.getFreeHeap();
+  record.largestFreeBlockBytes = diagnosticLargestFreeBlock();
+  record.wifiScanActive = wifiScanInProgress;
+  webStallTraceNext = (webStallTraceNext + 1) % WEB_STALL_TRACE_CAPACITY;
+  if (webStallTraceCount < WEB_STALL_TRACE_CAPACITY) webStallTraceCount++;
+}
+
+const WebStallTraceRecord& webStallTraceAt(size_t chronologicalIndex) {
+  size_t oldest = (webStallTraceNext + WEB_STALL_TRACE_CAPACITY - webStallTraceCount) % WEB_STALL_TRACE_CAPACITY;
+  return webStallTrace[(oldest + chronologicalIndex) % WEB_STALL_TRACE_CAPACITY];
+}
 
 void sampleWebResponseMemory() {
   if (!webResponseProfile.active) return;
@@ -1721,6 +1784,11 @@ void sendProfiledContentNow(const String& content) {
   if (!connectedAfter) webTransportDiagnostics.clientDisconnectedAfterSend++;
   uint32_t durationMs = (uint32_t)(millis() - startMs);
   sampleWebResponseMemory();
+  if (durationMs >= WEB_STALL_SEND_THRESHOLD_MS) {
+    uint32_t elapsedMs = webResponseProfile.startMs ? (uint32_t)(millis() - webResponseProfile.startMs) : durationMs;
+    recordWebStallTrace("SEND", webResponseProfile.route, webOperationState.activePhase,
+                        elapsedMs, durationMs, content.length());
+  }
   if (!webResponseProfile.active) return;
 
   webResponseProfile.sendCalls++;
@@ -1817,15 +1885,14 @@ void beginWebResponseProfile(const char* route) {
   }
   sampleWebResponseMemory();
   setWebOperationPhase("response-start");
+  webResponseProfile.startMs = millis();
+  webResponseProfile.phaseStartMs = webResponseProfile.startMs;
 
   if (!webResponseProfile.active) return;
-  webResponseProfile.startMs = millis();
   diagnosticPrefix("PAGE START");
   Serial.print("route="); Serial.print(route);
   if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
-  webResponseProfile.startMs = millis();
-  webResponseProfile.phaseStartMs = webResponseProfile.startMs;
 }
 
 // Purpose: Buffers response text so small logical fragments become moderate network writes.
@@ -1933,6 +2000,10 @@ void endWebResponseProfile() {
   Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
   recordDiagnosticEvent("PAGE SUMMARY", String(webResponseProfile.route) + " total=" + String(totalMs) + "ms send=" + String(webResponseProfile.sendTimeMs) + "ms other=" + String(otherMs) + "ms maxSend=" + String(webResponseProfile.maxSendMs) + "ms");
+  if (totalMs >= WEB_STALL_RESPONSE_THRESHOLD_MS) {
+    recordWebStallTrace("RESPONSE", webResponseProfile.route, "response", totalMs,
+                        webResponseProfile.sendTimeMs, webResponseProfile.sendBytes);
+  }
   if (webResponseProfile.pageId) {
     webTransportDiagnostics.rootPagesCompleted++;
     webTransportDiagnostics.lastRootPageId = webResponseProfile.pageId;
@@ -5505,7 +5576,7 @@ void sendThemeScript() {
       "applyViewMode(v);"
     "}"
     "function captureDiagnostics(){"
-      "const b=document.getElementById('capture-diagnostics-button');if(b)b.disabled=true;"
+      "const b=document.getElementById('capture-diagnostics-button');if(b){b.disabled=true;b.textContent='Capturing…';}"
       "let p=0;const m=document.querySelector('meta[name=\"ws38j-page-id\"]');"
       "if(window.__WS38J&&window.__WS38J.pageId)p=window.__WS38J.pageId;else if(m)p=parseInt(m.content||'0',10)||0;"
       "const w=window.__WS38J||{};"
@@ -5924,7 +5995,10 @@ void handleWebClientDiagnostic() {
   snprintf(webTransportDiagnostics.lastBrowserDetail, sizeof(webTransportDiagnostics.lastBrowserDetail), "%s", detail.c_str());
   if (stage == "guard") webTransportDiagnostics.lastGuardPageId = pageId;
   else if (stage == "loader") webTransportDiagnostics.lastLoaderPageId = pageId;
-  else if (stage == "repaint") webTransportDiagnostics.lastRepaintPageId = pageId;
+  else if (stage == "repaint") {
+    webTransportDiagnostics.lastRepaintPageId = pageId;
+    webTransportDiagnostics.lastRepaintReportMs = webTransportDiagnostics.lastBrowserReportMs;
+  }
   else if (stage == "tail") webTransportDiagnostics.lastTailPageId = pageId;
   else if (stage == "error" || stage == "reject") webTransportDiagnostics.browserErrorReports++;
   if (diagnosticStreamingEnabled && diagnosticWebEvents) {
@@ -5940,7 +6014,21 @@ void handleWebClientDiagnostic() {
 
 // Purpose: Returns only the Observed Networks card content for live-update repainting.
 void handleWifiObservedFragment() {
-  if (server.hasArg("p")) webTransportDiagnostics.lastObservedRequestPageId = (uint32_t)server.arg("p").toInt();
+  if (server.hasArg("p")) {
+    uint32_t requestPageId = (uint32_t)server.arg("p").toInt();
+    webTransportDiagnostics.lastObservedRequestPageId = requestPageId;
+    webTransportDiagnostics.lastObservedArrivalMs = millis();
+    if (requestPageId != 0 &&
+        requestPageId == webTransportDiagnostics.lastRepaintPageId &&
+        webTransportDiagnostics.lastRepaintReportMs != 0) {
+      uint32_t arrivalDelayMs = (uint32_t)(webTransportDiagnostics.lastObservedArrivalMs - webTransportDiagnostics.lastRepaintReportMs);
+      webTransportDiagnostics.lastRepaintToObservedMs = arrivalDelayMs;
+      if (arrivalDelayMs >= WEB_STALL_ARRIVAL_THRESHOLD_MS) {
+        recordWebStallTrace("ARRIVAL", "/api/wifi/observed", "after-repaint",
+                            arrivalDelayMs, 0, 0);
+      }
+    }
+  }
   if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
   beginWebResponseProfile("/api/wifi/observed");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -7657,12 +7745,43 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"lastGuardPageId\":" + String(webTransportDiagnostics.lastGuardPageId));
   diagnosticSendContent(",\"lastLoaderPageId\":" + String(webTransportDiagnostics.lastLoaderPageId));
   diagnosticSendContent(",\"lastRepaintPageId\":" + String(webTransportDiagnostics.lastRepaintPageId));
+  diagnosticSendContent(",\"lastRepaintReportMs\":" + String(webTransportDiagnostics.lastRepaintReportMs));
+  diagnosticSendContent(",\"lastObservedArrivalMs\":" + String(webTransportDiagnostics.lastObservedArrivalMs));
+  diagnosticSendContent(",\"lastRepaintToObservedMs\":" + String(webTransportDiagnostics.lastRepaintToObservedMs));
   diagnosticSendContent(",\"lastTailPageId\":" + String(webTransportDiagnostics.lastTailPageId));
   diagnosticSendContent(",\"lastObservedRequestPageId\":" + String(webTransportDiagnostics.lastObservedRequestPageId));
   diagnosticSendContent(",\"lastChannelRequestPageId\":" + String(webTransportDiagnostics.lastChannelRequestPageId));
   diagnosticSendContent(",\"lastPlotRequestPageId\":" + String(webTransportDiagnostics.lastPlotRequestPageId));
   diagnosticSendContent("},\n");
   markWebResponsePhase("web-transport");
+
+  diagnosticSendContent("  \"webStallTrace\":{");
+  diagnosticSendContent("\"sendThresholdMs\":" + String(WEB_STALL_SEND_THRESHOLD_MS));
+  diagnosticSendContent(",\"responseThresholdMs\":" + String(WEB_STALL_RESPONSE_THRESHOLD_MS));
+  diagnosticSendContent(",\"arrivalThresholdMs\":" + String(WEB_STALL_ARRIVAL_THRESHOLD_MS));
+  diagnosticSendContent(",\"recordedTotal\":" + String(webStallTraceSequence));
+  diagnosticSendContent(",\"retained\":" + String(webStallTraceCount));
+  diagnosticSendContent(",\"capacity\":" + String(WEB_STALL_TRACE_CAPACITY));
+  diagnosticSendContent(",\"records\":[");
+  for (size_t i = 0; i < webStallTraceCount; i++) {
+    if (i > 0) diagnosticSendContent(",");
+    const WebStallTraceRecord& record = webStallTraceAt(i);
+    diagnosticSendContent("{\"sequence\":" + String(record.sequence));
+    diagnosticSendContent(",\"uptimeMs\":" + String(record.uptimeMs));
+    diagnosticSendContent(",\"kind\":" + jsonQuoted(String(record.kind)));
+    diagnosticSendContent(",\"route\":" + jsonQuoted(String(record.route)));
+    diagnosticSendContent(",\"phase\":" + jsonQuoted(String(record.phase)));
+    diagnosticSendContent(",\"totalMs\":" + String(record.totalMs));
+    diagnosticSendContent(",\"sendMs\":" + String(record.sendMs));
+    diagnosticSendContent(",\"bytes\":" + String(record.bytes));
+    diagnosticSendContent(",\"freeHeapBytes\":" + String(record.freeHeapBytes));
+    diagnosticSendContent(",\"largestFreeBlockBytes\":" + String(record.largestFreeBlockBytes));
+    diagnosticSendContent(",\"wifiScanActive\":");
+    diagnosticSendContent(record.wifiScanActive ? "true" : "false");
+    diagnosticSendContent("}");
+  }
+  diagnosticSendContent("]},\n");
+  markWebResponsePhase("web-stall-trace");
 
   size_t eventsToInclude = diagnosticExportEventLimit < diagnosticEventCount ? diagnosticExportEventLimit : diagnosticEventCount;
   size_t firstEvent = diagnosticEventCount - eventsToInclude;
