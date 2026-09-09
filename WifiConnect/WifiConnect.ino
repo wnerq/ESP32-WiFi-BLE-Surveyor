@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39f_infrastructure_wifi_scan_select_20260906_2310.ino";
-const char* FIRMWARE_VERSION = "39f";
+const char* FIRMWARE_FILE = "WifiConnect39g_live_updates_status_help_20260907_0900.ino";
+const char* FIRMWARE_VERSION = "39g";
 
 
 Preferences preferences;
@@ -6361,8 +6361,10 @@ void handleBleScanStatus() {
   json += ",\"addressDrops\":" + String(bleAddressTableFullDrops);
   json += ",\"addressReferenced\":" + String(countReferencedBleAddresses());
   json += ",\"addressCapacity\":" + String(bleAddressTableCapacity);
+  json += ",\"addressPeak\":" + String(bleAddressPeakReferenced);
   json += ",\"metadataReferenced\":" + String(countReferencedBleScanSlots());
   json += ",\"metadataCapacity\":" + String(bleScanMetadataCapacity);
+  json += ",\"metadataPeak\":" + String(bleScanMetadataPeakUsed);
   json += ",\"csvExports\":" + String(bleCsvExportCount);
   json += ",\"lastCsv\":" + jsonQuoted(bleCsvExportCount ? csvExportSummaryLabel(bleCsvLastRows, bleCsvLastBytes, bleCsvLastDurationMs) : String("Never"));
   json += ",\"freeHeap\":" + String(ESP.getFreeHeap());
@@ -6378,7 +6380,7 @@ void handleBleScanStatus() {
   server.send(200, "application/json", json);
 }
 
-// Purpose: Builds the Bluetooth Survey page with automatic surveying, immediate interval control, and consistent page ordering.
+// Purpose: Builds the Bluetooth Survey page with automatic surveying, explicit interval Apply/Enter control, and consistent page ordering.
 void handleBLESurvey() {
   beginWebResponseProfile("/ble");
   markExplicitUserInteraction();
@@ -6492,9 +6494,9 @@ void handleBLESurvey() {
     String refreshScript =
       "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let pollBusy=false;let requestBusy=false;const requestQueue=[];const queued={};const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
-      "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak " + String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak " + String(bleScanMetadataPeakUsed) + "');text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
+      "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak '+s.addressPeak+'; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak '+s.metadataPeak);text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/ble/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
-      "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
+      "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
       "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
       "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(job.id);if(e)e.innerHTML=h;}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;requestBusy=false;pump();}}"
@@ -8187,6 +8189,23 @@ void handleHelpPage() {
   diagnosticSendContent("</head><body><div class=\"container\">");
   sendSiteNavigation("help");
   diagnosticSendContent("<h1>Help</h1><div class=\"card\"><h2>Using this Help page</h2><p>This page explains what each part of the surveyor shows, why it matters, and how to use it. When Help is opened from a card, use the return arrow to go back to the originating page.</p></div>");
+  diagnosticSendContent("<div class=\"card help-section developer-only\" id=\"serial-status-line\"><h2>Serial STATUS Diagnostic Line</h2><p>Developer view reference for the compact periodic diagnostic line and serial receive echo.</p><div class=\"table-wrap\"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>");
+  diagnosticSendContent("<tr><td><code>STATUS</code></td><td>Periodic or requested compact diagnostic snapshot.</td></tr>");
+  diagnosticSendContent("<tr><td><code>up</code></td><td>Device uptime in milliseconds from <code>millis()</code>.</td></tr>");
+  diagnosticSendContent("<tr><td><code>wifiScan</code></td><td>Wi-Fi scan active: 1 = scanning, 0 = idle.</td></tr>");
+  diagnosticSendContent("<tr><td><code>bleScan</code></td><td>Bluetooth scan active: 1 = scanning, 0 = idle.</td></tr>");
+  diagnosticSendContent("<tr><td><code>wifiObs</code></td><td>Retained Wi-Fi observations / configured Wi-Fi retention limit.</td></tr>");
+  diagnosticSendContent("<tr><td><code>bleObs</code></td><td>Retained Bluetooth observations / configured Bluetooth retention limit. 0/0 normally means BLE surveying is disabled.</td></tr>");
+  diagnosticSendContent("<tr><td><code>bleScans</code></td><td>Bluetooth scan counter since this boot/session.</td></tr>");
+  diagnosticSendContent("<tr><td><code>sta</code></td><td>Infrastructure Wi-Fi station state: 1 = connected, 0 = not connected.</td></tr>");
+  diagnosticSendContent("<tr><td><code>loopGapLast</code></td><td>Most recently measured interval between main-loop service entries, in milliseconds.</td></tr>");
+  diagnosticSendContent("<tr><td><code>loopGapMax</code></td><td>Largest measured main-loop service gap since startup or the last diagnostic reset, in milliseconds.</td></tr>");
+  diagnosticSendContent("<tr><td><code>heap</code></td><td>Current total free heap, in bytes.</td></tr>");
+  diagnosticSendContent("<tr><td><code>min</code></td><td>Minimum free heap observed since boot, in bytes.</td></tr>");
+  diagnosticSendContent("<tr><td><code>largest</code></td><td>Current largest contiguous free heap block, in bytes; useful for spotting fragmentation even when total free heap is adequate.</td></tr>");
+  diagnosticSendContent("<tr><td><code>[RX]</code></td><td>Echo of a command received by the serial command interface. Password-bearing commands are sanitized before echo.</td></tr>");
+  diagnosticSendContent("<tr><td><code>diag off</code></td><td>Serial command that disables diagnostic streaming; seeing <code>[RX] diag off</code> records that this command was received.</td></tr>");
+  diagnosticSendContent("</tbody></table></div><p><strong>Example:</strong> <code>STATUS up=34947644 wifiScan=0 bleScan=0 wifiObs=2220/2220 bleObs=0/0 bleScans=0 sta=1 loopGapLast=6 loopGapMax=166 heap=62248 min=48568 largest=47092</code></p></div>");
 
   const char* sections[] = {
     "about-cards|About cards|Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. On surveyor pages, use the ? button on a card to jump into Help; on Help, use the return arrow to go back.",
@@ -8339,6 +8358,22 @@ void printSerialMainMenu() {
   Serial.println();
   Serial.println("h/help - Show this menu");
   Serial.println("restart - Restart ESP32");
+  Serial.println();
+  Serial.println("Developer STATUS line reference:");
+  Serial.println("  up            uptime in ms");
+  Serial.println("  wifiScan      Wi-Fi scan active (0/1)");
+  Serial.println("  bleScan       BLE scan active (0/1)");
+  Serial.println("  wifiObs       retained Wi-Fi observations / retention limit");
+  Serial.println("  bleObs        retained BLE observations / retention limit");
+  Serial.println("  bleScans      BLE scan counter");
+  Serial.println("  sta           infrastructure Wi-Fi connected (0/1)");
+  Serial.println("  loopGapLast   latest main-loop service gap in ms");
+  Serial.println("  loopGapMax    maximum main-loop service gap in ms");
+  Serial.println("  heap          current free heap in bytes");
+  Serial.println("  min           minimum free heap since boot in bytes");
+  Serial.println("  largest       largest contiguous free heap block in bytes");
+  Serial.println("  [RX]          sanitized echo of a received serial command");
+  Serial.println("  diag off      disables diagnostic streaming");
   Serial.println();
   Serial.print("> ");
 }
