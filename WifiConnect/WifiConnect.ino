@@ -1,4 +1,5 @@
 // ESP32 Wireless Surveyor firmware.
+// V39a: adds a Developer-view sticky Capture Diagnostics button; otherwise preserves V39 baseline behavior.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
@@ -43,8 +44,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39_baseline_from_38j.ino";
-const char* FIRMWARE_VERSION = "39";
+const char* FIRMWARE_FILE = "WifiConnect39a_capture_diagnostics_button.ino";
+const char* FIRMWARE_VERSION = "39a";
 
 
 Preferences preferences;
@@ -4585,6 +4586,17 @@ String pageStyles() {
     font-size: 0.9em;
   }
 
+  .capture-diagnostic-control {
+    margin-bottom: 0;
+  }
+
+  .capture-diagnostic-control button {
+    min-height: 34px;
+    padding: 7px 11px;
+    white-space: nowrap;
+    font-size: 0.9em;
+  }
+
   .diagnostic-details {
     margin-top: 14px;
     border-top: 1px solid var(--border);
@@ -5459,7 +5471,10 @@ void sendThemeControl() {
     "<option value=\"system\">System</option>"
     "<option value=\"light\">Light</option>"
     "<option value=\"dark\">Dark</option>"
-    "</select></div></div>"
+    "</select></div>"
+    "<div class=\"capture-diagnostic-control developer-only\">"
+    "<button id=\"capture-diagnostics-button\" type=\"button\" title=\"Capture browser state and download status.json without leaving this page\">Capture Diagnostics</button>"
+    "</div></div>"
   );
 }
 
@@ -5489,11 +5504,25 @@ void sendThemeScript() {
       "localStorage.setItem('esp32-view',v);"
       "applyViewMode(v);"
     "}"
+    "function captureDiagnostics(){"
+      "const b=document.getElementById('capture-diagnostics-button');if(b)b.disabled=true;"
+      "let p=0;const m=document.querySelector('meta[name=\"ws38j-page-id\"]');"
+      "if(window.__WS38J&&window.__WS38J.pageId)p=window.__WS38J.pageId;else if(m)p=parseInt(m.content||'0',10)||0;"
+      "const w=window.__WS38J||{};"
+      "const d='g='+(w.guard?1:0)+',l='+(w.loader?1:0)+',r='+(w.repaint?1:0)+',t='+(w.tail?1:0);"
+      "const u='/api/web/client-diag?p='+encodeURIComponent(p)+'&s=capture&d='+encodeURIComponent(d);"
+      "fetch(u,{method:'POST',cache:'no-store'}).catch(()=>{}).finally(()=>{"
+        "const a=document.createElement('a');a.href='/status.json?capture='+Date.now();a.download='';a.style.display='none';"
+        "document.body.appendChild(a);a.click();setTimeout(()=>a.remove(),1000);"
+        "if(b){b.textContent='Captured';setTimeout(()=>{b.textContent='Capture Diagnostics';b.disabled=false;},1400);}"
+      "});"
+    "}"
     "document.addEventListener('DOMContentLoaded',()=>{"
       "const v=localStorage.getItem('esp32-theme')||'system';"
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
       "const w=localStorage.getItem('esp32-view')||'standard';"
       "applyViewMode(w);"
+      "const b=document.getElementById('capture-diagnostics-button');if(b)b.addEventListener('click',captureDiagnostics);"
       "if(window.matchMedia){"
         "window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{"
           "if((localStorage.getItem('esp32-theme')||'system')==='system')applyTheme('system');"
