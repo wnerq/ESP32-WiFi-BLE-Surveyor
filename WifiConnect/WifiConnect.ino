@@ -50,9 +50,9 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect40a_diagnostics_information_architecture_20260907_2231.ino";
-const char* FIRMWARE_VERSION = "40a";
-const char* FIRMWARE_CHANGE_SUMMARY = "Reorganize System, Settings, and Diagnostics pages";
+const char* FIRMWARE_FILE = "WifiConnect40a1_scan_recovery_watchdog_20260908_2123.ino";
+const char* FIRMWARE_VERSION = "40a1";
+const char* FIRMWARE_CHANGE_SUMMARY = "Add automatic Wi-Fi scan recovery watchdog with checkpointed restart";
 
 
 Preferences preferences;
@@ -288,6 +288,7 @@ float rssiInterferenceWeight(int rssi);
 float channelOverlapFactor(int distance);
 bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
 void serviceLoggedWifiScan();
+void serviceWifiScanRecoveryWatchdog();
 String jsonQuoted(const String& value);
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
@@ -323,6 +324,24 @@ uint32_t wifiMaxScanDurationMs = 0;
 uint64_t wifiTotalScanDurationMs = 0;
 bool wifiAutoScanRetryPending = false;
 uint32_t lastWifiAutoScanFailureMs = 0;
+
+// Second-stage unattended recovery policy. The existing scan watchdog and retry
+// path remain the first response to transient failures. These counters escalate
+// only when the scan engine repeatedly fails or stops producing successful scans.
+const uint8_t WIFI_RECOVERY_CONSECUTIVE_FAILURE_LIMIT = 5;
+const uint8_t WIFI_RECOVERY_BOOT_LIMIT = 3;
+const uint32_t WIFI_RECOVERY_NO_SUCCESS_MIN_MS = 180000;
+const uint8_t WIFI_RECOVERY_NO_SUCCESS_INTERVAL_MULTIPLIER = 3;
+const uint32_t WIFI_RECOVERY_HEALTHY_CLEAR_MS = 30UL * 60UL * 1000UL;
+const uint32_t WIFI_RECOVERY_CHECKPOINT_RETRY_MS = 60000;
+uint32_t wifiConsecutiveScanFailureCount = 0;
+uint32_t wifiLastSuccessfulScanMs = 0;
+bool wifiSuccessfulScanSeenThisBoot = false;
+uint32_t wifiRecoveryHealthySinceMs = 0;
+uint8_t wifiRecoveryBootCount = 0;
+bool wifiRecoverySuppressed = false;
+uint32_t wifiLastRecoveryCheckpointAttemptMs = 0;
+String wifiLastRecoveryReason = "None";
 
 // Interaction-priority policy:
 // - Never abort a Wi-Fi scan that has already started.
@@ -2676,10 +2695,62 @@ uint32_t wifiAverageScanDurationMs() {
   return (uint32_t)(wifiTotalScanDurationMs / wifiScanDurationCount);
 }
 
-// Purpose: Records an automatic Wi-Fi scan-start failure and arms the retry-backoff state.
+// Purpose: Returns the maximum tolerated boot-runtime gap without a successful Wi-Fi scan.
+uint32_t wifiRecoveryNoSuccessTimeoutMs() {
+  uint64_t scaled = (uint64_t)scanIntervalSeconds * 1000ULL * WIFI_RECOVERY_NO_SUCCESS_INTERVAL_MULTIPLIER;
+  if (scaled < WIFI_RECOVERY_NO_SUCCESS_MIN_MS) scaled = WIFI_RECOVERY_NO_SUCCESS_MIN_MS;
+  if (scaled > UINT32_MAX) scaled = UINT32_MAX;
+  return (uint32_t)scaled;
+}
+
+// Purpose: Loads the small persistent reboot-loop guard used only by automatic Wi-Fi recovery.
+void loadWifiRecoveryState() {
+  preferences.begin("recovery", true);
+  wifiRecoveryBootCount = preferences.getUChar("wifiBoots", 0);
+  wifiLastRecoveryReason = preferences.getString("wifiReason", "None");
+  preferences.end();
+  wifiRecoverySuppressed = wifiRecoveryBootCount >= WIFI_RECOVERY_BOOT_LIMIT;
+}
+
+// Purpose: Persists one automatic-recovery restart before the ESP32 is rebooted.
+void persistWifiRecoveryRestart(const String& reason) {
+  if (wifiRecoveryBootCount < 255) wifiRecoveryBootCount++;
+  wifiLastRecoveryReason = reason;
+  preferences.begin("recovery", false);
+  preferences.putUChar("wifiBoots", wifiRecoveryBootCount);
+  preferences.putString("wifiReason", wifiLastRecoveryReason);
+  preferences.end();
+  wifiRecoverySuppressed = wifiRecoveryBootCount >= WIFI_RECOVERY_BOOT_LIMIT;
+}
+
+// Purpose: Clears persisted recovery-loop state after a sustained healthy scan period.
+void clearWifiRecoveryStateAfterHealthyRun() {
+  if (wifiRecoveryBootCount == 0 && !wifiRecoverySuppressed) return;
+  wifiRecoveryBootCount = 0;
+  wifiRecoverySuppressed = false;
+  wifiLastRecoveryReason = "None - guard cleared after healthy run";
+  preferences.begin("recovery", false);
+  preferences.putUChar("wifiBoots", 0);
+  preferences.remove("wifiReason");
+  preferences.end();
+  recordDiagnosticEvent("WIFI RECOVERY", "reboot-loop guard cleared after sustained healthy scanning");
+}
+
+// Purpose: Marks proof that the Wi-Fi scan engine is healthy and resets consecutive-failure escalation.
+void noteSuccessfulWifiScan() {
+  uint32_t now = millis();
+  wifiSuccessfulScanSeenThisBoot = true;
+  wifiLastSuccessfulScanMs = now;
+  wifiConsecutiveScanFailureCount = 0;
+  if (wifiRecoveryHealthySinceMs == 0) wifiRecoveryHealthySinceMs = now;
+}
+
+// Purpose: Records an automatic Wi-Fi scan failure and arms the existing retry-backoff state.
 void noteAutomaticScanFailure() {
   wifiAutoScanRetryPending = true;
   lastWifiAutoScanFailureMs = millis();
+  if (wifiConsecutiveScanFailureCount < UINT32_MAX) wifiConsecutiveScanFailureCount++;
+  wifiRecoveryHealthySinceMs = 0;
 }
 
 // Purpose: Legacy synchronous wrapper that starts a logged Wi-Fi scan and waits for its completion.
@@ -2772,6 +2843,7 @@ void serviceLoggedWifiScan() {
   }
 
   processCompletedWifiScan(result);
+  noteSuccessfulWifiScan();
   considerInfrastructureReconnectAfterScan(result);
   recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
@@ -2791,6 +2863,66 @@ void serviceLoggedWifiScan() {
   }
 
   wifiCurrentScanAutomatic = false;
+}
+
+// Purpose: Escalates persistent Wi-Fi scan-engine failure to a checkpointed controlled restart.
+void serviceWifiScanRecoveryWatchdog() {
+  uint32_t now = millis();
+
+  // A stable half-hour proves the scanner recovered; clear persistent loop-guard state.
+  if (wifiRecoveryHealthySinceMs != 0 &&
+      (uint32_t)(now - wifiRecoveryHealthySinceMs) >= WIFI_RECOVERY_HEALTHY_CLEAR_MS) {
+    clearWifiRecoveryStateAfterHealthyRun();
+    wifiRecoveryHealthySinceMs = now;
+  }
+
+  if (csvExportInProgress || userInteractionDeferActive() || wifiScanInProgress) return;
+  if (initialWifiScanPending) return;
+
+  bool failureLimitReached = wifiConsecutiveScanFailureCount >= WIFI_RECOVERY_CONSECUTIVE_FAILURE_LIMIT;
+  uint32_t noSuccessTimeoutMs = wifiRecoveryNoSuccessTimeoutMs();
+  uint32_t successAgeMs = wifiSuccessfulScanSeenThisBoot ? (uint32_t)(now - wifiLastSuccessfulScanMs) : now;
+  bool noSuccessTimeoutReached = successAgeMs >= noSuccessTimeoutMs;
+
+  if (!failureLimitReached && !noSuccessTimeoutReached) return;
+
+  String reason = failureLimitReached
+      ? String("consecutive failures=") + String(wifiConsecutiveScanFailureCount)
+      : String("no successful scan for ") + String(successAgeMs) + "ms";
+
+  if (wifiRecoverySuppressed) {
+    // Do not spam the bounded diagnostic ring every loop while suppression remains active.
+    if ((uint32_t)(now - wifiLastRecoveryCheckpointAttemptMs) >= WIFI_RECOVERY_CHECKPOINT_RETRY_MS ||
+        wifiLastRecoveryCheckpointAttemptMs == 0) {
+      wifiLastRecoveryCheckpointAttemptMs = now;
+      recordDiagnosticEvent("WIFI RECOVERY SUPPRESSED", reason + "; recoveries=" + String(wifiRecoveryBootCount));
+    }
+    return;
+  }
+
+  if (wifiLastRecoveryCheckpointAttemptMs != 0 &&
+      (uint32_t)(now - wifiLastRecoveryCheckpointAttemptMs) < WIFI_RECOVERY_CHECKPOINT_RETRY_MS) return;
+  wifiLastRecoveryCheckpointAttemptMs = now;
+
+  recordDiagnosticEvent("WIFI RECOVERY", reason + "; checkpointing before restart");
+  Serial.print("Automatic Wi-Fi recovery triggered: ");
+  Serial.println(reason);
+  Serial.println("Saving restart checkpoint before automatic recovery reboot...");
+
+  if (!checkpointBeforeControlledRestart()) {
+    recordDiagnosticEvent("WIFI RECOVERY", "checkpoint failed; automatic restart deferred");
+    Serial.println("Automatic Wi-Fi recovery checkpoint failed; restart deferred to preserve survey history.");
+    return;
+  }
+
+  persistWifiRecoveryRestart(reason);
+  Serial.print("Checkpoint saved. Automatic Wi-Fi recovery restart ");
+  Serial.print(wifiRecoveryBootCount);
+  Serial.print(" / ");
+  Serial.print(WIFI_RECOVERY_BOOT_LIMIT);
+  Serial.println(". Restarting ESP32...");
+  delay(250);
+  ESP.restart();
 }
 
 // ============================================================
@@ -6711,6 +6843,12 @@ void handleDiagnosticsPage() {
     "<div class=\"row advanced-only\"><span class=\"label\">Automatic Scan Starts</span><span class=\"value\">" + String(wifiAutoScanStartCount) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">Automatic Scan Completions</span><span class=\"value\">" + String(wifiAutoScanCompletionCount) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">Start / Completion Failures</span><span class=\"value\">" + String(wifiAutoScanStartFailureCount) + " / " + String(wifiAutoScanCompletionFailureCount) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Consecutive Scan Failures</span><span class=\"value\">" + String(wifiConsecutiveScanFailureCount) + " / " + String(WIFI_RECOVERY_CONSECUTIVE_FAILURE_LIMIT) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Last Successful Scan</span><span class=\"value\">" + String(wifiSuccessfulScanSeenThisBoot ? runtimeAgeLabel(wifiLastSuccessfulScanMs) : String("None this boot")) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Automatic Recovery</span><span class=\"value\">" + String(wifiRecoverySuppressed ? "SUPPRESSED - reboot-loop guard active" : "Armed") + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Recovery Restarts Since Stable Run</span><span class=\"value\">" + String(wifiRecoveryBootCount) + " / " + String(WIFI_RECOVERY_BOOT_LIMIT) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">No-Success Recovery Timeout</span><span class=\"value\">" + htmlEscape(millisecondsLabel(wifiRecoveryNoSuccessTimeoutMs())) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Last Recovery Reason</span><span class=\"value\">" + htmlEscape(wifiLastRecoveryReason) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">Last Automatic Start</span><span class=\"value\">" + htmlEscape(wifiAutoScanLastStartLabel()) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">Last Automatic Completion</span><span class=\"value\">" + htmlEscape(wifiAutoScanLastCompletionLabel()) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">Scan Duration</span><span class=\"value\">" + htmlEscape(wifiScanDurationSummaryLabel()) + "</span></div>"
@@ -7694,6 +7832,17 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"automaticCompletions\":" + String(wifiAutoScanCompletionCount));
   diagnosticSendContent(",\"automaticStartFailures\":" + String(wifiAutoScanStartFailureCount));
   diagnosticSendContent(",\"automaticCompletionFailures\":" + String(wifiAutoScanCompletionFailureCount));
+  diagnosticSendContent(",\"consecutiveScanFailures\":" + String(wifiConsecutiveScanFailureCount));
+  diagnosticSendContent(",\"recoveryFailureLimit\":" + String(WIFI_RECOVERY_CONSECUTIVE_FAILURE_LIMIT));
+  diagnosticSendContent(",\"lastSuccessfulScanRuntimeMs\":" + String(wifiLastSuccessfulScanMs));
+  diagnosticSendContent(",\"successfulScanSeenThisBoot\":");
+  diagnosticSendContent(wifiSuccessfulScanSeenThisBoot ? "true" : "false");
+  diagnosticSendContent(",\"recoveryNoSuccessTimeoutMs\":" + String(wifiRecoveryNoSuccessTimeoutMs()));
+  diagnosticSendContent(",\"recoveryRestartCount\":" + String(wifiRecoveryBootCount));
+  diagnosticSendContent(",\"recoveryRestartLimit\":" + String(WIFI_RECOVERY_BOOT_LIMIT));
+  diagnosticSendContent(",\"recoverySuppressed\":");
+  diagnosticSendContent(wifiRecoverySuppressed ? "true" : "false");
+  diagnosticSendContent(",\"lastRecoveryReason\":" + jsonQuoted(wifiLastRecoveryReason));
   diagnosticSendContent(",\"automaticRetryPending\":");
   diagnosticSendContent(wifiAutoScanRetryPending ? "true" : "false");
   diagnosticSendContent(",\"interactionDeferred\":");
@@ -8462,6 +8611,18 @@ void printWifiSurveySerial() {
   Serial.print("Auto completion fails:");
   Serial.print(" ");
   Serial.println(wifiAutoScanCompletionFailureCount);
+  Serial.print("Consecutive failures:  ");
+  Serial.print(wifiConsecutiveScanFailureCount);
+  Serial.print(" / ");
+  Serial.println(WIFI_RECOVERY_CONSECUTIVE_FAILURE_LIMIT);
+  Serial.print("Recovery state:        ");
+  Serial.println(wifiRecoverySuppressed ? "SUPPRESSED - reboot-loop guard" : "Armed");
+  Serial.print("Recovery restarts:     ");
+  Serial.print(wifiRecoveryBootCount);
+  Serial.print(" / ");
+  Serial.println(WIFI_RECOVERY_BOOT_LIMIT);
+  Serial.print("Last recovery reason:  ");
+  Serial.println(wifiLastRecoveryReason);
   Serial.print("Auto retry pending:    ");
   Serial.println(wifiAutoScanRetryPending ? "Yes" : "No");
   Serial.print("Wi-Fi scan duration:   ");
@@ -8907,6 +9068,7 @@ void setup() {
   captureBootHeapCheckpoint("Startup");
   loadSurveyModeSettings();
   loadDiagnosticStreamingSettings();
+  loadWifiRecoveryState();
   captureBootHeapCheckpoint("Settings loaded");
   initializeStatusLed();
   captureBootHeapCheckpoint("Status LED initialized");
@@ -8926,6 +9088,11 @@ void setup() {
   Serial.println(FIRMWARE_CHANGE_SUMMARY);
   Serial.print("Built:    ");
   Serial.println(firmwareBuildTimestamp());
+  Serial.print("Wi-Fi recovery restarts since stable run: ");
+  Serial.print(wifiRecoveryBootCount);
+  Serial.print(" / ");
+  Serial.println(WIFI_RECOVERY_BOOT_LIMIT);
+  if (wifiRecoverySuppressed) Serial.println("Wi-Fi automatic recovery is SUPPRESSED by the reboot-loop guard until sustained healthy scanning clears it.");
   Serial.println();
   if (diagnosticStreamingEnabled) {
     diagnosticPrefix("BOOT");
@@ -9145,6 +9312,7 @@ void loop() {
   serviceDiagnosticSnapshot();
   serviceCompletedBLEScan();
   serviceLoggedWifiScan();
+  serviceWifiScanRecoveryWatchdog();
   serviceNativeReconnectDiagnostics();
   serviceInitialSurveyScans();
   serviceAutomaticScan();
