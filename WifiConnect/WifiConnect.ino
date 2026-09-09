@@ -49,8 +49,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39c_severe_browser_hang_trace_20260903_2118.ino";
-const char* FIRMWARE_VERSION = "39c";
+const char* FIRMWARE_FILE = "WifiConnect39d_memory_headroom_experiment_20260903_2159.ino";
+const char* FIRMWARE_VERSION = "39d";
 
 
 Preferences preferences;
@@ -128,9 +128,12 @@ const size_t DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS = 64;
 // margin because web and network services consume additional heap afterward.
 const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 88 * 1024;
 
-// Wi-Fi-only mode can devote substantially more RAM to retained observations
-// because the BLE stack and BLE history tables are absent.
-const size_t HISTORY_HEAP_RESERVE_BYTES = 64 * 1024;
+// V39d controlled memory-headroom experiment: keep the web/UI implementation
+// identical to V39c, but retain an additional 16 KB of heap instead of assigning
+// it to Wi-Fi observations. This tests whether the severe browser/document failure
+// correlates causally with the root-page largest-free-block collapse seen in V39c.
+// Expected tradeoff: lower Wi-Fi history capacity, higher runtime heap headroom.
+const size_t HISTORY_HEAP_RESERVE_BYTES = 80 * 1024;
 
 const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
 const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
