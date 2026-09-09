@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39i_web_restart_fix_20260907_0943.ino";
-const char* FIRMWARE_VERSION = "39i";
+const char* FIRMWARE_FILE = "WifiConnect39j_web_restart_js_escape_fix_20260907_0957.ino";
+const char* FIRMWARE_VERSION = "39j";
 
 
 Preferences preferences;
@@ -6751,7 +6751,7 @@ void handleSystemStatus() {
     "<div class=\"note\">Restarts the surveyor without changing saved settings. Current survey history is preserved when it can be saved for the restart.</div>"
     "<div class=\"buttons\"><button class=\"button\" type=\"button\" id=\"system-restart-button\" onclick=\"requestSystemRestart()\">Restart Device</button></div>"
     "<div id=\"system-restart-warning\" class=\"note\"></div></div>"
-    "<script>async function requestSystemRestart(){const w=document.getElementById('system-restart-warning');const b=document.getElementById('system-restart-button');if(b)b.disabled=true;if(w)w.textContent='Preparing a safe restart...';try{let r=await fetch('/restart-device',{method:'POST',cache:'no-store'});if(r.status===409){const message='Restarting will erase all current Wi-Fi and Bluetooth survey history. The current survey history cannot be preserved through this restart. Download the Wi-Fi and Bluetooth CSV files before restarting if you want to keep this data.';if(w)w.textContent=message;if(!confirm(message+'\n\nRestart and erase history?')){if(b)b.disabled=false;return;}r=await fetch('/restart-device?erase=1',{method:'POST',cache:'no-store'});}if(!r.ok)throw new Error();if(w)w.textContent='Restarting device...';setTimeout(function retry(){fetch('/api/ping',{cache:'no-store'}).then(function(x){if(x.ok){location.replace('/system');return;}setTimeout(retry,1000);}).catch(function(){setTimeout(retry,1000);});},2500);}catch(e){if(w)w.textContent='Unable to restart the device.';if(b)b.disabled=false;}}</script>");
+    "<script>async function requestSystemRestart(){const w=document.getElementById('system-restart-warning');const b=document.getElementById('system-restart-button');if(b)b.disabled=true;if(w)w.textContent='Preparing a safe restart...';try{let r=await fetch('/restart-device',{method:'POST',cache:'no-store'});if(r.status===409){const message='Restarting will erase all current Wi-Fi and Bluetooth survey history. The current survey history cannot be preserved through this restart. Download the Wi-Fi and Bluetooth CSV files before restarting if you want to keep this data.';if(w)w.textContent=message;if(!confirm(message+'\\n\\nRestart and erase history?')){if(b)b.disabled=false;return;}r=await fetch('/restart-device?erase=1',{method:'POST',cache:'no-store'});}if(!r.ok)throw new Error();if(w)w.textContent='Restarting device...';setTimeout(function retry(){fetch('/api/ping',{cache:'no-store'}).then(function(x){if(x.ok){location.replace('/system');return;}setTimeout(retry,1000);}).catch(function(){setTimeout(retry,1000);});},2500);}catch(e){if(w)w.textContent='Unable to restart the device.';if(b)b.disabled=false;}}</script>");
   markWebResponsePhase("restart-device");
 
   diagnosticSendContent("<div class=\"card developer-only\"><h2>Boot Heap Checkpoints</h2><div class=\"note\">Startup instrumentation showing where heap is consumed.</div><div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
