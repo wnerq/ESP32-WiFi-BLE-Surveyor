@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39j_web_restart_js_escape_fix_20260907_0957.ino";
-const char* FIRMWARE_VERSION = "39j";
+const char* FIRMWARE_FILE = "WifiConnect39k_checkpoint_wording_cleanup_20260907_1022.ino";
+const char* FIRMWARE_VERSION = "39k";
 
 
 Preferences preferences;
@@ -1253,7 +1253,7 @@ bool restoreSurveySessionCheckpoint(String& detail) {
   bool consumed = SPIFFS.remove(SESSION_CHECKPOINT_PATH);
   detail = "Restored " + String(historyCount) + " Wi-Fi observation(s) from restart checkpoint";
   if (bleSurveyEnabled && bleHistoryCount) detail += " and " + String(bleHistoryCount) + " BLE observation(s)";
-  detail += consumed ? "; checkpoint consumed." : "; warning: checkpoint could not be consumed.";
+  detail += consumed ? "; checkpoint deleted after successful restore." : "; warning: restored successfully, but checkpoint file could not be deleted.";
   sessionCheckpointStatus = detail;
   if (diagnosticStreamingEnabled && diagnosticCheckpointEvents) recordDiagnosticEvent("CHECKPOINT", detail);
   return true;
@@ -5476,7 +5476,7 @@ String contextHelpScript() {
     'Diagnostics Export':['diagnostics-export','Downloads a JSON snapshot of System information and recent diagnostic events for troubleshooting or comparison.','The export mirrors current System state and includes bounded RAM diagnostic history plus the current configuration snapshot.'],
     'Restart Device':['restart-device','Restarts the surveyor without changing saved settings. Current survey history is preserved when the restart checkpoint can hold it.','A failed checkpoint blocks the safe restart path; destructive restart requires explicit confirmation so stale or current history is not silently lost.'],
     'Boot Heap Checkpoints':['boot-heap','Shows memory at major startup stages so you can see where RAM is consumed.','Compare free heap, minimum heap, and largest block across initialization stages to isolate subsystem costs.'],
-    'Session':['session','Shows whether survey history was restored through a controlled restart and the current restart-preservation status.','Restart checkpoints are temporary continuity data and are consumed after successful restore.'],
+    'Session':['session','Shows whether survey history was restored through a controlled restart and the current restart-preservation status.','Restart checkpoints are temporary continuity data and are deleted after successful restore.'],
     'History Test Tools':['history-test-tools','Developer-only controls fill history with synthetic observations for near-capacity UI and rollover testing.','Synthetic data exercises compact history/table behavior but is not a substitute for radio or endurance testing.'],
     'Infrastructure Network':['settings-network','Configures the existing Wi-Fi network the surveyor can join for browser access.','Credentials are stored separately and are intentionally excluded from configuration export.'],
     'Device Hostname':['device-identity','Configures the friendly local hostname used to reach the surveyor on networks that support mDNS.','Changing the hostname requires restart because mDNS advertisement is initialized at boot.'],
@@ -5858,7 +5858,7 @@ void handleWebScan() {
     "<div class=\"row\"><span class=\"label\">Newest Observation</span><span id=\"wifi-newest-data\" class=\"value\">" + htmlEscape(newestLabel) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span id=\"wifi-retained-window\" class=\"value\">" + htmlEscape(windowLabel) + "</span></div>"
     "<div class=\"buttons\"><a class=\"button\" href=\"/scanlog.csv\">Download CSV</a><a class=\"button\" href=\"/scan-clear\">Clear History</a></div>"
-    "<div class=\"note\">History is retained in RAM during normal operation. Restart checkpoints preserve the current working history through controlled restarts and are consumed after successful restore.</div></div>";
+    "<div class=\"note\">History is retained in RAM during normal operation. Restart checkpoints preserve the current working history through controlled restarts and are deleted after successful restore.</div></div>";
   diagnosticSendContent(card);
   markWebResponsePhase("status-history");
 
@@ -6763,7 +6763,7 @@ void handleSystemStatus() {
   markWebResponsePhase("boot-checkpoints");
 
   diagnosticSendContent("<div class=\"card advanced-only\"><h2>Session</h2><div class=\"row\"><span class=\"label\">Restart Checkpoint</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div><div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
-    "<div class=\"developer-only\"><div class=\"test-tool-actions\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are consumed after successful restore.</div></div></div>");
+    "<div class=\"developer-only\"><div class=\"test-tool-actions\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are deleted after successful restore.</div></div></div>");
   String historyTestTools = "<div class=\"card developer-only\"><h2>History Test Tools</h2>"
     "<div class=\"test-tool-group\"><h3>Wi-Fi History</h3><div class=\"test-tool-actions\">"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
@@ -8247,7 +8247,7 @@ void handleHelpPage() {
     "diagnostics-export|Diagnostics Export|Downloads a JSON snapshot of System information, survey state, configuration, boot memory checkpoints, and recent bounded diagnostic events. It is intended to make troubleshooting snapshots portable.",
     "restart-device|Restart Device|A normal System restart first tries to preserve current survey history. If preservation fails, the device does not restart until you explicitly confirm that the current Wi-Fi and Bluetooth history can be erased.",
     "boot-heap|Boot Heap Checkpoints|Developer startup measurements show how free heap, minimum heap, and the largest contiguous block change as major subsystems initialize.",
-    "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint is consumed so it is not repeatedly restored on later boots.",
+    "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint file is deleted so it is not repeatedly restored on later boots.",
     "history-test-tools|History Test Tools|Developer prefill creates synthetic history at selected capacity targets for UI, rollover, and performance testing. Synthetic entries are not evidence of radio endurance or RF behavior.",
     "settings-network|Infrastructure Network|Scan for nearby Wi-Fi networks and select one to fill the SSID field, or enter an SSID manually for hidden or currently unseen networks. Credentials are saved only after a successful connection, and passwords are intentionally excluded from configuration backup files.",
     "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. The default is surveyor.local; use a unique hostname when multiple surveyors share a LAN. A hostname change requires restart so the new identity can be advertised from startup.",
