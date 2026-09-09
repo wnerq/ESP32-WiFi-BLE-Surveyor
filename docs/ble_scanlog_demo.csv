@@ -1,0 +1,4 @@
+scan,age,address,address_type,name,rssi_dbm
+1,1m 05s,DA:00:00:00:01:01,Random,Demo Sensor,-58
+2,0m 32s,DA:00:00:00:02:02,Random,Beacon Demo,-71
+3,0m 00s,DA:00:00:00:03:03,Random,Demo Tag,-64

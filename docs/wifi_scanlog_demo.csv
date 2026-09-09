@@ -1,0 +1,6 @@
+scan,age,ssid,bssid,rssi_dbm,channel,security
+3,3m 12s,DemoNetwork,02:00:00:00:01:11,-48,11,WPA2-PSK
+4,2m 10s,Demo-IoT,02:00:00:00:02:22,-67,6,WPA2-PSK
+5,1m 08s,Guest-Demo,02:00:00:00:03:33,-74,1,Open
+6,0m 00s,DemoNetwork,02:00:00:00:01:11,-44,11,WPA2-PSK
+6,0m 00s,Lab-AP,02:00:00:00:04:44,-81,6,WPA3-SAE

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "demo": true,
+  "scanIntervalSeconds": 60,
+  "bluetoothSurveyEnabled": false,
+  "captureHiddenWifi": false,
+  "statusLedEnabled": true,
+  "mdnsHostname": "surveyor-demo",
+  "accessPoint": {
+    "enabled": true,
+    "ssid": "ESP32-Surveyor-DEMO"
+  },
+  "credentialsExcluded": true
+}
