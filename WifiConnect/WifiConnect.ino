@@ -2,15 +2,16 @@
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
-// Complete contextual help, restart safeguards, and survey-control parity
+// Harden web responsiveness under rapid scans, slow clients, and constrained heap
 //
-// - restore the Bluetooth interval Apply control and reliable BLE enable reconnect flow
-// - add Wi-Fi scan progress/completion feedback matching Bluetooth survey status
-// - add 99 percent Wi-Fi and Bluetooth developer history prefill targets
-// - add a guarded System restart control with explicit destructive-history warning
-// - make diagnostics and configuration exports cover current System data and settings
-// - add version-agnostic contextual card help plus a deep-linked Help page
-// - preserve RSSI guidance through live refresh and make plots theme-aware
+// - make Live Updates off stop browser polling entirely
+// - serialize and throttle expensive history-card requests
+// - defer expensive fragments while scans, exports, or low-memory pressure are active
+// - return the Wi-Fi page shell before constructing history tables and plots
+// - stream smaller response chunks and abandon work for disconnected clients
+// - service completed Wi-Fi scans between response chunks
+// - retain fixed-size current/last web-operation diagnostics in status.json
+// - skip optional serial snapshots while the UART transmit buffer is congested
 //
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
@@ -35,8 +36,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38f_context_help_resilience.ino";
-const char* FIRMWARE_VERSION = "38f";
+const char* FIRMWARE_FILE = "WifiConnect38g_web_resilience.ino";
+const char* FIRMWARE_VERSION = "38g";
 
 
 Preferences preferences;
@@ -1522,6 +1523,8 @@ void serviceDiagnosticSnapshot() {
   if (!diagnosticStreamingEnabled || diagnosticSnapshotIntervalMs == 0) return;
   uint32_t now = millis();
   if ((uint32_t)(now - diagnosticLastSnapshotMs) < diagnosticSnapshotIntervalMs) return;
+  // Never let optional diagnostics wait behind a congested UART.
+  if (Serial.availableForWrite() < 64) return;
   diagnosticLastSnapshotMs = now;
   printDiagnosticSnapshot();
 }
@@ -1549,9 +1552,33 @@ void serviceLoopGapDiagnostics() {
   diagnosticLastLoopEntryMs = now;
 }
 
-// Purpose: Runs a registered HTTP handler while measuring page/API generation time for developer diagnostics.
+struct WebOperationState {
+  bool active = false;
+  char activeRoute[40] = "";
+  char activePhase[32] = "";
+  char lastRoute[40] = "";
+  char lastPhase[32] = "";
+  uint32_t activeSinceMs = 0;
+  uint32_t lastCompletedMs = 0;
+  uint32_t lastDurationMs = 0;
+  uint32_t busyDeferrals = 0;
+  uint32_t memoryDeferrals = 0;
+  uint32_t disconnectedAborts = 0;
+};
+
+WebOperationState webOperationState;
+
+void setWebOperationPhase(const char* phase) {
+  snprintf(webOperationState.activePhase, sizeof(webOperationState.activePhase), "%s", phase ? phase : "");
+}
+
+// Purpose: Runs a registered HTTP handler while retaining allocation-free current/last operation diagnostics.
 void runDiagnosticWebHandler(const char* route, void (*handler)()) {
   uint32_t startMs = millis();
+  webOperationState.active = true;
+  webOperationState.activeSinceMs = startMs;
+  snprintf(webOperationState.activeRoute, sizeof(webOperationState.activeRoute), "%s", route ? route : "");
+  setWebOperationPhase("handler");
   if (diagnosticStreamingEnabled && diagnosticWebEvents) {
     diagnosticPrefix("HTTP START");
     Serial.print("route="); Serial.print(route);
@@ -1562,6 +1589,11 @@ void runDiagnosticWebHandler(const char* route, void (*handler)()) {
   handler();
 
   uint32_t durationMs = (uint32_t)(millis() - startMs);
+  snprintf(webOperationState.lastRoute, sizeof(webOperationState.lastRoute), "%s", webOperationState.activeRoute);
+  snprintf(webOperationState.lastPhase, sizeof(webOperationState.lastPhase), "%s", webOperationState.activePhase);
+  webOperationState.lastDurationMs = durationMs;
+  webOperationState.lastCompletedMs = millis();
+  webOperationState.active = false;
   diagnosticWebHandlerCount++;
   diagnosticWebLastDurationMs = durationMs;
   if (durationMs > diagnosticWebMaxDurationMs) diagnosticWebMaxDurationMs = durationMs;
@@ -1614,14 +1646,24 @@ void recordWebWorkTiming(const char* label, uint32_t startMs) {
   webWorkTimingCount++;
 }
 
-const size_t WEB_RESPONSE_BUFFER_FLUSH_BYTES = 4096;
+const size_t WEB_RESPONSE_BUFFER_FLUSH_BYTES = 1024;
 String webResponseBuffer;
 bool webResponseBuffering = false;
+bool webResponseAborted = false;
 
 // Purpose: Accounts for one actual network write while preserving page-response timing diagnostics.
 void sendProfiledContentNow(const String& content) {
+  if (webResponseAborted || content.length() == 0) return;
+  WiFiClient client = server.client();
+  if (!client.connected()) {
+    webResponseAborted = true;
+    webOperationState.disconnectedAborts++;
+    return;
+  }
   uint32_t startMs = millis();
   server.sendContent(content);
+  yield();
+  serviceLoggedWifiScan();
   uint32_t durationMs = (uint32_t)(millis() - startMs);
   if (!webResponseProfile.active) return;
 
@@ -1651,6 +1693,7 @@ void flushDiagnosticWebResponseBuffer() {
 
 // Purpose: Appends bytes while keeping individual network writes near the configured response-chunk size.
 void appendDiagnosticWebResponseBytes(const char* data, size_t length) {
+  if (webResponseAborted) return;
   if (!webResponseBuffering) {
     if (length == 0) return;
     String direct;
@@ -1689,6 +1732,8 @@ void beginWebResponseProfile(const char* route) {
   webResponseBuffer.remove(0);
   webResponseBuffer.reserve(WEB_RESPONSE_BUFFER_FLUSH_BYTES + 128);
   webResponseBuffering = true;
+  webResponseAborted = false;
+  setWebOperationPhase("response-start");
 
   if (!webResponseProfile.active) return;
   webResponseProfile.startMs = millis();
@@ -1711,6 +1756,7 @@ void diagnosticSendContent(const char* content) {
 
 // Purpose: Records elapsed work and send activity for one logical response-generation phase.
 void markWebResponsePhase(const char* phase) {
+  setWebOperationPhase(phase);
   if (webResponseProfile.active)
     flushDiagnosticWebResponseBuffer();
   if (!webResponseProfile.active) return;
@@ -1747,6 +1793,29 @@ void markWebResponsePhase(const char* phase) {
   webResponseProfile.phaseSendCalls = webResponseProfile.sendCalls;
   webResponseProfile.phaseSendBytes = webResponseProfile.sendBytes;
   webResponseProfile.phaseSendTimeMs = webResponseProfile.sendTimeMs;
+}
+
+const uint32_t EXPENSIVE_WEB_MIN_FREE_HEAP = 24 * 1024;
+const uint32_t EXPENSIVE_WEB_MIN_LARGEST_BLOCK = 8 * 1024;
+
+// Purpose: Keeps expensive history rendering out of active scans and severe transient heap pressure.
+bool allowExpensiveWebFragment() {
+  if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress) {
+    webOperationState.busyDeferrals++;
+    return false;
+  }
+  if (ESP.getFreeHeap() < EXPENSIVE_WEB_MIN_FREE_HEAP ||
+      diagnosticLargestFreeBlock() < EXPENSIVE_WEB_MIN_LARGEST_BLOCK) {
+    webOperationState.memoryDeferrals++;
+    return false;
+  }
+  return true;
+}
+
+void sendExpensiveWebDeferred() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Retry-After", "2");
+  server.send(503, "text/html", "<h2>Temporarily deferred</h2><p>The surveyor is protecting an active scan or low-memory condition. Retrying shortly.</p>");
 }
 
 // Purpose: Finishes detailed response profiling and prints aggregate construction-versus-send timing.
@@ -5572,24 +5641,13 @@ void handleWebScan() {
   diagnosticSendContent(card);
   markWebResponsePhase("status-history");
 
-  String plotHeading = selectedSSID.length() ? selectedSSID : String("");
-  diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History" + (plotHeading.length() ? String(" &mdash; ") + htmlEscape(plotHeading) : String("")) + "</h2>");
-  if (selectedBSSID.length() > 0) {
-    diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(selectedBSSID) + "</span></div>");
-    sendRssiHistoryPlot(selectedBSSID);
-    diagnosticSendContent("<div class=\"note\">Select a network in Observed Networks to plot that access point's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
-  } else diagnosticSendContent("<p>No logged networks are available to plot yet.</p>");
-  diagnosticSendContent("</div>");
+  diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2><p class=\"note\">Loading history after the page becomes interactive…</p></div>");
   markWebResponsePhase("rssi");
 
-  diagnosticSendContent("<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2><div class=\"note\">One row per retained BSSID. Click a column header to sort; click a network to redraw the RSSI plot.</div>");
-  sendNetworkSummaryTable();
-  diagnosticSendContent("</div>");
+  diagnosticSendContent("<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2><p class=\"note\">Loading retained network summary…</p></div>");
   markWebResponsePhase("observed-networks");
 
-  diagnosticSendContent("<div id=\"wifi-channel-region\">");
-  sendWifiChannelAnalysis();
-  diagnosticSendContent("</div>");
+  diagnosticSendContent("<div id=\"wifi-channel-region\"><div class=\"card\"><h2>Observed Channel Interference</h2><p class=\"note\">Loading channel analysis…</p></div></div>");
   markWebResponsePhase("channel-analysis");
 
   diagnosticSendContent("<div class=\"card\"><h2>Infrastructure Wi-Fi</h2>"
@@ -5644,7 +5702,7 @@ void handleWebScan() {
       "let scan=" + String(scanCounter) + ";"
       "const toggle=document.getElementById('live-updates-toggle');"
       "const plotBssid='" + jsEscape(selectedBSSID) + "';"
-      "let updating=false;"
+      "let updating=false;let pollBusy=false;let retryTimer=0;let lastDetailRefresh=0;"
       "const scanButton=document.getElementById('wifi-scan-now');"
       "const scanState=document.getElementById('wifi-scan-state');"
       "const intervalInput=document.getElementById('interval');"
@@ -5653,12 +5711,15 @@ void handleWebScan() {
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
       "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
-      "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-retained-window',s.retainedWindow);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));}"
+      "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-newest-data',s.newestData);text('wifi-retained-window',s.retainedWindow);text('wifi-last-scan-results',s.lastFound+' found; '+s.lastLogged+' logged; '+s.lastDropped+' dropped');text('wifi-last-ap-results',s.lastNewAps+' new; '+s.lastSeenAps+' previously seen');text('wifi-last-filter-results',s.lastHiddenSkipped+' hidden skipped; '+s.lastReclaimedAps+' slots reclaimed');if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Wi-Fi scan in progress…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
-      "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;}),fetch('/api/wifi/channel',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-channel-region');if(e)e.innerHTML=h;})];if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
-      "setInterval(function(){fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);else showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);"
+      "async function loadInto(url,id){const r=await fetch(url,{cache:'no-store'});if(r.status===503)return false;if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(id);if(e)e.innerHTML=h;return true;}"
+      "function retryDetails(){if(retryTimer)return;retryTimer=setTimeout(function(){retryTimer=0;repaint();},2200);}"
+      "async function repaint(){if(updating)return;updating=true;try{if(!await loadInto('/api/wifi/observed','wifi-observed-card')){retryDetails();return;}if(!await loadInto('/api/wifi/channel','wifi-channel-region')){retryDetails();return;}if(plotBssid&&!await loadInto('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),'rssi-plot')){retryDetails();return;}lastDetailRefresh=Date.now();}catch(e){retryDetails();}finally{updating=false;}}"
+      "async function poll(){if(!toggle||!toggle.checked||pollBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;}}"
+      "setTimeout(repaint,250);setInterval(poll,2000);"
       "})();</script>";
     diagnosticSendContent(refreshScript);
   }
@@ -5671,6 +5732,8 @@ void handleWebScan() {
 
 // Purpose: Returns only the Observed Networks card content for live-update repainting.
 void handleWifiObservedFragment() {
+  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  beginWebResponseProfile("/api/wifi/observed");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
@@ -5682,10 +5745,13 @@ void handleWifiObservedFragment() {
   );
   sendNetworkSummaryTable();
   diagnosticSendContent("");
+  endWebResponseProfile();
 }
 
 // Purpose: Returns only the selected Wi-Fi RSSI plot fragment for live-update repainting.
 void handleWifiPlotFragment() {
+  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  beginWebResponseProfile("/api/wifi/plot");
   String selectedBSSID = server.hasArg("bssid") ? server.arg("bssid") : "";
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -5706,16 +5772,20 @@ void handleWifiPlotFragment() {
     diagnosticSendContent("<h2>RSSI History</h2><p>Select a network in Observed Networks to display its retained RSSI history. Hover over a point on the graph to see details for that observation.</p>");
   }
   diagnosticSendContent("");
+  endWebResponseProfile();
 }
 
 
 // Purpose: Returns the current Wi-Fi channel-analysis card for live-update repainting.
 void handleWifiChannelFragment() {
+  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  beginWebResponseProfile("/api/wifi/channel");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
   sendWifiChannelAnalysis();
   diagnosticSendContent("");
+  endWebResponseProfile();
 }
 
 // ============================================================
@@ -5981,6 +6051,7 @@ void handleBleScanStatus() {
   json += ",\"stationBSSID\":" + jsonQuoted(connected ? WiFi.BSSIDstr() : String(""));
   json += ",\"stationRssi\":" + String(connected ? WiFi.RSSI() : 0);
   json += ",\"stationChannel\":" + String(connected ? WiFi.channel() : 0);
+  json += ",\"live\":" + String(webAutoRefreshEnabled ? "true" : "false");
   json += "}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
@@ -6098,13 +6169,16 @@ void handleBLESurvey() {
   sendThemeScript();
   {
     String refreshScript =
-      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
+      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;let pollBusy=false;let retryTimer=0;const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak " + String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak " + String(bleScanMetadataPeakUsed) + "');text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/ble/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
-      "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/ble/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('ble-observed-card');if(e)e.innerHTML=h;})];if(address){jobs.push(fetch('/api/ble/plot?address='+encodeURIComponent(address),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
-      "setInterval(function(){fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);})();</script>";
+      "async function loadInto(url,id){const r=await fetch(url,{cache:'no-store'});if(r.status===503)return false;if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(id);if(e)e.innerHTML=h;return true;}"
+      "function retryDetails(){if(retryTimer)return;retryTimer=setTimeout(function(){retryTimer=0;repaint();},2200);}"
+      "async function repaint(){if(updating)return;updating=true;try{if(!await loadInto('/api/ble/observed','ble-observed-card')){retryDetails();return;}if(address&&!await loadInto('/api/ble/plot?address='+encodeURIComponent(address),'rssi-plot')){retryDetails();return;}}catch(e){retryDetails();}finally{updating=false;}}"
+      "async function poll(){if(!toggle||!toggle.checked||pollBusy)return;pollBusy=true;try{const r=await fetch('/api/ble/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(s.live===false){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;repaint();}}catch(e){}finally{pollBusy=false;}}"
+      "setInterval(poll,2000);})();</script>";
     diagnosticSendContent(refreshScript);
   }
   diagnosticSendContent("</div></body></html>");
@@ -6116,16 +6190,21 @@ void handleBLESurvey() {
 
 // Purpose: Returns only the Observed BLE Devices card content for live-update repainting.
 void handleBleObservedFragment() {
+  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  beginWebResponseProfile("/api/ble/observed");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
   diagnosticSendContent("<h2>Observed BLE Devices</h2><div class=\"note\">One row per retained BLE address. Click a column header to sort.</div>");
   sendBleSummaryTable();
   diagnosticSendContent("");
+  endWebResponseProfile();
 }
 
 // Purpose: Returns only the selected BLE RSSI plot fragment for live-update repainting.
 void handleBlePlotFragment() {
+  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  beginWebResponseProfile("/api/ble/plot");
   String selectedAddress = server.hasArg("address") ? server.arg("address") : "";
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -6141,6 +6220,7 @@ void handleBlePlotFragment() {
     diagnosticSendContent("<h2>RSSI History</h2><p>Select a device in Observed Devices to display its retained RSSI history. Hover over a point on the graph to see details for that observation.</p>");
   }
   diagnosticSendContent("");
+  endWebResponseProfile();
 }
 
 // Purpose: Runs the user-requested immediate BLE scan endpoint.
@@ -7324,6 +7404,21 @@ void handleStatusJsonExport() {
   diagnosticSendContent("},\n");
 
   markWebResponsePhase("channel-analysis");
+
+  diagnosticSendContent("  \"webResilience\":{");
+  diagnosticSendContent("\"active\":" + String(webOperationState.active ? "true" : "false"));
+  diagnosticSendContent(",\"activeRoute\":" + jsonQuoted(String(webOperationState.activeRoute)));
+  diagnosticSendContent(",\"activePhase\":" + jsonQuoted(String(webOperationState.activePhase)));
+  diagnosticSendContent(",\"activeSinceMs\":" + String(webOperationState.activeSinceMs));
+  diagnosticSendContent(",\"lastRoute\":" + jsonQuoted(String(webOperationState.lastRoute)));
+  diagnosticSendContent(",\"lastPhase\":" + jsonQuoted(String(webOperationState.lastPhase)));
+  diagnosticSendContent(",\"lastDurationMs\":" + String(webOperationState.lastDurationMs));
+  diagnosticSendContent(",\"lastCompletedMs\":" + String(webOperationState.lastCompletedMs));
+  diagnosticSendContent(",\"busyDeferrals\":" + String(webOperationState.busyDeferrals));
+  diagnosticSendContent(",\"memoryDeferrals\":" + String(webOperationState.memoryDeferrals));
+  diagnosticSendContent(",\"disconnectedAborts\":" + String(webOperationState.disconnectedAborts));
+  diagnosticSendContent("},\n");
+  markWebResponsePhase("web-resilience");
 
   size_t eventsToInclude = diagnosticExportEventLimit < diagnosticEventCount ? diagnosticExportEventLimit : diagnosticEventCount;
   size_t firstEvent = diagnosticEventCount - eventsToInclude;
