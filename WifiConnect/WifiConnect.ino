@@ -49,8 +49,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39b_server_stall_trace_compile_fix.ino";
-const char* FIRMWARE_VERSION = "39b";
+const char* FIRMWARE_FILE = "WifiConnect39c_severe_browser_hang_trace_20260903_2118.ino";
+const char* FIRMWARE_VERSION = "39c";
 
 
 Preferences preferences;
@@ -1680,17 +1680,22 @@ struct WebTransportDiagnostics {
   uint32_t lastObservedRequestPageId = 0;
   uint32_t lastChannelRequestPageId = 0;
   uint32_t lastPlotRequestPageId = 0;
+  uint32_t severeHangReports = 0;
+  uint32_t lastSevereHangPageId = 0;
+  uint32_t lastSevereHangReportMs = 0;
+  char lastSevereHangDetail[64] = "";
 };
 
 WebTransportDiagnostics webTransportDiagnostics;
 size_t webCurrentFooterStartBytes = 0;
 
-// V39b: Fixed-size abnormal web-stall recorder. This intentionally avoids String
+// V39c: Fixed-size abnormal web-stall recorder plus severe browser-hang watchdog evidence. This intentionally avoids String
 // allocation so evidence survives the same low-memory/socket-pressure conditions
 // that can delay the browser-side Capture Diagnostics request.
 const uint32_t WEB_STALL_SEND_THRESHOLD_MS = 150;
 const uint32_t WEB_STALL_RESPONSE_THRESHOLD_MS = 500;
 const uint32_t WEB_STALL_ARRIVAL_THRESHOLD_MS = 1000;
+const uint32_t WEB_SEVERE_HANG_THRESHOLD_MS = 8000;
 const size_t WEB_STALL_TRACE_CAPACITY = 8;
 
 struct WebStallTraceRecord {
@@ -5539,7 +5544,7 @@ void sendThemeControl() {
     "<option value=\"dark\">Dark</option>"
     "</select></div>"
     "<div class=\"capture-diagnostic-control developer-only\">"
-    "<button id=\"capture-diagnostics-button\" type=\"button\" title=\"Capture browser state and download status.json without leaving this page\">Capture Diagnostics</button>"
+    "<button id=\"capture-diagnostics-button\" type=\"button\" onclick=\"captureDiagnostics()\" title=\"Capture browser state and download status.json without leaving this page\">Capture Diagnostics</button>"
     "</div></div>"
   );
 }
@@ -5575,7 +5580,7 @@ void sendThemeScript() {
       "let p=0;const m=document.querySelector('meta[name=\"ws38j-page-id\"]');"
       "if(window.__WS38J&&window.__WS38J.pageId)p=window.__WS38J.pageId;else if(m)p=parseInt(m.content||'0',10)||0;"
       "const w=window.__WS38J||{};"
-      "const d='g='+(w.guard?1:0)+',l='+(w.loader?1:0)+',r='+(w.repaint?1:0)+',t='+(w.tail?1:0);"
+      "const d='g='+(w.guard?1:0)+',l='+(w.loader?1:0)+',r='+(w.repaint?1:0)+',t='+(w.tail?1:0)+',o='+(w.observedDone?1:0);"
       "const u='/api/web/client-diag?p='+encodeURIComponent(p)+'&s=capture&d='+encodeURIComponent(d);"
       "fetch(u,{method:'POST',cache:'no-store'}).catch(()=>{}).finally(()=>{"
         "const a=document.createElement('a');a.href='/status.json?capture='+Date.now();a.download='';a.style.display='none';"
@@ -5588,7 +5593,6 @@ void sendThemeScript() {
       "document.querySelectorAll('.theme-select').forEach(s=>s.value=v);"
       "const w=localStorage.getItem('esp32-view')||'standard';"
       "applyViewMode(w);"
-      "const b=document.getElementById('capture-diagnostics-button');if(b)b.addEventListener('click',captureDiagnostics);"
       "if(window.matchMedia){"
         "window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{"
           "if((localStorage.getItem('esp32-theme')||'system')==='system')applyTheme('system');"
@@ -5904,11 +5908,12 @@ void handleWebScan() {
   diagnosticSendContent(String(webResponseProfile.pageId));
   diagnosticSendContent("--><script>(function(){const p=");
   diagnosticSendContent(String(webResponseProfile.pageId));
-  diagnosticSendContent(";window.__WS38J={pageId:p,guard:true,loader:false,repaint:false,tail:false};"
+  diagnosticSendContent(";window.__WS38J={pageId:p,guard:true,loader:false,repaint:false,tail:false,observedDone:false};"
     "window.__ws38jReport=function(s,d){try{fetch('/api/web/client-diag?p='+p+'&s='+encodeURIComponent(s)+(d?'&d='+encodeURIComponent(String(d).slice(0,48)):''),{method:'POST',cache:'no-store'}).catch(()=>{});}catch(e){}};"
     "window.addEventListener('error',function(e){window.__ws38jReport('error',(e.message||'error')+'@'+(e.lineno||0));});"
     "window.addEventListener('unhandledrejection',function(e){window.__ws38jReport('reject',String(e.reason||'reject'));});"
-    "window.__ws38jReport('guard','ok');})();</script><!--WS38J_GUARD_END-->");
+    "window.__ws38jReport('guard','ok');"
+    "setTimeout(function(){const w=window.__WS38J||{};if(!(w.loader&&w.repaint&&w.tail&&w.observedDone)){window.__ws38jReport('hang8','l='+(w.loader?1:0)+',r='+(w.repaint?1:0)+',t='+(w.tail?1:0)+',o='+(w.observedDone?1:0));}},8000);})();</script><!--WS38J_GUARD_END-->");
   // V38j: independent guard/tail markers plus browser stage reports distinguish
   // generation, buffering, transport, parse, and execution failures.
   diagnosticSendContent("<!--WS38J_DEFERRED_START:");
@@ -5960,7 +5965,7 @@ void handleWebScan() {
     "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
     "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;"
     "try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();"
-    "const e=document.getElementById(job.id);if(e)e.innerHTML=h;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;"
+    "const e=document.getElementById(job.id);if(e)e.innerHTML=h;if(job.key==='observed'&&window.__WS38J)window.__WS38J.observedDone=true;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;"
     "requestBusy=false;pump();}}"
     "function repaint(){if(window.__WS38J)window.__WS38J.repaint=true;if(window.__ws38jReport)window.__ws38jReport('repaint','enter');"
     "enqueue('observed','/api/wifi/observed?p='+pageId,'wifi-observed-card');enqueue('channel','/api/wifi/channel?p='+pageId,'wifi-channel-region');"
@@ -5995,6 +6000,13 @@ void handleWebClientDiagnostic() {
     webTransportDiagnostics.lastRepaintReportMs = webTransportDiagnostics.lastBrowserReportMs;
   }
   else if (stage == "tail") webTransportDiagnostics.lastTailPageId = pageId;
+  else if (stage == "hang8") {
+    webTransportDiagnostics.severeHangReports++;
+    webTransportDiagnostics.lastSevereHangPageId = pageId;
+    webTransportDiagnostics.lastSevereHangReportMs = webTransportDiagnostics.lastBrowserReportMs;
+    snprintf(webTransportDiagnostics.lastSevereHangDetail, sizeof(webTransportDiagnostics.lastSevereHangDetail), "%s", detail.c_str());
+    recordWebStallTrace("BROWSER", "/", "hang8", WEB_SEVERE_HANG_THRESHOLD_MS, 0, 0);
+  }
   else if (stage == "error" || stage == "reject") webTransportDiagnostics.browserErrorReports++;
   if (diagnosticStreamingEnabled && diagnosticWebEvents) {
     diagnosticPrefix("BROWSER");
@@ -7747,6 +7759,10 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"lastObservedRequestPageId\":" + String(webTransportDiagnostics.lastObservedRequestPageId));
   diagnosticSendContent(",\"lastChannelRequestPageId\":" + String(webTransportDiagnostics.lastChannelRequestPageId));
   diagnosticSendContent(",\"lastPlotRequestPageId\":" + String(webTransportDiagnostics.lastPlotRequestPageId));
+  diagnosticSendContent(",\"severeHangReports\":" + String(webTransportDiagnostics.severeHangReports));
+  diagnosticSendContent(",\"lastSevereHangPageId\":" + String(webTransportDiagnostics.lastSevereHangPageId));
+  diagnosticSendContent(",\"lastSevereHangReportMs\":" + String(webTransportDiagnostics.lastSevereHangReportMs));
+  diagnosticSendContent(",\"lastSevereHangDetail\":" + jsonQuoted(String(webTransportDiagnostics.lastSevereHangDetail)));
   diagnosticSendContent("},\n");
   markWebResponsePhase("web-transport");
 
@@ -7754,6 +7770,7 @@ void handleStatusJsonExport() {
   diagnosticSendContent("\"sendThresholdMs\":" + String(WEB_STALL_SEND_THRESHOLD_MS));
   diagnosticSendContent(",\"responseThresholdMs\":" + String(WEB_STALL_RESPONSE_THRESHOLD_MS));
   diagnosticSendContent(",\"arrivalThresholdMs\":" + String(WEB_STALL_ARRIVAL_THRESHOLD_MS));
+  diagnosticSendContent(",\"severeHangThresholdMs\":" + String(WEB_SEVERE_HANG_THRESHOLD_MS));
   diagnosticSendContent(",\"recordedTotal\":" + String(webStallTraceSequence));
   diagnosticSendContent(",\"retained\":" + String(webStallTraceCount));
   diagnosticSendContent(",\"capacity\":" + String(WEB_STALL_TRACE_CAPACITY));
