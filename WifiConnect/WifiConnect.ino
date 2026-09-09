@@ -49,7 +49,7 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39b_server_stall_trace.ino";
+const char* FIRMWARE_FILE = "WifiConnect39b_server_stall_trace_compile_fix.ino";
 const char* FIRMWARE_VERSION = "39b";
 
 
@@ -1733,11 +1733,6 @@ void recordWebStallTrace(const char* kind, const char* route, const char* phase,
   record.wifiScanActive = wifiScanInProgress;
   webStallTraceNext = (webStallTraceNext + 1) % WEB_STALL_TRACE_CAPACITY;
   if (webStallTraceCount < WEB_STALL_TRACE_CAPACITY) webStallTraceCount++;
-}
-
-const WebStallTraceRecord& webStallTraceAt(size_t chronologicalIndex) {
-  size_t oldest = (webStallTraceNext + WEB_STALL_TRACE_CAPACITY - webStallTraceCount) % WEB_STALL_TRACE_CAPACITY;
-  return webStallTrace[(oldest + chronologicalIndex) % WEB_STALL_TRACE_CAPACITY];
 }
 
 void sampleWebResponseMemory() {
@@ -7763,9 +7758,10 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"retained\":" + String(webStallTraceCount));
   diagnosticSendContent(",\"capacity\":" + String(WEB_STALL_TRACE_CAPACITY));
   diagnosticSendContent(",\"records\":[");
+  size_t webStallOldest = (webStallTraceNext + WEB_STALL_TRACE_CAPACITY - webStallTraceCount) % WEB_STALL_TRACE_CAPACITY;
   for (size_t i = 0; i < webStallTraceCount; i++) {
     if (i > 0) diagnosticSendContent(",");
-    const WebStallTraceRecord& record = webStallTraceAt(i);
+    const WebStallTraceRecord& record = webStallTrace[(webStallOldest + i) % WEB_STALL_TRACE_CAPACITY];
     diagnosticSendContent("{\"sequence\":" + String(record.sequence));
     diagnosticSendContent(",\"uptimeMs\":" + String(record.uptimeMs));
     diagnosticSendContent(",\"kind\":" + jsonQuoted(String(record.kind)));
