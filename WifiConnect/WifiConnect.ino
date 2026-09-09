@@ -2,8 +2,12 @@
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
-// Add end-to-end web transport/browser diagnostics to isolate intermittent deferred-loader failures
+// Expand page-correlated diagnostics so intermittent deferred-card failures survive navigation
 //
+// - retain the last 8 Wi-Fi root-page traces so failure evidence survives navigation to System
+// - record per-page root completion, heap minima, send totals, browser stages, and fragment outcomes
+// - distinguish fragment attempts, busy/memory 503 deferrals, HTTP 200 responses, and browser DOM application
+// - add Developer-mode direct download links for Status, Config, Wi-Fi CSV, and BLE CSV without leaving the page
 // - assign a unique page ID to every Wi-Fi root response and expose it in HTML and HTTP headers
 // - add independent guard/deferred/tail HTML markers and browser execution breadcrumbs
 // - report browser guard, loader, repaint, tail, error, and rejection stages back to the ESP32
@@ -43,8 +47,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38j_transport_root_cause_diagnostics.ino";
-const char* FIRMWARE_VERSION = "38j";
+const char* FIRMWARE_FILE = "WifiConnect38k_page_trace_diagnostics.ino";
+const char* FIRMWARE_VERSION = "38k";
 
 
 Preferences preferences;
@@ -1640,7 +1644,7 @@ struct WebResponseProfile {
 
 WebResponseProfile webResponseProfile;
 
-// V38j end-to-end web transport/browser diagnostics. Fixed-size state only.
+// V38k end-to-end web transport/browser diagnostics. Fixed-size state only.
 struct WebTransportDiagnostics {
   uint32_t nextPageId = 0;
   uint32_t rootPagesStarted = 0;
@@ -1674,10 +1678,124 @@ struct WebTransportDiagnostics {
 };
 
 WebTransportDiagnostics webTransportDiagnostics;
+
+// V38k: fixed-size page-correlated trace ring. This survives navigation away from a failed
+// Wi-Fi page, so status.json can still describe the page that failed.
+const size_t WEB_PAGE_TRACE_CAPACITY = 8;
+
+struct WebFragmentTrace {
+  uint16_t attempts = 0;
+  uint16_t http200 = 0;
+  uint16_t busy503 = 0;
+  uint16_t memory503 = 0;
+  uint16_t browserApplied = 0;
+  uint16_t browserErrors = 0;
+  uint32_t lastAttemptMs = 0;
+  uint32_t lastHttp200Ms = 0;
+  uint32_t lastBrowserAppliedMs = 0;
+};
+
+struct WebPageTrace {
+  uint32_t pageId = 0;
+  uint32_t startedMs = 0;
+  uint32_t completedMs = 0;
+  uint32_t rootDurationMs = 0;
+  size_t attemptedBytes = 0;
+  size_t footerAttemptedBytes = 0;
+  uint32_t sendCalls = 0;
+  uint32_t slowSends = 0;
+  size_t minFreeHeap = 0;
+  size_t minLargestBlock = 0;
+  bool rootCompleted = false;
+  bool guard = false;
+  bool loader = false;
+  bool repaint = false;
+  bool tail = false;
+  uint16_t browserErrors = 0;
+  WebFragmentTrace observed;
+  WebFragmentTrace channel;
+  WebFragmentTrace plot;
+};
+
+WebPageTrace webPageTraces[WEB_PAGE_TRACE_CAPACITY];
 size_t webCurrentFooterStartBytes = 0;
 
+enum WebFragmentKind : uint8_t { WEB_FRAG_OBSERVED = 0, WEB_FRAG_CHANNEL = 1, WEB_FRAG_PLOT = 2 };
+enum ExpensiveWebDecision : uint8_t { WEB_FRAGMENT_ALLOW = 0, WEB_FRAGMENT_BUSY = 1, WEB_FRAGMENT_MEMORY = 2 };
+
+WebPageTrace* webPageTraceFor(uint32_t pageId, bool createIfMissing = false) {
+  if (pageId == 0) return nullptr;
+  WebPageTrace& slot = webPageTraces[(pageId - 1) % WEB_PAGE_TRACE_CAPACITY];
+  if (slot.pageId != pageId) {
+    if (!createIfMissing) return nullptr;
+    slot = WebPageTrace();
+    slot.pageId = pageId;
+  }
+  return &slot;
+}
+
+WebFragmentTrace* webFragmentTraceFor(WebPageTrace* page, WebFragmentKind kind) {
+  if (!page) return nullptr;
+  if (kind == WEB_FRAG_OBSERVED) return &page->observed;
+  if (kind == WEB_FRAG_CHANNEL) return &page->channel;
+  return &page->plot;
+}
+
+void startWebPageTrace(uint32_t pageId) {
+  WebPageTrace* page = webPageTraceFor(pageId, true);
+  if (!page) return;
+  *page = WebPageTrace();
+  page->pageId = pageId;
+  page->startedMs = millis();
+}
+
+void completeWebPageTrace(uint32_t pageId, uint32_t durationMs) {
+  WebPageTrace* page = webPageTraceFor(pageId, true);
+  if (!page) return;
+  page->rootCompleted = true;
+  page->completedMs = millis();
+  page->rootDurationMs = durationMs;
+  page->attemptedBytes = webResponseProfile.sendBytes;
+  page->footerAttemptedBytes = webResponseProfile.sendBytes >= webCurrentFooterStartBytes ? webResponseProfile.sendBytes - webCurrentFooterStartBytes : 0;
+  page->sendCalls = webResponseProfile.sendCalls;
+  page->slowSends = webResponseProfile.slowSendCount;
+  page->minFreeHeap = webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap;
+  page->minLargestBlock = webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock;
+
+  webTransportDiagnostics.rootPagesCompleted++;
+  webTransportDiagnostics.lastRootPageId = pageId;
+  webTransportDiagnostics.lastRootDurationMs = durationMs;
+  webTransportDiagnostics.lastRootAttemptedBytes = page->attemptedBytes;
+  webTransportDiagnostics.lastRootFooterAttemptedBytes = page->footerAttemptedBytes;
+  webTransportDiagnostics.lastRootSendCalls = page->sendCalls;
+  webTransportDiagnostics.lastRootSlowSends = page->slowSends;
+  webTransportDiagnostics.lastRootMinFreeHeap = page->minFreeHeap;
+  webTransportDiagnostics.lastRootMinLargestBlock = page->minLargestBlock;
+}
+
+void noteWebFragmentAttempt(uint32_t pageId, WebFragmentKind kind) {
+  WebFragmentTrace* f = webFragmentTraceFor(webPageTraceFor(pageId, false), kind);
+  if (!f) return;
+  f->attempts++;
+  f->lastAttemptMs = millis();
+}
+
+void noteWebFragmentDecision(uint32_t pageId, WebFragmentKind kind, ExpensiveWebDecision decision) {
+  WebFragmentTrace* f = webFragmentTraceFor(webPageTraceFor(pageId, false), kind);
+  if (!f) return;
+  if (decision == WEB_FRAGMENT_BUSY) f->busy503++;
+  else if (decision == WEB_FRAGMENT_MEMORY) f->memory503++;
+}
+
+void noteWebFragment200(uint32_t pageId, WebFragmentKind kind) {
+  WebFragmentTrace* f = webFragmentTraceFor(webPageTraceFor(pageId, false), kind);
+  if (!f) return;
+  f->http200++;
+  f->lastHttp200Ms = millis();
+}
+
 void sampleWebResponseMemory() {
-  if (!webResponseProfile.active) return;
+  if (!webResponseProfile.active && webResponseProfile.pageId == 0) return;
   size_t freeHeap = ESP.getFreeHeap();
   size_t largest = diagnosticLargestFreeBlock();
   if (freeHeap < webResponseProfile.minFreeHeap) webResponseProfile.minFreeHeap = freeHeap;
@@ -1720,7 +1838,7 @@ void sendProfiledContentNow(const String& content) {
   if (!connectedAfter) webTransportDiagnostics.clientDisconnectedAfterSend++;
   uint32_t durationMs = (uint32_t)(millis() - startMs);
   sampleWebResponseMemory();
-  if (!webResponseProfile.active) return;
+  if (!webResponseProfile.active && webResponseProfile.pageId == 0) return;
 
   webResponseProfile.sendCalls++;
   webResponseProfile.sendBytes += content.length();
@@ -1813,17 +1931,18 @@ void beginWebResponseProfile(const char* route) {
   if (route && strcmp(route, "/") == 0) {
     webResponseProfile.pageId = ++webTransportDiagnostics.nextPageId;
     webTransportDiagnostics.rootPagesStarted++;
+    startWebPageTrace(webResponseProfile.pageId);
   }
+  webResponseProfile.startMs = millis();
+  webResponseProfile.phaseStartMs = webResponseProfile.startMs;
   sampleWebResponseMemory();
   setWebOperationPhase("response-start");
 
   if (!webResponseProfile.active) return;
-  webResponseProfile.startMs = millis();
   diagnosticPrefix("PAGE START");
   Serial.print("route="); Serial.print(route);
   if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
-  webResponseProfile.startMs = millis();
   webResponseProfile.phaseStartMs = webResponseProfile.startMs;
 }
 
@@ -1884,18 +2003,20 @@ void markWebResponsePhase(const char* phase) {
 const uint32_t EXPENSIVE_WEB_MIN_FREE_HEAP = 24 * 1024;
 const uint32_t EXPENSIVE_WEB_MIN_LARGEST_BLOCK = 8 * 1024;
 
+// Purpose: Classifies why an expensive fragment can or cannot run right now.
+ExpensiveWebDecision expensiveWebFragmentDecision() {
+  if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress) return WEB_FRAGMENT_BUSY;
+  if (ESP.getFreeHeap() < EXPENSIVE_WEB_MIN_FREE_HEAP ||
+      diagnosticLargestFreeBlock() < EXPENSIVE_WEB_MIN_LARGEST_BLOCK) return WEB_FRAGMENT_MEMORY;
+  return WEB_FRAGMENT_ALLOW;
+}
+
 // Purpose: Keeps expensive history rendering out of active scans and severe transient heap pressure.
 bool allowExpensiveWebFragment() {
-  if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress) {
-    webOperationState.busyDeferrals++;
-    return false;
-  }
-  if (ESP.getFreeHeap() < EXPENSIVE_WEB_MIN_FREE_HEAP ||
-      diagnosticLargestFreeBlock() < EXPENSIVE_WEB_MIN_LARGEST_BLOCK) {
-    webOperationState.memoryDeferrals++;
-    return false;
-  }
-  return true;
+  ExpensiveWebDecision decision = expensiveWebFragmentDecision();
+  if (decision == WEB_FRAGMENT_BUSY) webOperationState.busyDeferrals++;
+  else if (decision == WEB_FRAGMENT_MEMORY) webOperationState.memoryDeferrals++;
+  return decision == WEB_FRAGMENT_ALLOW;
 }
 
 void sendExpensiveWebDeferred() {
@@ -1906,47 +2027,38 @@ void sendExpensiveWebDeferred() {
 
 // Purpose: Finishes detailed response profiling and prints aggregate construction-versus-send timing.
 void endWebResponseProfile() {
-  if (!webResponseProfile.active) {
-    flushDiagnosticWebResponseBuffer();
-    webResponseBuffering = false;
-    webResponseBuffer.remove(0);
-    return;
-  }
+  if (webResponseProfile.active) markWebResponsePhase("finish");
+  else flushDiagnosticWebResponseBuffer();
 
-  markWebResponsePhase("finish");
   uint32_t totalMs = (uint32_t)(millis() - webResponseProfile.startMs);
   uint32_t otherMs = totalMs >= webResponseProfile.sendTimeMs ? totalMs - webResponseProfile.sendTimeMs : 0;
-  diagnosticPrefix("PAGE SUMMARY");
-  Serial.print("route="); Serial.print(webResponseProfile.route);
-  if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
-  Serial.print(" total="); Serial.print(totalMs); Serial.print("ms");
-  Serial.print(" sendTime="); Serial.print(webResponseProfile.sendTimeMs); Serial.print("ms");
-  Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
-  Serial.print(" sends="); Serial.print(webResponseProfile.sendCalls);
-  Serial.print(" bytes="); Serial.print(webResponseProfile.sendBytes);
-  Serial.print(" maxSend="); Serial.print(webResponseProfile.maxSendMs); Serial.print("ms");
-  Serial.print(" maxBytes="); Serial.print(webResponseProfile.maxSendBytes);
-  Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount);
-  Serial.print(" minFree="); Serial.print(webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap);
-  Serial.print(" minLargest="); Serial.print(webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock);
-  Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
-  Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
-  recordDiagnosticEvent("PAGE SUMMARY", String(webResponseProfile.route) + " total=" + String(totalMs) + "ms send=" + String(webResponseProfile.sendTimeMs) + "ms other=" + String(otherMs) + "ms maxSend=" + String(webResponseProfile.maxSendMs) + "ms");
-  if (webResponseProfile.pageId) {
-    webTransportDiagnostics.rootPagesCompleted++;
-    webTransportDiagnostics.lastRootPageId = webResponseProfile.pageId;
-    webTransportDiagnostics.lastRootDurationMs = totalMs;
-    webTransportDiagnostics.lastRootAttemptedBytes = webResponseProfile.sendBytes;
-    webTransportDiagnostics.lastRootFooterAttemptedBytes = webResponseProfile.sendBytes >= webCurrentFooterStartBytes ? webResponseProfile.sendBytes - webCurrentFooterStartBytes : 0;
-    webTransportDiagnostics.lastRootSendCalls = webResponseProfile.sendCalls;
-    webTransportDiagnostics.lastRootSlowSends = webResponseProfile.slowSendCount;
-    webTransportDiagnostics.lastRootMinFreeHeap = webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap;
-    webTransportDiagnostics.lastRootMinLargestBlock = webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock;
+
+  if (webResponseProfile.pageId) completeWebPageTrace(webResponseProfile.pageId, totalMs);
+
+  if (webResponseProfile.active) {
+    diagnosticPrefix("PAGE SUMMARY");
+    Serial.print("route="); Serial.print(webResponseProfile.route);
+    if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
+    Serial.print(" total="); Serial.print(totalMs); Serial.print("ms");
+    Serial.print(" sendTime="); Serial.print(webResponseProfile.sendTimeMs); Serial.print("ms");
+    Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
+    Serial.print(" sends="); Serial.print(webResponseProfile.sendCalls);
+    Serial.print(" bytes="); Serial.print(webResponseProfile.sendBytes);
+    Serial.print(" maxSend="); Serial.print(webResponseProfile.maxSendMs); Serial.print("ms");
+    Serial.print(" maxBytes="); Serial.print(webResponseProfile.maxSendBytes);
+    Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount);
+    Serial.print(" minFree="); Serial.print(webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap);
+    Serial.print(" minLargest="); Serial.print(webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock);
+    Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
+    Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+    recordDiagnosticEvent("PAGE SUMMARY", String(webResponseProfile.route) + " total=" + String(totalMs) + "ms send=" + String(webResponseProfile.sendTimeMs) + "ms other=" + String(otherMs) + "ms maxSend=" + String(webResponseProfile.maxSendMs) + "ms");
   }
+
   webResponseProfile.active = false;
   webResponseBuffering = false;
   webResponseBuffer.remove(0);
 }
+
 
 // Purpose: Prints accumulated BLE timing, loop-gap, HTTP, and heap diagnostics as one serial report.
 void printDeveloperDiagnosticSummary() {
@@ -5673,6 +5785,19 @@ void sendWifiChannelAnalysis() {
   diagnosticSendContent("</tbody></table></div></div></div>");
 }
 
+// Purpose: Provides Developer-view evidence downloads without navigating away from the page being diagnosed.
+void sendDeveloperDiagnosticDownloads() {
+  diagnosticSendContent(
+    "<div class=\"card developer-only\"><h2>Diagnostic Downloads</h2>"
+    "<div class=\"buttons\">"
+    "<a class=\"button\" href=\"/status.json\" download>Download Status JSON</a>"
+    "<a class=\"button\" href=\"/config.json\" download>Download Config JSON</a>"
+    "<a class=\"button\" href=\"/scanlog.csv\" download>Download Wi-Fi CSV</a>"
+    "<a class=\"button\" href=\"/blelog.csv\" download>Download BLE CSV</a>"
+    "</div><div class=\"note\">Downloads preserve the current page so an intermittent failure can remain visible while evidence is captured.</div></div>"
+  );
+}
+
 // Purpose: Builds the Wi-Fi Survey page with consistent survey, analysis, network-context, and diagnostic ordering.
 void handleWebScan() {
   beginWebResponseProfile("/");
@@ -5711,9 +5836,9 @@ void handleWebScan() {
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("X-Surveyor-Page-Id", String(webResponseProfile.pageId));
   server.send(200, "text/html", "");
-  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wi-Fi Survey</title><meta name=\"ws38j-page-id\" content=\"");
+  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wi-Fi Survey</title><meta name=\"ws38k-page-id\" content=\"");
   diagnosticSendContent(String(webResponseProfile.pageId));
-  diagnosticSendContent("\"><meta name=\"ws38j-marker\" content=\"HEAD\">");
+  diagnosticSendContent("\"><meta name=\"ws38k-marker\" content=\"HEAD\">");
   sendThemeBootstrapScript();
   diagnosticSendContent(pageStyles());
   diagnosticSendContent("</head><body><div class=\"container\">");
@@ -5797,30 +5922,31 @@ void handleWebScan() {
     "<div class=\"row\"><span class=\"label\">Free Heap</span><span id=\"wifi-free-heap\" class=\"value\">" + String(ESP.getFreeHeap()/1024.0,1) + " KB</span></div>"
     "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span id=\"wifi-largest-block\" class=\"value\">" + String(diagnosticLargestFreeBlock()/1024.0,1) + " KB</span></div></div>";
   diagnosticSendContent(dev);
+  sendDeveloperDiagnosticDownloads();
   markWebResponsePhase("health-diagnostics");
 
   webCurrentFooterStartBytes = webResponseProfile.sendBytes + webResponseBuffer.length();
-  diagnosticSendContent("<!--WS38J_FOOTER_START:");
+  diagnosticSendContent("<!--WS38K_FOOTER_START:");
   diagnosticSendContent(String(webResponseProfile.pageId));
   diagnosticSendContent("--><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
-  diagnosticSendContent("<!--WS38J_GUARD_START:");
+  diagnosticSendContent("<!--WS38K_GUARD_START:");
   diagnosticSendContent(String(webResponseProfile.pageId));
   diagnosticSendContent("--><script>(function(){const p=");
   diagnosticSendContent(String(webResponseProfile.pageId));
-  diagnosticSendContent(";window.__WS38J={pageId:p,guard:true,loader:false,repaint:false,tail:false};"
-    "window.__ws38jReport=function(s,d){try{fetch('/api/web/client-diag?p='+p+'&s='+encodeURIComponent(s)+(d?'&d='+encodeURIComponent(String(d).slice(0,48)):''),{method:'POST',cache:'no-store'}).catch(()=>{});}catch(e){}};"
-    "window.addEventListener('error',function(e){window.__ws38jReport('error',(e.message||'error')+'@'+(e.lineno||0));});"
-    "window.addEventListener('unhandledrejection',function(e){window.__ws38jReport('reject',String(e.reason||'reject'));});"
-    "window.__ws38jReport('guard','ok');})();</script><!--WS38J_GUARD_END-->");
-  // V38j: independent guard/tail markers plus browser stage reports distinguish
+  diagnosticSendContent(";window.__WS38K={pageId:p,guard:true,loader:false,repaint:false,tail:false,fragments:{observed:{attempts:0,status:0,applied:false,errors:0},channel:{attempts:0,status:0,applied:false,errors:0},plot:{attempts:0,status:0,applied:false,errors:0}}};"
+    "window.__ws38kReport=function(s,d){try{fetch('/api/web/client-diag?p='+p+'&s='+encodeURIComponent(s)+(d?'&d='+encodeURIComponent(String(d).slice(0,48)):''),{method:'POST',cache:'no-store'}).catch(()=>{});}catch(e){}};"
+    "window.addEventListener('error',function(e){window.__ws38kReport('error',(e.message||'error')+'@'+(e.lineno||0));});"
+    "window.addEventListener('unhandledrejection',function(e){window.__ws38kReport('reject',String(e.reason||'reject'));});"
+    "window.__ws38kReport('guard','ok');})();</script><!--WS38K_GUARD_END-->");
+  // V38k: independent guard/tail markers plus browser stage reports distinguish
   // generation, buffering, transport, parse, and execution failures.
-  diagnosticSendContent("<!--WS38J_DEFERRED_START:");
+  diagnosticSendContent("<!--WS38K_DEFERRED_START:");
   diagnosticSendContent(String(webResponseProfile.pageId));
   diagnosticSendContent("--><script>(function(){const pageId=");
   diagnosticSendContent(String(webResponseProfile.pageId));
-  diagnosticSendContent(";if(window.__WS38J)window.__WS38J.loader=true;if(window.__ws38jReport)window.__ws38jReport('loader','enter');let scan=");
+  diagnosticSendContent(";if(window.__WS38K)window.__WS38K.loader=true;if(window.__ws38kReport)window.__ws38kReport('loader','enter');let scan=");
   diagnosticSendContent(String(scanCounter));
   diagnosticSendContent(";const toggle=document.getElementById('live-updates-toggle');const plotBssid='");
   diagnosticSendContent(jsEscape(selectedBSSID));
@@ -5863,18 +5989,18 @@ void handleWebScan() {
     ".catch(function(){showScanState(false,'Unable to start scan');});});}"
     "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
     "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
-    "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;"
-    "try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();"
-    "const e=document.getElementById(job.id);if(e)e.innerHTML=h;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;"
+    "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;const fd=window.__WS38K&&window.__WS38K.fragments?window.__WS38K.fragments[job.key]:null;if(fd)fd.attempts++;"
+    "try{const r=await fetch(job.url,{cache:'no-store'});if(fd)fd.status=r.status;if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error('HTTP '+r.status);const h=await r.text();"
+    "const e=document.getElementById(job.id);if(e){e.innerHTML=h;if(fd)fd.applied=true;if(window.__ws38kReport)window.__ws38kReport('frag-'+job.key+'-applied',String(h.length));}lastDetailRefresh=Date.now();}}catch(e){if(fd)fd.errors++;if(window.__ws38kReport)window.__ws38kReport('frag-'+job.key+'-error',String(e&&e.message||e));delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;"
     "requestBusy=false;pump();}}"
-    "function repaint(){if(window.__WS38J)window.__WS38J.repaint=true;if(window.__ws38jReport)window.__ws38jReport('repaint','enter');"
+    "function repaint(){if(window.__WS38K)window.__WS38K.repaint=true;if(window.__ws38kReport)window.__ws38kReport('repaint','enter');"
     "enqueue('observed','/api/wifi/observed?p='+pageId,'wifi-observed-card');enqueue('channel','/api/wifi/channel?p='+pageId,'wifi-channel-region');"
     "if(plotBssid)enqueue('plot','/api/wifi/plot?bssid='+encodeURIComponent(plotBssid)+'&p='+pageId,'rssi-plot');}"
     "async function poll(){if(!toggle||!toggle.checked||pollBusy||requestBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});"
     "if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;"
     "if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;pump();}}"
-    "setTimeout(repaint,250);setInterval(poll,2000);})();</script><!--WS38J_DEFERRED_END-->");
-  diagnosticSendContent("<script>(function(){if(window.__WS38J)window.__WS38J.tail=true;if(window.__ws38jReport)window.__ws38jReport('tail','ok');})();</script><!--WS38J_PAGE_END:");
+    "setTimeout(repaint,250);setInterval(poll,2000);})();</script><!--WS38K_DEFERRED_END-->");
+  diagnosticSendContent("<script>(function(){if(window.__WS38K)window.__WS38K.tail=true;if(window.__ws38kReport)window.__ws38kReport('tail','ok');})();</script><!--WS38K_PAGE_END:");
   diagnosticSendContent(String(webResponseProfile.pageId));
   diagnosticSendContent("--></div></body></html>");
   diagnosticSendContent("");
@@ -5898,6 +6024,24 @@ void handleWebClientDiagnostic() {
   else if (stage == "repaint") webTransportDiagnostics.lastRepaintPageId = pageId;
   else if (stage == "tail") webTransportDiagnostics.lastTailPageId = pageId;
   else if (stage == "error" || stage == "reject") webTransportDiagnostics.browserErrorReports++;
+
+  WebPageTrace* page = webPageTraceFor(pageId, false);
+  if (page) {
+    if (stage == "guard") page->guard = true;
+    else if (stage == "loader") page->loader = true;
+    else if (stage == "repaint") page->repaint = true;
+    else if (stage == "tail") page->tail = true;
+    else if (stage == "error" || stage == "reject") page->browserErrors++;
+    else if (stage.startsWith("frag-") && stage.endsWith("-applied")) {
+      WebFragmentKind kind = stage.indexOf("observed") >= 0 ? WEB_FRAG_OBSERVED : (stage.indexOf("channel") >= 0 ? WEB_FRAG_CHANNEL : WEB_FRAG_PLOT);
+      WebFragmentTrace* f = webFragmentTraceFor(page, kind);
+      if (f) { f->browserApplied++; f->lastBrowserAppliedMs = millis(); }
+    } else if (stage.startsWith("frag-") && stage.endsWith("-error")) {
+      WebFragmentKind kind = stage.indexOf("observed") >= 0 ? WEB_FRAG_OBSERVED : (stage.indexOf("channel") >= 0 ? WEB_FRAG_CHANNEL : WEB_FRAG_PLOT);
+      WebFragmentTrace* f = webFragmentTraceFor(page, kind);
+      if (f) f->browserErrors++;
+    }
+  }
   if (diagnosticStreamingEnabled && diagnosticWebEvents) {
     diagnosticPrefix("BROWSER");
     Serial.print("pageId="); Serial.print(pageId);
@@ -5911,8 +6055,16 @@ void handleWebClientDiagnostic() {
 
 // Purpose: Returns only the Observed Networks card content for live-update repainting.
 void handleWifiObservedFragment() {
-  if (server.hasArg("p")) webTransportDiagnostics.lastObservedRequestPageId = (uint32_t)server.arg("p").toInt();
-  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  uint32_t pageId = server.hasArg("p") ? (uint32_t)server.arg("p").toInt() : 0;
+  if (pageId) webTransportDiagnostics.lastObservedRequestPageId = pageId;
+  noteWebFragmentAttempt(pageId, WEB_FRAG_OBSERVED);
+  ExpensiveWebDecision decision = expensiveWebFragmentDecision();
+  if (decision != WEB_FRAGMENT_ALLOW) {
+    if (decision == WEB_FRAGMENT_BUSY) webOperationState.busyDeferrals++; else webOperationState.memoryDeferrals++;
+    noteWebFragmentDecision(pageId, WEB_FRAG_OBSERVED, decision);
+    sendExpensiveWebDeferred(); return;
+  }
+  noteWebFragment200(pageId, WEB_FRAG_OBSERVED);
   beginWebResponseProfile("/api/wifi/observed");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -5930,8 +6082,16 @@ void handleWifiObservedFragment() {
 
 // Purpose: Returns only the selected Wi-Fi RSSI plot fragment for live-update repainting.
 void handleWifiPlotFragment() {
-  if (server.hasArg("p")) webTransportDiagnostics.lastPlotRequestPageId = (uint32_t)server.arg("p").toInt();
-  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  uint32_t pageId = server.hasArg("p") ? (uint32_t)server.arg("p").toInt() : 0;
+  if (pageId) webTransportDiagnostics.lastPlotRequestPageId = pageId;
+  noteWebFragmentAttempt(pageId, WEB_FRAG_PLOT);
+  ExpensiveWebDecision decision = expensiveWebFragmentDecision();
+  if (decision != WEB_FRAGMENT_ALLOW) {
+    if (decision == WEB_FRAGMENT_BUSY) webOperationState.busyDeferrals++; else webOperationState.memoryDeferrals++;
+    noteWebFragmentDecision(pageId, WEB_FRAG_PLOT, decision);
+    sendExpensiveWebDeferred(); return;
+  }
+  noteWebFragment200(pageId, WEB_FRAG_PLOT);
   beginWebResponseProfile("/api/wifi/plot");
   String selectedBSSID = server.hasArg("bssid") ? server.arg("bssid") : "";
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -5959,8 +6119,16 @@ void handleWifiPlotFragment() {
 
 // Purpose: Returns the current Wi-Fi channel-analysis card for live-update repainting.
 void handleWifiChannelFragment() {
-  if (server.hasArg("p")) webTransportDiagnostics.lastChannelRequestPageId = (uint32_t)server.arg("p").toInt();
-  if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
+  uint32_t pageId = server.hasArg("p") ? (uint32_t)server.arg("p").toInt() : 0;
+  if (pageId) webTransportDiagnostics.lastChannelRequestPageId = pageId;
+  noteWebFragmentAttempt(pageId, WEB_FRAG_CHANNEL);
+  ExpensiveWebDecision decision = expensiveWebFragmentDecision();
+  if (decision != WEB_FRAGMENT_ALLOW) {
+    if (decision == WEB_FRAGMENT_BUSY) webOperationState.busyDeferrals++; else webOperationState.memoryDeferrals++;
+    noteWebFragmentDecision(pageId, WEB_FRAG_CHANNEL, decision);
+    sendExpensiveWebDeferred(); return;
+  }
+  noteWebFragment200(pageId, WEB_FRAG_CHANNEL);
   beginWebResponseProfile("/api/wifi/channel");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.sendHeader("Cache-Control", "no-store");
@@ -6344,6 +6512,7 @@ void handleBLESurvey() {
     "<div class=\"row\"><span class=\"label\">Largest Free Block</span><span id=\"ble-largest-block\" class=\"value\">" + String(diagnosticLargestFreeBlock()/1024.0,1) + " KB</span></div>"
     "<div class=\"note\">BLE scanning uses NimBLE callbacks and a bounded firmware capture buffer so scan acquisition does not block normal web servicing.</div></div>";
   diagnosticSendContent(dev);
+  sendDeveloperDiagnosticDownloads();
   markWebResponsePhase("health-diagnostics");
 
   diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
@@ -6650,7 +6819,7 @@ void handleSystemStatus() {
 // Status export and configuration backup / restore
 // ============================================================
 
-const uint32_t STATUS_SCHEMA_VERSION = 2;
+const uint32_t STATUS_SCHEMA_VERSION = 3;
 const uint32_t CONFIG_SCHEMA_VERSION = 2;
 const size_t MAX_CONFIG_IMPORT_BYTES = 4096;
 
@@ -7634,6 +7803,55 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"lastPlotRequestPageId\":" + String(webTransportDiagnostics.lastPlotRequestPageId));
   diagnosticSendContent("},\n");
   markWebResponsePhase("web-transport");
+
+  diagnosticSendContent("  \"webPageTraces\":{\"capacity\":" + String(WEB_PAGE_TRACE_CAPACITY) + ",\"pages\":[");
+  bool firstPageTrace = true;
+  uint32_t newestPageId = webTransportDiagnostics.nextPageId;
+  uint32_t oldestPageId = newestPageId > WEB_PAGE_TRACE_CAPACITY ? newestPageId - WEB_PAGE_TRACE_CAPACITY + 1 : 1;
+  for (uint32_t pageId = oldestPageId; pageId <= newestPageId && newestPageId > 0; pageId++) {
+    WebPageTrace* page = webPageTraceFor(pageId, false);
+    if (!page) continue;
+    if (!firstPageTrace) diagnosticSendContent(",");
+    firstPageTrace = false;
+    diagnosticSendContent("{\"pageId\":" + String(page->pageId));
+    diagnosticSendContent(",\"startedMs\":" + String(page->startedMs));
+    diagnosticSendContent(",\"completedMs\":" + String(page->completedMs));
+    diagnosticSendContent(",\"rootCompleted\":" + String(page->rootCompleted ? "true" : "false"));
+    diagnosticSendContent(",\"rootDurationMs\":" + String(page->rootDurationMs));
+    diagnosticSendContent(",\"attemptedBytes\":" + String(page->attemptedBytes));
+    diagnosticSendContent(",\"footerAttemptedBytes\":" + String(page->footerAttemptedBytes));
+    diagnosticSendContent(",\"sendCalls\":" + String(page->sendCalls));
+    diagnosticSendContent(",\"slowSends\":" + String(page->slowSends));
+    diagnosticSendContent(",\"minFreeHeap\":" + String(page->minFreeHeap));
+    diagnosticSendContent(",\"minLargestBlock\":" + String(page->minLargestBlock));
+    diagnosticSendContent(",\"browser\":{\"guard\":" + String(page->guard ? "true" : "false"));
+    diagnosticSendContent(",\"loader\":" + String(page->loader ? "true" : "false"));
+    diagnosticSendContent(",\"repaint\":" + String(page->repaint ? "true" : "false"));
+    diagnosticSendContent(",\"tail\":" + String(page->tail ? "true" : "false"));
+    diagnosticSendContent(",\"errors\":" + String(page->browserErrors) + "}");
+
+    WebFragmentTrace* fragments[3] = { &page->observed, &page->channel, &page->plot };
+    const char* fragmentNames[3] = { "observed", "channel", "plot" };
+    diagnosticSendContent(",\"fragments\":{");
+    for (uint8_t fi = 0; fi < 3; fi++) {
+      if (fi) diagnosticSendContent(",");
+      WebFragmentTrace* f = fragments[fi];
+      diagnosticSendContent(jsonQuoted(String(fragmentNames[fi])) + ":{");
+      diagnosticSendContent("\"attempts\":" + String(f->attempts));
+      diagnosticSendContent(",\"http200\":" + String(f->http200));
+      diagnosticSendContent(",\"busy503\":" + String(f->busy503));
+      diagnosticSendContent(",\"memory503\":" + String(f->memory503));
+      diagnosticSendContent(",\"browserApplied\":" + String(f->browserApplied));
+      diagnosticSendContent(",\"browserErrors\":" + String(f->browserErrors));
+      diagnosticSendContent(",\"lastAttemptMs\":" + String(f->lastAttemptMs));
+      diagnosticSendContent(",\"lastHttp200Ms\":" + String(f->lastHttp200Ms));
+      diagnosticSendContent(",\"lastBrowserAppliedMs\":" + String(f->lastBrowserAppliedMs));
+      diagnosticSendContent("}");
+    }
+    diagnosticSendContent("}}");
+  }
+  diagnosticSendContent("]},\n");
+  markWebResponsePhase("web-page-traces");
 
   size_t eventsToInclude = diagnosticExportEventLimit < diagnosticEventCount ? diagnosticExportEventLimit : diagnosticEventCount;
   size_t firstEvent = diagnosticEventCount - eventsToInclude;
