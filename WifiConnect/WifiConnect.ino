@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39h_configurable_hostname_20260907_0931.ino";
-const char* FIRMWARE_VERSION = "39h";
+const char* FIRMWARE_FILE = "WifiConnect39i_web_restart_fix_20260907_0943.ino";
+const char* FIRMWARE_VERSION = "39i";
 
 
 Preferences preferences;
@@ -8153,6 +8153,21 @@ void handleApiPing() {
   server.send(200, "text/plain", "ok");
 }
 
+// Web-triggered restarts are deferred until after the HTTP handler returns.
+// Restarting directly inside WebServer::handleClient() can interrupt the response/handler
+// lifecycle; serial restarts do not have that constraint.
+bool webRestartPending = false;
+uint32_t webRestartRequestedMs = 0;
+const uint32_t WEB_RESTART_DELAY_MS = 750;
+
+void servicePendingWebRestart() {
+  if (!webRestartPending) return;
+  if ((uint32_t)(millis() - webRestartRequestedMs) < WEB_RESTART_DELAY_MS) return;
+  Serial.println("Web restart request complete. Restarting ESP32...");
+  delay(50);
+  ESP.restart();
+}
+
 // Purpose: Performs a controlled System-page restart and refuses destructive history loss until explicitly confirmed.
 void handleSystemRestart() {
   markExplicitUserInteraction();
@@ -8174,8 +8189,11 @@ void handleSystemRestart() {
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", String("{\"ok\":true,\"historyPreserved\":") + ((!eraseHistory && hasSurveyHistory) ? "true" : "false") + ",\"restarting\":true}");
-  delay(750);
-  ESP.restart();
+
+  // Let this HTTP handler return cleanly, then restart from loop(). This mirrors
+  // the proven serial restart path while allowing the web response to complete.
+  webRestartPending = true;
+  webRestartRequestedMs = millis();
 }
 
 // Purpose: Provides version-agnostic operational guidance with stable anchors used by contextual card help buttons.
@@ -9067,6 +9085,14 @@ void loop() {
   if (webServerStarted) {
     server.handleClient();
     armUserInteractionDeferAfterWebService();
+  }
+
+  // A web restart is intentionally serviced only after handleClient() returns.
+  // While the short restart delay is active, do not start new survey work.
+  if (webRestartPending) {
+    servicePendingWebRestart();
+    delay(5);
+    return;
   }
 
   serviceDiagnosticSnapshot();
