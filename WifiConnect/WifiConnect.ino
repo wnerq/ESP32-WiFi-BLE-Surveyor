@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39e_help_return_link_20260906_2100.ino";
-const char* FIRMWARE_VERSION = "39e";
+const char* FIRMWARE_FILE = "WifiConnect39f_infrastructure_wifi_scan_select_20260906_2310.ino";
+const char* FIRMWARE_VERSION = "39f";
 
 
 Preferences preferences;
@@ -7855,8 +7855,11 @@ void handleSettingsPage() {
     s += "<div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + "</span></div>";
     s += "<div class=\"row advanced-only\"><span class=\"label\">IP Address</span><span class=\"value\">" + WiFi.localIP().toString() + "</span></div>";
   }
-  s += "<form class=\"controls\" action=\"/wifi-save\" method=\"post\"><div class=\"control\"><label for=\"sta-ssid\">SSID</label><input id=\"sta-ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" required></div><div class=\"control\"><label for=\"sta-password\">Password</label><input id=\"sta-password\" name=\"password\" type=\"password\" maxlength=\"63\"></div><button type=\"submit\">Connect &amp; Save</button></form><form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>"
-    "<div class=\"note\">Infrastructure Wi-Fi is optional and does not affect automatic surveying. New credentials are saved only after a successful connection; stored passwords are never displayed.</div></div>";
+  s += "<div class=\"control\"><label for=\"sta-network-list\">Discovered Networks</label><select id=\"sta-network-list\"><option value=\"\">Use manual SSID entry</option></select></div>"
+    "<div class=\"buttons\"><button id=\"sta-scan-button\" type=\"button\" onclick=\"refreshInfrastructureNetworks()\">Scan for Networks</button></div>"
+    "<div id=\"sta-scan-state\" class=\"note\">Select a discovered network or enter an SSID manually. Hidden networks require manual entry.</div>"
+    "<form class=\"controls\" action=\"/wifi-save\" method=\"post\"><div class=\"control\"><label for=\"sta-ssid\">SSID</label><input id=\"sta-ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" required></div><div class=\"control\"><label for=\"sta-password\">Password</label><input id=\"sta-password\" name=\"password\" type=\"password\" maxlength=\"63\"></div><button type=\"submit\">Connect &amp; Save</button></form><form class=\"controls\" action=\"/wifi-clear\" method=\"post\"><button class=\"danger\" type=\"submit\">Clear Saved Wi-Fi</button></form>"
+    "<div class=\"note\">Infrastructure Wi-Fi is optional and does not affect automatic surveying. A network selection only fills the SSID field; credentials are saved only after a successful connection, and stored passwords are never displayed.</div></div>";
   diagnosticSendContent(s); s.remove(0);
   markWebResponsePhase("infrastructure-wifi");
 
@@ -7903,7 +7906,7 @@ void handleSettingsPage() {
   markWebResponsePhase("interface-indicators");
 
   diagnosticSendContent("<div class=\"card advanced-only\"><h2>Configuration Backup &amp; Restore</h2><div class=\"buttons\"><a class=\"button\" href=\"/config.json\">Download Configuration</a></div><div class=\"note\">Configuration export contains supported non-secret settings; infrastructure and Device AP passwords are excluded.</div><div class=\"control\"><label for=\"config-import-file\">Restore configuration</label><input id=\"config-import-file\" type=\"file\" accept=\"application/json,.json\"></div><div class=\"buttons\"><button id=\"config-import-button\" type=\"button\" onclick=\"importConfiguration()\">Validate &amp; Apply Configuration</button></div><div id=\"config-import-result\" class=\"note\">Import validates the complete supported schema before writing settings. Restart-required changes are saved but are not silently restarted.</div></div>");
-  diagnosticSendContent("<script>async function setStatusLed(box){const state=document.getElementById('status-led-state');const save=document.getElementById('status-led-save-state');const enabled=!!box.checked;if(save)save.textContent='Saving…';try{const r=await fetch('/interface-settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ledEnabled='+(enabled?'1':'0'),cache:'no-store'});if(!r.ok)throw new Error();const j=await r.json();box.checked=!!j.enabled;if(state)state.textContent=j.enabled?'Enabled':'Disabled';if(save){save.textContent='Saved';setTimeout(()=>{save.textContent='';},1400);}}catch(e){box.checked=!enabled;if(state)state.textContent=box.checked?'Enabled':'Disabled';if(save)save.textContent='Save failed';}} async function importConfiguration(){const f=document.getElementById('config-import-file');const o=document.getElementById('config-import-result');if(!f||!o)return;if(!f.files||!f.files.length){o.textContent='Choose a configuration JSON file first.';return;}const file=f.files[0];if(file.size>4096){o.textContent='Configuration file is larger than the 4096-byte import limit.';return;}o.textContent='Validating configuration...';try{const body=await file.text();const r=await fetch('/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'});const j=await r.json();if(!j.ok){o.textContent='Import rejected: '+j.message;return;}let msg=j.message+' '+j.applied+' setting group(s) changed.';if(j.restartRequired){msg+=' Restart required for: '+j.restartReason+'.';}else{msg+=' No restart required.';}o.textContent=msg;}catch(e){o.textContent='Configuration import failed: '+e;}}</script>");
+  diagnosticSendContent("<script>function renderInfrastructureNetworks(j){const list=document.getElementById('sta-network-list');const state=document.getElementById('sta-scan-state');if(!list)return;const selected=list.value;list.innerHTML='<option value=\"\">Use manual SSID entry</option>';const best={};for(const n of (j.networks||[])){if(!n.ssid)continue;if(!best[n.ssid]||n.rssi>best[n.ssid].rssi)best[n.ssid]=n;}const rows=Object.values(best).sort((a,b)=>b.rssi-a.rssi||a.ssid.localeCompare(b.ssid));for(const n of rows){const o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+'  ('+n.rssi+' dBm, Ch '+n.channel+', '+n.security+')';list.appendChild(o);}if(selected&&best[selected])list.value=selected;if(state)state.textContent=rows.length?(rows.length+' network'+(rows.length===1?'':'s')+' from survey scan '+j.scan+'; newest data '+j.age+'.'):'No visible SSIDs were retained in the latest scan. Manual entry remains available.';}async function loadInfrastructureNetworks(){try{const r=await fetch('/api/wifi/config-networks',{cache:'no-store'});if(!r.ok)throw new Error();renderInfrastructureNetworks(await r.json());}catch(e){const state=document.getElementById('sta-scan-state');if(state)state.textContent='Unable to load discovered networks. Manual SSID entry remains available.';}}async function refreshInfrastructureNetworks(){const button=document.getElementById('sta-scan-button');const state=document.getElementById('sta-scan-state');if(button)button.disabled=true;if(state)state.textContent='Starting Wi-Fi scan...';let previous=0;try{let prior=await fetch('/api/wifi/status',{cache:'no-store'});if(prior.ok){const p=await prior.json();previous=p.scan||0;}const start=await fetch('/scan-now',{cache:'no-store'});if(!start.ok&&start.status!==202)throw new Error();for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,500));const sr=await fetch('/api/wifi/status',{cache:'no-store'});if(!sr.ok)continue;const sj=await sr.json();if(state)state.textContent=sj.scanStatus||'Scanning...';if(!sj.scanning&&(sj.scan||0)>previous){await loadInfrastructureNetworks();return;}}if(state)state.textContent='Scan is taking longer than expected. You can retry or enter the SSID manually.';}catch(e){if(state)state.textContent='Network scan failed. Manual SSID entry remains available.';}finally{if(button)button.disabled=false;}}function bindInfrastructureNetworkSelection(){const list=document.getElementById('sta-network-list');const ssid=document.getElementById('sta-ssid');if(list&&ssid)list.addEventListener('change',function(){if(this.value)ssid.value=this.value;});loadInfrastructureNetworks();}bindInfrastructureNetworkSelection();async function setStatusLed(box){const state=document.getElementById('status-led-state');const save=document.getElementById('status-led-save-state');const enabled=!!box.checked;if(save)save.textContent='Saving…';try{const r=await fetch('/interface-settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ledEnabled='+(enabled?'1':'0'),cache:'no-store'});if(!r.ok)throw new Error();const j=await r.json();box.checked=!!j.enabled;if(state)state.textContent=j.enabled?'Enabled':'Disabled';if(save){save.textContent='Saved';setTimeout(()=>{save.textContent='';},1400);}}catch(e){box.checked=!enabled;if(state)state.textContent=box.checked?'Enabled':'Disabled';if(save)save.textContent='Save failed';}} async function importConfiguration(){const f=document.getElementById('config-import-file');const o=document.getElementById('config-import-result');if(!f||!o)return;if(!f.files||!f.files.length){o.textContent='Choose a configuration JSON file first.';return;}const file=f.files[0];if(file.size>4096){o.textContent='Configuration file is larger than the 4096-byte import limit.';return;}o.textContent='Validating configuration...';try{const body=await file.text();const r=await fetch('/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'});const j=await r.json();if(!j.ok){o.textContent='Import rejected: '+j.message;return;}let msg=j.message+' '+j.applied+' setting group(s) changed.';if(j.restartRequired){msg+=' Restart required for: '+j.restartReason+'.';}else{msg+=' No restart required.';}o.textContent=msg;}catch(e){o.textContent='Configuration import failed: '+e;}}</script>");
   markWebResponsePhase("configuration-backup");
   diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>"); sendThemeScript(); diagnosticSendContent("</div></body></html>"); diagnosticSendContent("");
   markWebResponsePhase("footer-scripts");
@@ -7988,6 +7991,35 @@ void handleSaveStationSettings() {
   if (connected) saveCredentials(ssid, password);
   server.sendHeader("Location", "/settings");
   server.send(303, "text/plain", connected ? "Connected and saved." : "Connection failed; previous saved credentials were retained.");
+}
+
+// Purpose: Returns the latest completed Wi-Fi survey scan as a lightweight list for infrastructure network selection.
+void handleInfrastructureWifiNetworkList() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", "");
+  diagnosticSendContent("{\"scan\":" + String(scanCounter));
+  diagnosticSendContent(",\"scanning\":");
+  diagnosticSendContent(wifiScanInProgress ? "true" : "false");
+  diagnosticSendContent(",\"age\":" + jsonQuoted(scanCounter ? observationAgeLabel(lastScanUptimeMs) : String("Never")));
+  diagnosticSendContent(",\"networks\":[");
+
+  bool first = true;
+  if (scanCounter > 0) {
+    for (size_t i = 0; i < historyCount; i++) {
+      const ScanRecord& record = historyRecord(i);
+      if (record.scanNumber != scanCounter || record.ssid[0] == '\0') continue;
+      if (!first) diagnosticSendContent(",");
+      first = false;
+      diagnosticSendContent("{\"ssid\":" + jsonQuoted(String(record.ssid)));
+      diagnosticSendContent(",\"bssid\":" + jsonQuoted(String(record.bssid)));
+      diagnosticSendContent(",\"rssi\":" + String(record.rssi));
+      diagnosticSendContent(",\"channel\":" + String(record.channel));
+      diagnosticSendContent(",\"security\":" + jsonQuoted(securityLabel((wifi_auth_mode_t)record.authMode)) + "}");
+    }
+  }
+  diagnosticSendContent("]}");
+  diagnosticSendContent("");
 }
 
 // Purpose: Persists the requested Bluetooth survey mode, attempts a checkpoint, and performs the required controlled restart.
@@ -8179,7 +8211,7 @@ void handleHelpPage() {
     "boot-heap|Boot Heap Checkpoints|Developer startup measurements show how free heap, minimum heap, and the largest contiguous block change as major subsystems initialize.",
     "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint is consumed so it is not repeatedly restored on later boots.",
     "history-test-tools|History Test Tools|Developer prefill creates synthetic history at selected capacity targets for UI, rollover, and performance testing. Synthetic entries are not evidence of radio endurance or RF behavior.",
-    "settings-network|Infrastructure Network|Save or clear the Wi-Fi credentials used to join an existing network. Passwords are intentionally excluded from configuration backup files.",
+    "settings-network|Infrastructure Network|Scan for nearby Wi-Fi networks and select one to fill the SSID field, or enter an SSID manually for hidden or currently unseen networks. Credentials are saved only after a successful connection, and passwords are intentionally excluded from configuration backup files.",
     "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. A hostname change requires restart so the new identity can be advertised from startup.",
     "device-ap|Device AP|The surveyor can provide its own Wi-Fi access point for direct browser access. Changing AP state, SSID, or password can require reconnecting to the device after restart.",
     "survey-mode|Survey Mode|Bluetooth surveying can be enabled or disabled. Bluetooth consumes additional RAM, so changing this mode requires restart and changes how survey-history memory is divided.",
@@ -8235,6 +8267,7 @@ void startWebServer() {
   server.on("/led-test", HTTP_POST, []() { runDiagnosticWebHandler("/led-test", handleLedSelfTest); });
   server.on("/scan-now", []() { runDiagnosticWebHandler("/scan-now", handleWebScanNow); });
   server.on("/api/wifi/status", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/status", handleWifiScanStatus); });
+  server.on("/api/wifi/config-networks", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/config-networks", handleInfrastructureWifiNetworkList); });
   server.on("/api/wifi/observed", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/observed", handleWifiObservedFragment); });
   server.on("/api/wifi/plot", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/plot", handleWifiPlotFragment); });
   server.on("/api/wifi/channel", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/channel", handleWifiChannelFragment); });
