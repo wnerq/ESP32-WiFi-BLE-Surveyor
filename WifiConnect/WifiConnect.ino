@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect39g_live_updates_status_help_20260907_0900.ino";
-const char* FIRMWARE_VERSION = "39g";
+const char* FIRMWARE_FILE = "WifiConnect39h_configurable_hostname_20260907_0931.ino";
+const char* FIRMWARE_VERSION = "39h";
 
 
 Preferences preferences;
@@ -813,10 +813,11 @@ String generatedDefaultMdnsHostname() {
   return String("surveyor-") + suffix;
 }
 
-// Purpose: Applies a generated hostname when no valid saved hostname is available.
+// Purpose: Applies the friendly default hostname when the user has not saved a custom hostname.
+// The Device AP SSID remains unique, so changing the mDNS default does not change AP identity.
 void applyGeneratedDefaultMdnsHostname() {
   if (mdnsHostnameUserConfigured) return;
-  mdnsHostname = normalizedMdnsHostname(generatedDefaultMdnsHostname());
+  mdnsHostname = DEFAULT_MDNS_HOSTNAME;
 }
 
 // Purpose: Stores the validated device hostname in NVS and updates the in-memory copy.
@@ -7868,7 +7869,7 @@ void handleSettingsPage() {
   s += "<div class=\"card\"><h2>Device Hostname</h2><div class=\"row\"><span class=\"label\">Friendly Web Address</span><span class=\"value\">" + htmlEscape(mdnsWebAddress()) + "</span></div>"
     "<div class=\"row advanced-only\"><span class=\"label\">mDNS Status</span><span class=\"value\">" + htmlEscape(mdnsStatusMessage) + "</span></div>"
     "<form class=\"controls\" action=\"/hostname-save\" method=\"post\"><div class=\"control\"><label for=\"mdns-hostname\">Hostname</label><input id=\"mdns-hostname\" name=\"hostname\" type=\"text\" maxlength=\"32\" value=\"" + htmlEscape(mdnsHostname) + "\" required></div><button type=\"submit\">Save Hostname &amp; Restart</button></form>"
-    "<div class=\"note\">Use letters, numbers, and hyphens only; the name cannot begin or end with a hyphen.</div><div class=\"note advanced-only\">The friendly address is &lt;hostname&gt;.local. mDNS support can vary by client, so IP addresses remain the fallback.</div></div>";
+    "<div class=\"note\">Use letters, numbers, and hyphens only; the name cannot begin or end with a hyphen.</div><div class=\"note advanced-only\">The default hostname is surveyor, giving surveyor.local. If multiple surveyors share the same LAN, assign each a unique hostname to avoid mDNS name collisions. mDNS support can vary by client, so IP addresses remain the fallback.</div></div>";
   diagnosticSendContent(s); s.remove(0);
   markWebResponsePhase("hostname");
 
@@ -8231,7 +8232,7 @@ void handleHelpPage() {
     "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint is consumed so it is not repeatedly restored on later boots.",
     "history-test-tools|History Test Tools|Developer prefill creates synthetic history at selected capacity targets for UI, rollover, and performance testing. Synthetic entries are not evidence of radio endurance or RF behavior.",
     "settings-network|Infrastructure Network|Scan for nearby Wi-Fi networks and select one to fill the SSID field, or enter an SSID manually for hidden or currently unseen networks. Credentials are saved only after a successful connection, and passwords are intentionally excluded from configuration backup files.",
-    "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. A hostname change requires restart so the new identity can be advertised from startup.",
+    "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. The default is surveyor.local; use a unique hostname when multiple surveyors share a LAN. A hostname change requires restart so the new identity can be advertised from startup.",
     "device-ap|Device AP|The surveyor can provide its own Wi-Fi access point for direct browser access. Changing AP state, SSID, or password can require reconnecting to the device after restart.",
     "survey-mode|Survey Mode|Bluetooth surveying can be enabled or disabled. Bluetooth consumes additional RAM, so changing this mode requires restart and changes how survey-history memory is divided.",
     "wifi-capture|Wi-Fi Capture|Hidden networks are always detectable for RF/channel analysis. When hidden-history capture is disabled, future hidden observations do not consume AP-table or retained-history capacity; existing hidden history ages out normally.",
