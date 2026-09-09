@@ -2,9 +2,16 @@
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
-// Correct deferred-card delivery while preserving V38g web resilience
+// Add end-to-end web transport/browser diagnostics to isolate intermittent deferred-loader failures
 //
-// - make Live Updates off stop browser polling entirely
+// - assign a unique page ID to every Wi-Fi root response and expose it in HTML and HTTP headers
+// - add independent guard/deferred/tail HTML markers and browser execution breadcrumbs
+// - report browser guard, loader, repaint, tail, error, and rejection stages back to the ESP32
+// - correlate deferred fragment requests with the originating page ID
+// - detect response-buffer reserve/append failures and count any dropped bytes
+// - capture per-page minimum free heap/largest block and client connection state around sends
+// - export the new transport/browser diagnostics in status.json
+// - preserve V38i serialized fragment loading, retries, throttling, and Live Updates behavior
 // - serialize and throttle expensive history-card requests
 // - defer expensive fragments while scans, exports, or low-memory pressure are active
 // - return the Wi-Fi page shell before constructing history tables and plots
@@ -36,8 +43,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38h_web_resilience_fix.ino";
-const char* FIRMWARE_VERSION = "38h";
+const char* FIRMWARE_FILE = "WifiConnect38j_transport_root_cause_diagnostics.ino";
+const char* FIRMWARE_VERSION = "38j";
 
 
 Preferences preferences;
@@ -1625,9 +1632,58 @@ struct WebResponseProfile {
   uint32_t phaseSendCalls = 0;
   size_t phaseSendBytes = 0;
   uint32_t phaseSendTimeMs = 0;
+  size_t minFreeHeap = SIZE_MAX;
+  size_t minLargestBlock = SIZE_MAX;
+  uint32_t bufferAppendFailuresAtStart = 0;
+  uint32_t pageId = 0;
 };
 
 WebResponseProfile webResponseProfile;
+
+// V38j end-to-end web transport/browser diagnostics. Fixed-size state only.
+struct WebTransportDiagnostics {
+  uint32_t nextPageId = 0;
+  uint32_t rootPagesStarted = 0;
+  uint32_t rootPagesCompleted = 0;
+  uint32_t lastRootPageId = 0;
+  uint32_t lastRootDurationMs = 0;
+  size_t lastRootAttemptedBytes = 0;
+  size_t lastRootFooterAttemptedBytes = 0;
+  uint32_t lastRootSendCalls = 0;
+  uint32_t lastRootSlowSends = 0;
+  size_t lastRootMinFreeHeap = 0;
+  size_t lastRootMinLargestBlock = 0;
+  uint32_t bufferReserveFailures = 0;
+  uint32_t bufferAppendFailures = 0;
+  size_t bufferAppendBytesLost = 0;
+  uint32_t clientDisconnectedBeforeSend = 0;
+  uint32_t clientDisconnectedAfterSend = 0;
+  uint32_t browserReports = 0;
+  uint32_t browserErrorReports = 0;
+  uint32_t lastBrowserPageId = 0;
+  uint32_t lastBrowserReportMs = 0;
+  char lastBrowserStage[32] = "";
+  char lastBrowserDetail[64] = "";
+  uint32_t lastGuardPageId = 0;
+  uint32_t lastLoaderPageId = 0;
+  uint32_t lastRepaintPageId = 0;
+  uint32_t lastTailPageId = 0;
+  uint32_t lastObservedRequestPageId = 0;
+  uint32_t lastChannelRequestPageId = 0;
+  uint32_t lastPlotRequestPageId = 0;
+};
+
+WebTransportDiagnostics webTransportDiagnostics;
+size_t webCurrentFooterStartBytes = 0;
+
+void sampleWebResponseMemory() {
+  if (!webResponseProfile.active) return;
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t largest = diagnosticLargestFreeBlock();
+  if (freeHeap < webResponseProfile.minFreeHeap) webResponseProfile.minFreeHeap = freeHeap;
+  if (largest < webResponseProfile.minLargestBlock) webResponseProfile.minLargestBlock = largest;
+}
+
 
 struct WebWorkTiming {
   const char* label = "";
@@ -1653,11 +1709,17 @@ bool webResponseBuffering = false;
 // Purpose: Accounts for one actual network write while preserving page-response timing diagnostics.
 void sendProfiledContentNow(const String& content) {
   if (content.length() == 0) return;
+  bool connectedBefore = server.client().connected();
+  if (!connectedBefore) webTransportDiagnostics.clientDisconnectedBeforeSend++;
+  sampleWebResponseMemory();
   uint32_t startMs = millis();
   server.sendContent(content);
   yield();
   serviceLoggedWifiScan();
+  bool connectedAfter = server.client().connected();
+  if (!connectedAfter) webTransportDiagnostics.clientDisconnectedAfterSend++;
   uint32_t durationMs = (uint32_t)(millis() - startMs);
+  sampleWebResponseMemory();
   if (!webResponseProfile.active) return;
 
   webResponseProfile.sendCalls++;
@@ -1706,7 +1768,24 @@ void appendDiagnosticWebResponseBytes(const char* data, size_t length) {
     }
 
     size_t take = length < room ? length : room;
-    webResponseBuffer.concat(data, take);
+    size_t beforeLength = webResponseBuffer.length();
+    bool appended = webResponseBuffer.concat(data, take);
+    size_t afterLength = webResponseBuffer.length();
+    size_t actualAdded = afterLength >= beforeLength ? afterLength - beforeLength : 0;
+    if (!appended || actualAdded != take) {
+      webTransportDiagnostics.bufferAppendFailures++;
+      if (actualAdded < take) webTransportDiagnostics.bufferAppendBytesLost += (take - actualAdded);
+      if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+        diagnosticPrefix("WEB BUFFER FAIL");
+        Serial.print("route="); Serial.print(webResponseProfile.route);
+        Serial.print(" phase="); Serial.print(webOperationState.activePhase);
+        Serial.print(" wanted="); Serial.print(take);
+        Serial.print(" added="); Serial.print(actualAdded);
+        Serial.print(" buffer="); Serial.print(afterLength);
+        Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+      }
+    }
+    sampleWebResponseMemory();
     data += take;
     length -= take;
 
@@ -1722,14 +1801,27 @@ void beginWebResponseProfile(const char* route) {
   webResponseProfile.route = route;
   webWorkTimingCount = 0;
   webResponseBuffer.remove(0);
-  webResponseBuffer.reserve(WEB_RESPONSE_BUFFER_FLUSH_BYTES + 128);
+  if (!webResponseBuffer.reserve(WEB_RESPONSE_BUFFER_FLUSH_BYTES + 128)) {
+    webTransportDiagnostics.bufferReserveFailures++;
+    if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+      diagnosticPrefix("WEB BUFFER RESERVE FAIL");
+      Serial.print("route="); Serial.print(route); Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+    }
+  }
   webResponseBuffering = true;
+  webResponseProfile.bufferAppendFailuresAtStart = webTransportDiagnostics.bufferAppendFailures;
+  if (route && strcmp(route, "/") == 0) {
+    webResponseProfile.pageId = ++webTransportDiagnostics.nextPageId;
+    webTransportDiagnostics.rootPagesStarted++;
+  }
+  sampleWebResponseMemory();
   setWebOperationPhase("response-start");
 
   if (!webResponseProfile.active) return;
   webResponseProfile.startMs = millis();
   diagnosticPrefix("PAGE START");
   Serial.print("route="); Serial.print(route);
+  if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
   webResponseProfile.startMs = millis();
   webResponseProfile.phaseStartMs = webResponseProfile.startMs;
@@ -1748,8 +1840,10 @@ void diagnosticSendContent(const char* content) {
 // Purpose: Records elapsed work and send activity for one logical response-generation phase.
 void markWebResponsePhase(const char* phase) {
   setWebOperationPhase(phase);
+  sampleWebResponseMemory();
   if (webResponseProfile.active)
     flushDiagnosticWebResponseBuffer();
+  sampleWebResponseMemory();
   if (!webResponseProfile.active) return;
   uint32_t now = millis();
   uint32_t elapsedMs = (uint32_t)(now - webResponseProfile.phaseStartMs);
@@ -1759,6 +1853,7 @@ void markWebResponsePhase(const char* phase) {
   size_t sendBytes = webResponseProfile.sendBytes - webResponseProfile.phaseSendBytes;
   diagnosticPrefix("PAGE PHASE");
   Serial.print("route="); Serial.print(webResponseProfile.route);
+  if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" phase="); Serial.print(phase);
   Serial.print(" elapsed="); Serial.print(elapsedMs); Serial.print("ms");
   Serial.print(" sendTime="); Serial.print(sendTimeMs); Serial.print("ms");
@@ -1823,6 +1918,7 @@ void endWebResponseProfile() {
   uint32_t otherMs = totalMs >= webResponseProfile.sendTimeMs ? totalMs - webResponseProfile.sendTimeMs : 0;
   diagnosticPrefix("PAGE SUMMARY");
   Serial.print("route="); Serial.print(webResponseProfile.route);
+  if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" total="); Serial.print(totalMs); Serial.print("ms");
   Serial.print(" sendTime="); Serial.print(webResponseProfile.sendTimeMs); Serial.print("ms");
   Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
@@ -1831,8 +1927,22 @@ void endWebResponseProfile() {
   Serial.print(" maxSend="); Serial.print(webResponseProfile.maxSendMs); Serial.print("ms");
   Serial.print(" maxBytes="); Serial.print(webResponseProfile.maxSendBytes);
   Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount);
+  Serial.print(" minFree="); Serial.print(webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap);
+  Serial.print(" minLargest="); Serial.print(webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock);
+  Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
   recordDiagnosticEvent("PAGE SUMMARY", String(webResponseProfile.route) + " total=" + String(totalMs) + "ms send=" + String(webResponseProfile.sendTimeMs) + "ms other=" + String(otherMs) + "ms maxSend=" + String(webResponseProfile.maxSendMs) + "ms");
+  if (webResponseProfile.pageId) {
+    webTransportDiagnostics.rootPagesCompleted++;
+    webTransportDiagnostics.lastRootPageId = webResponseProfile.pageId;
+    webTransportDiagnostics.lastRootDurationMs = totalMs;
+    webTransportDiagnostics.lastRootAttemptedBytes = webResponseProfile.sendBytes;
+    webTransportDiagnostics.lastRootFooterAttemptedBytes = webResponseProfile.sendBytes >= webCurrentFooterStartBytes ? webResponseProfile.sendBytes - webCurrentFooterStartBytes : 0;
+    webTransportDiagnostics.lastRootSendCalls = webResponseProfile.sendCalls;
+    webTransportDiagnostics.lastRootSlowSends = webResponseProfile.slowSendCount;
+    webTransportDiagnostics.lastRootMinFreeHeap = webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap;
+    webTransportDiagnostics.lastRootMinLargestBlock = webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock;
+  }
   webResponseProfile.active = false;
   webResponseBuffering = false;
   webResponseBuffer.remove(0);
@@ -5597,8 +5707,13 @@ void handleWebScan() {
   }
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("X-Surveyor-Page-Id", String(webResponseProfile.pageId));
   server.send(200, "text/html", "");
-  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wi-Fi Survey</title>");
+  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wi-Fi Survey</title><meta name=\"ws38j-page-id\" content=\"");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent("\"><meta name=\"ws38j-marker\" content=\"HEAD\">");
   sendThemeBootstrapScript();
   diagnosticSendContent(pageStyles());
   diagnosticSendContent("</head><body><div class=\"container\">");
@@ -5684,46 +5799,119 @@ void handleWebScan() {
   diagnosticSendContent(dev);
   markWebResponsePhase("health-diagnostics");
 
-  diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
+  webCurrentFooterStartBytes = webResponseProfile.sendBytes + webResponseBuffer.length();
+  diagnosticSendContent("<!--WS38J_FOOTER_START:");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent("--><div class=\"footer\">ESP32 Web Interface</div>");
   sendSortableTableScript();
   sendThemeScript();
-  {
-    String refreshScript =
-      "<script>(function(){"
-      "let scan=" + String(scanCounter) + ";"
-      "const toggle=document.getElementById('live-updates-toggle');"
-      "const plotBssid='" + jsEscape(selectedBSSID) + "';"
-      "let pollBusy=false;let requestBusy=false;let lastDetailRefresh=0;const requestQueue=[];const queued={};"
-      "const scanButton=document.getElementById('wifi-scan-now');"
-      "const scanState=document.getElementById('wifi-scan-state');"
-      "const intervalInput=document.getElementById('interval');"
-      "const intervalApply=document.getElementById('wifi-interval-apply');"
-      "const intervalState=document.getElementById('interval-save-state');"
-      "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
-      "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
-      "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
-      "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-newest-data',s.newestData);text('wifi-retained-window',s.retainedWindow);text('wifi-last-scan-results',s.lastFound+' found; '+s.lastLogged+' logged; '+s.lastDropped+' dropped');text('wifi-last-ap-results',s.lastNewAps+' new; '+s.lastSeenAps+' previously seen');text('wifi-last-filter-results',s.lastHiddenSkipped+' hidden skipped; '+s.lastReclaimedAps+' slots reclaimed');if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));}"
-      "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
-      "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
-      "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Wi-Fi scan in progress…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
-      "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
-      "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
-      "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(job.id);if(e)e.innerHTML=h;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;requestBusy=false;pump();}}"
-      "function repaint(){enqueue('observed','/api/wifi/observed','wifi-observed-card');enqueue('channel','/api/wifi/channel','wifi-channel-region');if(plotBssid)enqueue('plot','/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),'rssi-plot');}"
-      "async function poll(){if(!toggle||!toggle.checked||pollBusy||requestBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;pump();}}"
-      "setTimeout(repaint,250);setInterval(poll,2000);"
-      "})();</script>";
-    diagnosticSendContent(refreshScript);
-  }
-  diagnosticSendContent("</div></body></html>");
+  diagnosticSendContent("<!--WS38J_GUARD_START:");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent("--><script>(function(){const p=");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent(";window.__WS38J={pageId:p,guard:true,loader:false,repaint:false,tail:false};"
+    "window.__ws38jReport=function(s,d){try{fetch('/api/web/client-diag?p='+p+'&s='+encodeURIComponent(s)+(d?'&d='+encodeURIComponent(String(d).slice(0,48)):''),{method:'POST',cache:'no-store'}).catch(()=>{});}catch(e){}};"
+    "window.addEventListener('error',function(e){window.__ws38jReport('error',(e.message||'error')+'@'+(e.lineno||0));});"
+    "window.addEventListener('unhandledrejection',function(e){window.__ws38jReport('reject',String(e.reason||'reject'));});"
+    "window.__ws38jReport('guard','ok');})();</script><!--WS38J_GUARD_END-->");
+  // V38j: independent guard/tail markers plus browser stage reports distinguish
+  // generation, buffering, transport, parse, and execution failures.
+  diagnosticSendContent("<!--WS38J_DEFERRED_START:");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent("--><script>(function(){const pageId=");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent(";if(window.__WS38J)window.__WS38J.loader=true;if(window.__ws38jReport)window.__ws38jReport('loader','enter');let scan=");
+  diagnosticSendContent(String(scanCounter));
+  diagnosticSendContent(";const toggle=document.getElementById('live-updates-toggle');const plotBssid='");
+  diagnosticSendContent(jsEscape(selectedBSSID));
+  diagnosticSendContent("';let pollBusy=false;let requestBusy=false;let lastDetailRefresh=0;const requestQueue=[];const queued={};"
+    "const scanButton=document.getElementById('wifi-scan-now');const scanState=document.getElementById('wifi-scan-state');"
+    "const intervalInput=document.getElementById('interval');const intervalApply=document.getElementById('wifi-interval-apply');"
+    "const intervalState=document.getElementById('interval-save-state');"
+    "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
+    "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
+    "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
+    "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);"
+    "text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-newest-data',s.newestData);text('wifi-retained-window',s.retainedWindow);"
+    "text('wifi-last-scan-results',s.lastFound+' found; '+s.lastLogged+' logged; '+s.lastDropped+' dropped');"
+    "text('wifi-last-ap-results',s.lastNewAps+' new; '+s.lastSeenAps+' previously seen');"
+    "text('wifi-last-filter-results',s.lastHiddenSkipped+' hidden skipped; '+s.lastReclaimedAps+' slots reclaimed');"
+    "if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);"
+    "text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);"
+    "text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);"
+    "text('wifi-health-duration',s.scanDuration);text('wifi-retry-state',");
+  diagnosticSendContent(String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1));
+  diagnosticSendContent("+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);"
+    "text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; ");
+  diagnosticSendContent(String((wifiApTableCapacity * sizeof(WifiApEntry)) / 1024.0, 1));
+  diagnosticSendContent(" KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');"
+    "text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');"
+    "text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');"
+    "text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');"
+    "text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);"
+    "show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');"
+    "showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));}"
+    "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;"
+    "v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';"
+    "fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();})"
+    ".then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}})"
+    ".catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
+    "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){"
+    "if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
+    "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Wi-Fi scan in progress…');fetch('/scan-now',{cache:'no-store'})"
+    ".then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.message||''));})"
+    ".catch(function(){showScanState(false,'Unable to start scan');});});}"
+    "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
+    "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
+    "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;"
+    "try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();"
+    "const e=document.getElementById(job.id);if(e)e.innerHTML=h;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;"
+    "requestBusy=false;pump();}}"
+    "function repaint(){if(window.__WS38J)window.__WS38J.repaint=true;if(window.__ws38jReport)window.__ws38jReport('repaint','enter');"
+    "enqueue('observed','/api/wifi/observed?p='+pageId,'wifi-observed-card');enqueue('channel','/api/wifi/channel?p='+pageId,'wifi-channel-region');"
+    "if(plotBssid)enqueue('plot','/api/wifi/plot?bssid='+encodeURIComponent(plotBssid)+'&p='+pageId,'rssi-plot');}"
+    "async function poll(){if(!toggle||!toggle.checked||pollBusy||requestBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});"
+    "if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;"
+    "if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;pump();}}"
+    "setTimeout(repaint,250);setInterval(poll,2000);})();</script><!--WS38J_DEFERRED_END-->");
+  diagnosticSendContent("<script>(function(){if(window.__WS38J)window.__WS38J.tail=true;if(window.__ws38jReport)window.__ws38jReport('tail','ok');})();</script><!--WS38J_PAGE_END:");
+  diagnosticSendContent(String(webResponseProfile.pageId));
+  diagnosticSendContent("--></div></body></html>");
   diagnosticSendContent("");
   markWebResponsePhase("footer-scripts");
   endWebResponseProfile();
 }
 
 
+// Purpose: Records tiny browser-side execution breadcrumbs for root-cause isolation.
+void handleWebClientDiagnostic() {
+  uint32_t pageId = server.hasArg("p") ? (uint32_t)server.arg("p").toInt() : 0;
+  String stage = server.hasArg("s") ? server.arg("s") : String("");
+  String detail = server.hasArg("d") ? server.arg("d") : String("");
+  webTransportDiagnostics.browserReports++;
+  webTransportDiagnostics.lastBrowserPageId = pageId;
+  webTransportDiagnostics.lastBrowserReportMs = millis();
+  snprintf(webTransportDiagnostics.lastBrowserStage, sizeof(webTransportDiagnostics.lastBrowserStage), "%s", stage.c_str());
+  snprintf(webTransportDiagnostics.lastBrowserDetail, sizeof(webTransportDiagnostics.lastBrowserDetail), "%s", detail.c_str());
+  if (stage == "guard") webTransportDiagnostics.lastGuardPageId = pageId;
+  else if (stage == "loader") webTransportDiagnostics.lastLoaderPageId = pageId;
+  else if (stage == "repaint") webTransportDiagnostics.lastRepaintPageId = pageId;
+  else if (stage == "tail") webTransportDiagnostics.lastTailPageId = pageId;
+  else if (stage == "error" || stage == "reject") webTransportDiagnostics.browserErrorReports++;
+  if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+    diagnosticPrefix("BROWSER");
+    Serial.print("pageId="); Serial.print(pageId);
+    Serial.print(" stage="); Serial.print(stage);
+    if (detail.length()) { Serial.print(" detail="); Serial.print(detail); }
+    Serial.println();
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(204, "text/plain", "");
+}
+
 // Purpose: Returns only the Observed Networks card content for live-update repainting.
 void handleWifiObservedFragment() {
+  if (server.hasArg("p")) webTransportDiagnostics.lastObservedRequestPageId = (uint32_t)server.arg("p").toInt();
   if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
   beginWebResponseProfile("/api/wifi/observed");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -5742,6 +5930,7 @@ void handleWifiObservedFragment() {
 
 // Purpose: Returns only the selected Wi-Fi RSSI plot fragment for live-update repainting.
 void handleWifiPlotFragment() {
+  if (server.hasArg("p")) webTransportDiagnostics.lastPlotRequestPageId = (uint32_t)server.arg("p").toInt();
   if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
   beginWebResponseProfile("/api/wifi/plot");
   String selectedBSSID = server.hasArg("bssid") ? server.arg("bssid") : "";
@@ -5770,6 +5959,7 @@ void handleWifiPlotFragment() {
 
 // Purpose: Returns the current Wi-Fi channel-analysis card for live-update repainting.
 void handleWifiChannelFragment() {
+  if (server.hasArg("p")) webTransportDiagnostics.lastChannelRequestPageId = (uint32_t)server.arg("p").toInt();
   if (!allowExpensiveWebFragment()) { sendExpensiveWebDeferred(); return; }
   beginWebResponseProfile("/api/wifi/channel");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -7413,6 +7603,38 @@ void handleStatusJsonExport() {
   diagnosticSendContent("},\n");
   markWebResponsePhase("web-resilience");
 
+  diagnosticSendContent("  \"webTransport\":{");
+  diagnosticSendContent("\"rootPagesStarted\":" + String(webTransportDiagnostics.rootPagesStarted));
+  diagnosticSendContent(",\"rootPagesCompleted\":" + String(webTransportDiagnostics.rootPagesCompleted));
+  diagnosticSendContent(",\"lastRootPageId\":" + String(webTransportDiagnostics.lastRootPageId));
+  diagnosticSendContent(",\"lastRootDurationMs\":" + String(webTransportDiagnostics.lastRootDurationMs));
+  diagnosticSendContent(",\"lastRootAttemptedBytes\":" + String(webTransportDiagnostics.lastRootAttemptedBytes));
+  diagnosticSendContent(",\"lastRootFooterAttemptedBytes\":" + String(webTransportDiagnostics.lastRootFooterAttemptedBytes));
+  diagnosticSendContent(",\"lastRootSendCalls\":" + String(webTransportDiagnostics.lastRootSendCalls));
+  diagnosticSendContent(",\"lastRootSlowSends\":" + String(webTransportDiagnostics.lastRootSlowSends));
+  diagnosticSendContent(",\"lastRootMinFreeHeap\":" + String(webTransportDiagnostics.lastRootMinFreeHeap));
+  diagnosticSendContent(",\"lastRootMinLargestBlock\":" + String(webTransportDiagnostics.lastRootMinLargestBlock));
+  diagnosticSendContent(",\"bufferReserveFailures\":" + String(webTransportDiagnostics.bufferReserveFailures));
+  diagnosticSendContent(",\"bufferAppendFailures\":" + String(webTransportDiagnostics.bufferAppendFailures));
+  diagnosticSendContent(",\"bufferAppendBytesLost\":" + String(webTransportDiagnostics.bufferAppendBytesLost));
+  diagnosticSendContent(",\"clientDisconnectedBeforeSend\":" + String(webTransportDiagnostics.clientDisconnectedBeforeSend));
+  diagnosticSendContent(",\"clientDisconnectedAfterSend\":" + String(webTransportDiagnostics.clientDisconnectedAfterSend));
+  diagnosticSendContent(",\"browserReports\":" + String(webTransportDiagnostics.browserReports));
+  diagnosticSendContent(",\"browserErrorReports\":" + String(webTransportDiagnostics.browserErrorReports));
+  diagnosticSendContent(",\"lastBrowserPageId\":" + String(webTransportDiagnostics.lastBrowserPageId));
+  diagnosticSendContent(",\"lastBrowserReportMs\":" + String(webTransportDiagnostics.lastBrowserReportMs));
+  diagnosticSendContent(",\"lastBrowserStage\":" + jsonQuoted(String(webTransportDiagnostics.lastBrowserStage)));
+  diagnosticSendContent(",\"lastBrowserDetail\":" + jsonQuoted(String(webTransportDiagnostics.lastBrowserDetail)));
+  diagnosticSendContent(",\"lastGuardPageId\":" + String(webTransportDiagnostics.lastGuardPageId));
+  diagnosticSendContent(",\"lastLoaderPageId\":" + String(webTransportDiagnostics.lastLoaderPageId));
+  diagnosticSendContent(",\"lastRepaintPageId\":" + String(webTransportDiagnostics.lastRepaintPageId));
+  diagnosticSendContent(",\"lastTailPageId\":" + String(webTransportDiagnostics.lastTailPageId));
+  diagnosticSendContent(",\"lastObservedRequestPageId\":" + String(webTransportDiagnostics.lastObservedRequestPageId));
+  diagnosticSendContent(",\"lastChannelRequestPageId\":" + String(webTransportDiagnostics.lastChannelRequestPageId));
+  diagnosticSendContent(",\"lastPlotRequestPageId\":" + String(webTransportDiagnostics.lastPlotRequestPageId));
+  diagnosticSendContent("},\n");
+  markWebResponsePhase("web-transport");
+
   size_t eventsToInclude = diagnosticExportEventLimit < diagnosticEventCount ? diagnosticExportEventLimit : diagnosticEventCount;
   size_t firstEvent = diagnosticEventCount - eventsToInclude;
   diagnosticSendContent("  \"recentDiagnosticEvents\":{");
@@ -7823,6 +8045,7 @@ void startWebServer() {
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
   server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
   server.on("/api/ping", HTTP_GET, []() { handleApiPing(); });
+  server.on("/api/web/client-diag", HTTP_POST, []() { handleWebClientDiagnostic(); });
   server.on("/restart-device", HTTP_POST, []() { runDiagnosticWebHandler("/restart-device", handleSystemRestart); });
   server.on("/status.json", HTTP_GET, []() { runDiagnosticWebHandler("/status.json", handleStatusJsonExport); });
   server.on("/api/diag/event-limit", HTTP_POST, []() { runDiagnosticWebHandler("/api/diag/event-limit", handleDiagnosticEventLimit); });
