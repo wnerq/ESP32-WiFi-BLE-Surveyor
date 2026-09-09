@@ -1,14 +1,16 @@
 // ESP32 Wireless Surveyor firmware.
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
-// Improve mobile survey resilience, freshness, and AP identity reuse
+// Git commit:
+// Complete contextual help, restart safeguards, and survey-control parity
 //
-// - reclaim the least-recently-seen unreferenced AP-table identity safely
-// - default hidden-network history capture off while preserving live RF analysis
-// - expose newest-observation and per-scan new/known/logged/drop diagnostics
-// - recover asynchronous Wi-Fi scans that remain pending for 60 seconds
-// - invoke saved-infrastructure reconnect detection after completed surveys
-// - add explicit mobile-friendly Apply controls
+// - restore the Bluetooth interval Apply control and reliable BLE enable reconnect flow
+// - add Wi-Fi scan progress/completion feedback matching Bluetooth survey status
+// - add 99 percent Wi-Fi and Bluetooth developer history prefill targets
+// - add a guarded System restart control with explicit destructive-history warning
+// - make diagnostics and configuration exports cover current System data and settings
+// - add version-agnostic contextual card help plus a deep-linked Help page
+// - preserve RSSI guidance through live refresh and make plots theme-aware
 //
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
@@ -33,8 +35,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38e_mobile_survey_resilience.ino";
-const char* FIRMWARE_VERSION = "38e";
+const char* FIRMWARE_FILE = "WifiConnect38f_context_help_resilience.ino";
+const char* FIRMWARE_VERSION = "38f";
 
 
 Preferences preferences;
@@ -338,7 +340,7 @@ WifiScanMetadata* wifiScanMetadata = nullptr;
 size_t wifiScanMetadataCapacity = 0;
 size_t wifiApTableFullDrops = 0;
 size_t wifiApReclamationCount = 0;
-bool captureHiddenNetworks = false;
+bool captureHiddenNetworks = true;
 uint16_t wifiLastScanFound = 0;
 uint16_t wifiLastScanLogged = 0;
 uint16_t wifiLastScanDropped = 0;
@@ -759,7 +761,7 @@ void loadSurveyModeSettings() {
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
-  captureHiddenNetworks = preferences.getBool("captureHidden", false);
+  captureHiddenNetworks = preferences.getBool("captureHidden", true);
   scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
   bleScanIntervalSeconds = preferences.getULong("bleInterval", bleScanIntervalSeconds);
   if (scanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS) scanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
@@ -2446,7 +2448,7 @@ int performLoggedScan() {
   if (networkCount >= 0) recordWifiScanDuration(scanDurationMs);
   lastAutoScanMs = millis();
   wifiAutoScanRetryPending = false;
-  wifiScanStatusMessage = "Complete";
+  wifiScanStatusMessage = "Scan complete: " + String(networkCount >= 0 ? networkCount : 0) + " network(s) found.";
   return result;
 }
 
@@ -2478,7 +2480,7 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   wifiScanInProgress = true;
   wifiInitialScanCheckpointPending =
       wifiInitialScanCheckpointPending || initialCheckpoint;
-  wifiScanStatusMessage = "Scanning";
+  wifiScanStatusMessage = "Wi-Fi scan in progress...";
   startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
   return true;
 }
@@ -2528,7 +2530,7 @@ void serviceLoggedWifiScan() {
     wifiAutoScanCompletionCount++;
     lastWifiAutoScanCompletionMs = millis();
   }
-  wifiScanStatusMessage = "Complete";
+  wifiScanStatusMessage = "Scan complete: " + String(result) + " network(s) found.";
   if (scanDurationMs >= 15000 || (diagnosticStreamingEnabled && diagnosticSurveyEvents))
     recordDiagnosticEvent("WIFI SCAN", "seq=" + String(scanCounter) + " dur=" + String(scanDurationMs) + "ms found=" + String(wifiLastScanFound) + " log=" + String(wifiLastScanLogged) + " drop=" + String(wifiLastScanDropped));
   WiFi.scanDelete();
@@ -4343,6 +4345,43 @@ String pageStyles() {
     color: var(--button-text);
   }
 
+  .card > h2 {
+    position: relative;
+    padding-right: 38px;
+  }
+
+  .card-help-link {
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    color: var(--text);
+    background: var(--card-bg);
+    text-decoration: none;
+    font-size: 0.85em;
+    font-weight: bold;
+  }
+
+  .card-help-standard, .card-help-developer {
+    color: var(--muted);
+    font-size: 0.92em;
+    margin: 0 0 12px 0;
+    line-height: 1.4;
+  }
+
+  .card-help-developer { display: none; }
+  html[data-view="developer"] .card-help-developer { display: block; }
+
+  .help-section { scroll-margin-top: 150px; }
+  .help-section h2 { text-align: left; padding-right: 0; }
+
   .badge {
     display: inline-block;
     padding: 3px 7px;
@@ -4953,7 +4992,7 @@ void sendRssiHistoryPlot(const String& selectedBssid) {
 
   labels +=
     "<text x=\"15\" y=\"128\" transform=\"rotate(-90 15 128)\" "
-    "text-anchor=\"middle\" font-size=\"12\">RSSI (dBm)</text>";
+    "class=\"plot-text\" text-anchor=\"middle\" font-size=\"12\">RSSI (dBm)</text>";
 
   diagnosticSendContent(labels);
   diagnosticSendContent("</svg></div>");
@@ -5150,6 +5189,60 @@ String activeNavClass(const String& active, const char* item) {
   return active == item ? " class=\"active\"" : "";
 }
 
+// Purpose: Adds contextual card guidance and stable deep links without duplicating help markup in each page renderer.
+String contextHelpScript() {
+  return R"rawliteral(
+<script>
+(function(){
+  const help={
+    'Survey Status & Controls':['survey-controls','Shows whether surveying is active, when the last scan ran, and the controls that affect scan timing. Use it to confirm the survey is actually collecting data.','Scan state and counters are live scheduler indicators. Interval changes affect future automatic starts; Live Updates only refresh the browser.'],
+    'History':['history','Shows how much survey data is retained and how far back it reaches. Older observations roll out as the buffer fills.','Capacity reflects compact observations plus supporting identity and scan metadata; retained time depends on scan interval and observations per scan.'],
+    'RSSI History':['rssi-history','Plots retained signal strength for one selected network or device. Hover over a point to see details for that observation.','RSSI is shown in dBm on a fixed scale so plots are comparable. Each point represents one retained scan observation.'],
+    'Observed Networks':['observed-networks','Lists Wi-Fi access points currently represented in retained history. Select a network to inspect its RSSI history.','Rows are grouped by BSSID, not SSID, so multiple radios advertising the same network name remain distinct.'],
+    'Observed Devices':['observed-devices','Lists Bluetooth devices currently represented in retained history. Select a device to inspect its RSSI history.','Bluetooth addresses may be public, static-random, or private; address type affects how useful identity and vendor interpretation can be.'],
+    'Observed Channel Interference':['channel-analysis','Summarizes the Wi-Fi activity seen across 2.4 GHz channels and suggests a less-congested channel.','The estimate weights observed RSSI plus co-channel and adjacent-channel overlap; it is not an airtime-utilization or noise-floor measurement.'],
+    'Infrastructure Wi-Fi':['infrastructure-wifi','Shows the network connection used to reach the surveyor through your existing Wi-Fi. Surveying can continue even when this connection is unavailable.','Use RSSI, channel, BSSID, and reconnect diagnostics to separate infrastructure connectivity from survey-radio behavior.'],
+    'Survey Health':['survey-health','Summarizes whether automatic surveying and its supporting checks are operating normally.','Warnings identify timing, allocation, or integrity conditions that merit investigation without necessarily stopping the survey.'],
+    'Survey Scheduler Diagnostics':['scheduler-diagnostics','Shows detailed timing and retry information for automatic scan scheduling.','Use these counters to distinguish scan-start failures, completion failures, interaction deferral, and retry-backoff behavior.'],
+    'CSV Diagnostics':['csv-diagnostics','Shows how often survey CSV files have been exported and how the most recent export performed.','Useful for spotting long-running exports or response delays when history is near capacity.'],
+    'Wi-Fi Memory Diagnostics':['wifi-memory','Shows Wi-Fi history table sizes, identity usage, and heap margin.','Watch free heap, largest block, AP-table utilization, and history-integrity checks when stress testing near capacity.'],
+    'BLE Implementation Diagnostics':['ble-memory','Shows Bluetooth history-table usage and memory pressure.','Use address/metadata utilization and heap metrics to evaluate dual-radio allocation pressure.'],
+    'Device':['device','Identifies the running firmware, hardware, build, and uptime. This is the first place to confirm what device and software you are looking at.','Firmware/core/IDF and reset information are useful when reproducing behavior across builds or boards.'],
+    'System Health':['system-health','Provides an at-a-glance PASS/WARN summary of the surveyor. Open the deeper view when a warning appears.','Health combines survey cadence, history integrity, memory, reset, storage, and application-space checks.'],
+    'Memory':['memory','Shows available working memory and the lowest memory margin seen since startup. Low memory can reduce responsiveness or prevent operations from completing.','Minimum free heap shows peak pressure; largest free block helps distinguish total free memory from fragmentation.'],
+    'Network':['network','Shows how the device is connected and the addresses used to reach its web interface.','Use interface mode, MACs, channel, reconnect count, AP state, and mDNS state when diagnosing connectivity.'],
+    'Diagnostics Export':['diagnostics-export','Downloads a JSON snapshot of System information and recent diagnostic events for troubleshooting or comparison.','The export mirrors current System state and includes bounded RAM diagnostic history plus the current configuration snapshot.'],
+    'Restart Device':['restart-device','Restarts the surveyor without changing saved settings. Current survey history is preserved when the restart checkpoint can hold it.','A failed checkpoint blocks the safe restart path; destructive restart requires explicit confirmation so stale or current history is not silently lost.'],
+    'Boot Heap Checkpoints':['boot-heap','Shows memory at major startup stages so you can see where RAM is consumed.','Compare free heap, minimum heap, and largest block across initialization stages to isolate subsystem costs.'],
+    'Session':['session','Shows whether survey history was restored through a controlled restart and the current restart-preservation status.','Restart checkpoints are temporary continuity data and are consumed after successful restore.'],
+    'History Test Tools':['history-test-tools','Developer-only controls fill history with synthetic observations for near-capacity UI and rollover testing.','Synthetic data exercises compact history/table behavior but is not a substitute for radio or endurance testing.'],
+    'Infrastructure Network':['settings-network','Configures the existing Wi-Fi network the surveyor can join for browser access.','Credentials are stored separately and are intentionally excluded from configuration export.'],
+    'Device Hostname':['device-identity','Configures the friendly local hostname used to reach the surveyor on networks that support mDNS.','Changing the hostname requires restart because mDNS advertisement is initialized at boot.'],
+    'Device AP':['device-ap','Configures the surveyor\'s own Wi-Fi access point, which provides direct browser access when infrastructure Wi-Fi is unavailable.','Changing AP state, SSID, or password requires restart and can affect how you reconnect to the device.'],
+    'Survey Mode':['survey-mode','Enables or disables Bluetooth surveying. Bluetooth uses additional RAM, so changing this mode resizes survey memory at restart.','BLE is initialized at boot; history allocations are sized after the selected radio mode is known.'],
+    'Wi-Fi Capture':['wifi-capture','Controls whether hidden Wi-Fi networks consume retained-history capacity. Hidden networks are still detected for channel analysis when retention is disabled.','The filter applies to future observations only; existing hidden records age out normally.'],
+    'Interface & Indicators':['interface-indicators','Controls device indicators and explains browser-local display choices.','Theme and View are browser-local; status LED state is stored on the surveyor.'],
+    'Configuration Backup & Restore':['configuration','Exports and restores non-secret device settings so a configuration can be reproduced without re-entering every option.','Import validates the complete schema before writing settings; credential fields are intentionally excluded.']
+  };
+  function baseTitle(t){return (t||'').split('—')[0].split('–')[0].replace(/\s+/g,' ').trim();}
+  function slug(t){return baseTitle(t).toLowerCase().replace(/&/g,'and').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'about-cards';}
+  function decorate(card){
+    if(!card)return;
+    const h=card.querySelector(':scope > h2'); if(!h||h.querySelector('.card-help-link'))return;
+    const key=baseTitle(h.textContent); const d=help[key]||['about-cards','This card groups information or controls related to '+key+'. Use it to understand or operate this part of the surveyor.','Developer view exposes additional implementation and diagnostic detail for this card.'];
+    const a=document.createElement('a');a.className='card-help-link';a.href='/help#'+d[0];a.textContent='?';a.title='Help: '+key;a.setAttribute('aria-label','Help: '+key);h.appendChild(a);
+    const std=document.createElement('div');std.className='card-help-standard';std.textContent=d[1];h.insertAdjacentElement('afterend',std);
+    const dev=document.createElement('div');dev.className='card-help-developer developer-only';dev.textContent=d[2];std.insertAdjacentElement('afterend',dev);
+    card.dataset.helpReady='1';
+  }
+  function run(root){(root||document).querySelectorAll('.card').forEach(decorate);}
+  function start(){run(document);new MutationObserver(function(ms){for(const m of ms){for(const n of m.addedNodes){if(n.nodeType===1){if(n.matches&&n.matches('.card'))decorate(n);if(n.closest)decorate(n.closest('.card'));run(n);}}}}).observe(document.body,{childList:true,subtree:true});}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+})();
+</script>
+)rawliteral";
+}
+
 // Purpose: Streams the common site header, navigation links, Live Updates control, and view/theme controls.
 void sendSiteNavigation(const String& active) {
   String nav;
@@ -5159,6 +5252,7 @@ void sendSiteNavigation(const String& active) {
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
   nav += "<a href=\"/settings\"" + activeNavClass(active, "settings") + ">Settings</a>";
+  nav += "<a href=\"/help\"" + activeNavClass(active, "help") + ">Help</a>";
   nav += "</nav><label class=\"live-control\"><input id=\"live-updates-toggle\" type=\"checkbox\"";
   if (webAutoRefreshEnabled) nav += " checked";
   nav += "> Live updates</label></div></div>";
@@ -5175,6 +5269,7 @@ void sendSiteNavigation(const String& active) {
     "});"
     "})();</script>"
   );
+  diagnosticSendContent(contextHelpScript());
 }
 
 // Purpose: Streams the Standard/Advanced/Developer view selector and System/Light/Dark theme selector.
@@ -5482,7 +5577,7 @@ void handleWebScan() {
   if (selectedBSSID.length() > 0) {
     diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(selectedBSSID) + "</span></div>");
     sendRssiHistoryPlot(selectedBSSID);
-    diagnosticSendContent("<div class=\"note\">Click a network below to plot that access point's retained RSSI history.</div>");
+    diagnosticSendContent("<div class=\"note\">Select a network in Observed Networks to plot that access point's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
   } else diagnosticSendContent("<p>No logged networks are available to plot yet.</p>");
   diagnosticSendContent("</div>");
   markWebResponsePhase("rssi");
@@ -5558,12 +5653,12 @@ void handleWebScan() {
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
       "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
-      "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-retained-window',s.retainedWindow);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Scanning…':'');}"
+      "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-retained-window',s.retainedWindow);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('wifi-health-auto',s.autoDiagnostic);text('wifi-health-starts',s.autoStarts);text('wifi-health-completions',s.autoCompletions);text('wifi-health-start-failures',s.autoStartFailures);text('wifi-health-completion-failures',s.autoCompletionFailures);text('wifi-health-last-start',s.lastAutoStart);text('wifi-health-last-completion',s.lastAutoCompletion);text('wifi-health-duration',s.scanDuration);text('wifi-retry-state'," + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS / 1000.0f, 1) + "+' s; '+(s.autoRetryPending?'retry pending':'idle'));text('wifi-csv-count',s.csvExports);text('wifi-csv-last',s.lastCsv);text('wifi-ap-table',s.apCount+' / '+s.apCapacity+'; " + String((wifiApTableCapacity*sizeof(WifiApEntry))/1024.0,1) + " KB');text('wifi-history-integrity',s.historyIntegrityAnomalies===0?'PASS':'WARN - '+s.historyIntegrityAnomalies+' anomaly(s)');text('wifi-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('wifi-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('wifi-infra-status',s.connected?'Connected':'Not connected');text('wifi-infra-ssid',s.connected?s.stationSSID:'-');text('wifi-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('wifi-infra-channel',s.connected?s.stationChannel:'-');text('wifi-infra-bssid',s.connected?s.stationBSSID:'-');show('wifi-auto-warning',String(s.autoDiagnostic).startsWith('WARN'),s.autoDiagnostic);show('wifi-ap-drop-warning',s.apDrops>0,s.apDrops+' Wi-Fi observation(s) were not logged because no AP table slot was available.');showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
-      "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Scanning…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Scanning…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
+      "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Wi-Fi scan in progress…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
       "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/wifi/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-observed-card');if(e)e.innerHTML=h;}),fetch('/api/wifi/channel',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('wifi-channel-region');if(e)e.innerHTML=h;})];if(plotBssid){jobs.push(fetch('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
-      "setInterval(function(){fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);else showScanState(!!s.scanning,s.scanning?'Scanning…':'');if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);"
+      "setInterval(function(){fetch('/api/wifi/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);else showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.scanStatus||''));if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);"
       "})();</script>";
     diagnosticSendContent(refreshScript);
   }
@@ -5603,11 +5698,12 @@ void handleWifiPlotFragment() {
       diagnosticSendContent("<h2>RSSI History &mdash; " + htmlEscape(displaySSID) + "</h2>");
       diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BSSID</span><span class=\"value\">" + htmlEscape(selectedBSSID) + "</span></div>");
       sendRssiHistoryPlot(selectedBSSID);
+      diagnosticSendContent("<div class=\"note\">Select a network in Observed Networks to plot that access point's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
     } else {
       diagnosticSendContent("<h2>RSSI History</h2><p>The selected network is no longer retained.</p>");
     }
   } else {
-    diagnosticSendContent("<h2>RSSI History</h2><p>Select a network below to display RSSI history.</p>");
+    diagnosticSendContent("<h2>RSSI History</h2><p>Select a network in Observed Networks to display its retained RSSI history. Hover over a point on the graph to see details for that observation.</p>");
   }
   diagnosticSendContent("");
 }
@@ -5936,11 +6032,11 @@ void handleBLESurvey() {
     "<div class=\"row\"><span class=\"label\">Last Scan</span><span id=\"ble-last-scan\" class=\"value\">" + (bleScanCounter ? htmlEscape(observationAgeLabel(lastBleScanUptimeMs)) : String("Never")) + "</span></div>"
     "<div class=\"survey-control-row\"><div class=\"control\"><label for=\"ble-interval\">Scan Interval (seconds)</label>"
     "<input id=\"ble-interval\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(bleScanIntervalSeconds) + "\"></div>"
-    "<span id=\"ble-interval-save-state\" class=\"save-state\"></span></div>"
+    "<button class=\"button\" type=\"button\" id=\"ble-interval-apply\">Apply Interval</button><span id=\"ble-interval-save-state\" class=\"save-state\"></span></div>"
     "<div class=\"buttons\"><a class=\"button\" href=\"/ble-scan\">Scan Now</a><a class=\"button\" href=\"/ble\">Refresh Page</a></div>"
     "<form class=\"controls\" action=\"/ble-mode\" method=\"post\"><input type=\"hidden\" name=\"enabled\" value=\"0\"><button type=\"submit\">Disable Bluetooth Survey</button></form>"
     "<div id=\"ble-scan-state\" class=\"scan-state\"></div>"
-    "<div class=\"note\">Bluetooth surveying runs automatically whenever Bluetooth Survey is enabled. Changing the interval saves immediately. Bluetooth surveying significantly reduces available Wi-Fi history capacity.</div>"
+    "<div class=\"note\">Bluetooth surveying runs automatically whenever Bluetooth Survey is enabled. Use Apply Interval to save a change. Bluetooth surveying significantly reduces available Wi-Fi history capacity.</div>"
     "<div id=\"ble-status-note\" class=\"note\">" + htmlEscape(bleStatusMessage) + "</div></div>";
 
   status += "<div class=\"card\"><h2>History</h2>"
@@ -5960,7 +6056,7 @@ void handleBLESurvey() {
   if (selectedAddress.length()) {
     diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BLE Address</span><span class=\"value\">" + htmlEscape(selectedAddress) + "</span></div>");
     sendBleRssiHistoryPlot(selectedAddress);
-    diagnosticSendContent("<div class=\"note\">Click a device below to redraw this plot.</div>");
+    diagnosticSendContent("<div class=\"note\">Select a device in Observed Devices to plot that device's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
   } else diagnosticSendContent("<p>No logged BLE addresses are available to plot yet.</p>");
   diagnosticSendContent("</div>");
   markWebResponsePhase("rssi");
@@ -6002,11 +6098,11 @@ void handleBLESurvey() {
   sendThemeScript();
   {
     String refreshScript =
-      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;const intervalInput=document.getElementById('ble-interval');const intervalState=document.getElementById('ble-interval-save-state');"
+      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak " + String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak " + String(bleScanMetadataPeakUsed) + "');text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/ble/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
-      "if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
+      "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "async function repaint(){if(updating)return;updating=true;try{const jobs=[fetch('/api/ble/observed',{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('ble-observed-card');if(e)e.innerHTML=h;})];if(address){jobs.push(fetch('/api/ble/plot?address='+encodeURIComponent(address),{cache:'no-store'}).then(r=>r.text()).then(h=>{const e=document.getElementById('rssi-plot');if(e)e.innerHTML=h;}));}await Promise.all(jobs);}catch(e){}finally{updating=false;}}"
       "setInterval(function(){fetch('/api/ble/status',{cache:'no-store'}).then(r=>r.json()).then(function(s){if(toggle&&toggle.checked)applyStatus(s);if(s.scan!==scan){scan=s.scan;if(toggle&&toggle.checked)repaint();}}).catch(function(){});},2000);})();</script>";
     diagnosticSendContent(refreshScript);
@@ -6040,8 +6136,9 @@ void handleBlePlotFragment() {
     diagnosticSendContent("<h2>RSSI History &mdash; " + htmlEscape(identity) + "</h2>");
     diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BLE Address</span><span class=\"value\">" + htmlEscape(selectedAddress) + "</span></div>");
     sendBleRssiHistoryPlot(selectedAddress);
+    diagnosticSendContent("<div class=\"note\">Select a device in Observed Devices to plot that device's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
   } else {
-    diagnosticSendContent("<h2>RSSI History</h2><p>Select a BLE address below to display RSSI history.</p>");
+    diagnosticSendContent("<h2>RSSI History</h2><p>Select a device in Observed Devices to display its retained RSSI history. Hover over a point on the graph to see details for that observation.</p>");
   }
   diagnosticSendContent("");
 }
@@ -6245,6 +6342,13 @@ void handleSystemStatus() {
     "<script>(function(){const i=document.getElementById('diag-event-limit');const st=document.getElementById('diag-event-limit-state');if(!i)return;async function save(){let v=parseInt(i.value,10);if(!Number.isFinite(v))return;v=Math.max(0,Math.min(" + String(DIAGNOSTIC_EVENT_CAPACITY) + ",v));i.value=v;if(st)st.textContent='Saving…';try{const r=await fetch('/api/diag/event-limit?events='+encodeURIComponent(v),{method:'POST',cache:'no-store'});if(!r.ok)throw new Error();const j=await r.json();i.value=j.events;if(st){st.textContent='Saved';setTimeout(()=>{st.textContent='';},1400);}}catch(e){if(st)st.textContent='Save failed';}}i.addEventListener('change',save);i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();save();i.blur();}});})();</script>");
   markWebResponsePhase("diagnostics-export");
 
+  diagnosticSendContent("<div class=\"card\"><h2>Restart Device</h2>"
+    "<div class=\"note\">Restarts the surveyor without changing saved settings. Current survey history is preserved when it can be saved for the restart.</div>"
+    "<div class=\"buttons\"><button class=\"button\" type=\"button\" id=\"system-restart-button\" onclick=\"requestSystemRestart()\">Restart Device</button></div>"
+    "<div id=\"system-restart-warning\" class=\"note\"></div></div>"
+    "<script>async function requestSystemRestart(){const w=document.getElementById('system-restart-warning');const b=document.getElementById('system-restart-button');if(b)b.disabled=true;if(w)w.textContent='Preparing a safe restart...';try{let r=await fetch('/restart-device',{method:'POST',cache:'no-store'});if(r.status===409){const message='Restarting will erase all current Wi-Fi and Bluetooth survey history. The current survey history cannot be preserved through this restart. Download the Wi-Fi and Bluetooth CSV files before restarting if you want to keep this data.';if(w)w.textContent=message;if(!confirm(message+'\n\nRestart and erase history?')){if(b)b.disabled=false;return;}r=await fetch('/restart-device?erase=1',{method:'POST',cache:'no-store'});}if(!r.ok)throw new Error();if(w)w.textContent='Restarting device...';setTimeout(function retry(){fetch('/api/ping',{cache:'no-store'}).then(function(x){if(x.ok){location.replace('/system');return;}setTimeout(retry,1000);}).catch(function(){setTimeout(retry,1000);});},2500);}catch(e){if(w)w.textContent='Unable to restart the device.';if(b)b.disabled=false;}}</script>");
+  markWebResponsePhase("restart-device");
+
   diagnosticSendContent("<div class=\"card developer-only\"><h2>Boot Heap Checkpoints</h2><div class=\"note\">Startup instrumentation showing where heap is consumed.</div><div class=\"table-scroll\"><table><thead><tr><th>Stage</th><th>Free Heap</th><th>Min Free</th><th>Largest Block</th></tr></thead><tbody>");
   for (size_t i=0;i<bootHeapCheckpointCount;i++) {
     const BootHeapCheckpoint& cp=bootHeapCheckpoints[i];
@@ -6254,18 +6358,18 @@ void handleSystemStatus() {
   markWebResponsePhase("boot-checkpoints");
 
   diagnosticSendContent("<div class=\"card advanced-only\"><h2>Session</h2><div class=\"row\"><span class=\"label\">Restart Checkpoint</span><span class=\"value\">" + htmlEscape(sessionCheckpointStatus) + "</span></div><div class=\"row\"><span class=\"label\">Restored This Boot</span><span class=\"value\">" + String(sessionRestoredThisBoot ? "Yes" : "No") + "</span></div>"
-    "<div class=\"developer-only\"><div class=\"test-tool-actions\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are consumed after successful restore. Persistent logging is a separate future feature.</div></div></div>");
+    "<div class=\"developer-only\"><div class=\"test-tool-actions\"><form action=\"/session-save\" method=\"post\"><button type=\"submit\">Save Restart Checkpoint</button></form><form action=\"/session-discard\" method=\"post\"><button type=\"submit\">Discard Restart Checkpoint</button></form></div><div class=\"note\">Restart checkpoints preserve the current RAM history through controlled reboots and are consumed after successful restore.</div></div></div>");
   String historyTestTools = "<div class=\"card developer-only\"><h2>History Test Tools</h2>"
     "<div class=\"test-tool-group\"><h3>Wi-Fi History</h3><div class=\"test-tool-actions\">"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
-    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
+    "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"99\"><button type=\"submit\">Fill to 99%</button></form>"
     "</div></div>";
   if (bleSurveyEnabled && bleHistory && bleAddressTable && bleScanMetadata) {
     historyTestTools += "<div class=\"test-tool-group\"><h3>Bluetooth History</h3><div class=\"test-tool-actions\">"
       "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
       "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
-      "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
+      "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form><form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"ble\"><input type=\"hidden\" name=\"percent\" value=\"99\"><button type=\"submit\">Fill to 99%</button></form>"
       "</div></div>";
   } else {
     historyTestTools += "<div class=\"test-tool-group\"><h3>Bluetooth History</h3><div class=\"note\">Enable Bluetooth Survey to use Bluetooth history prefill.</div></div>";
@@ -6284,7 +6388,7 @@ void handleSystemStatus() {
 // ============================================================
 
 const uint32_t STATUS_SCHEMA_VERSION = 2;
-const uint32_t CONFIG_SCHEMA_VERSION = 1;
+const uint32_t CONFIG_SCHEMA_VERSION = 2;
 const size_t MAX_CONFIG_IMPORT_BYTES = 4096;
 
 // Purpose: Escapes a string for safe inclusion in generated JSON.
@@ -6321,9 +6425,20 @@ String jsonQuoted(const String& value) {
 
 struct PortableConfig {
   unsigned long wifiScanIntervalSeconds;
+  unsigned long bluetoothScanIntervalSeconds;
   bool bluetoothSurveyEnabled;
+  bool captureHiddenNetworks;
   bool statusLedEnabled;
   bool liveUpdatesEnabled;
+  bool diagnosticStreamingEnabled;
+  bool diagnosticSurveyEvents;
+  bool diagnosticBleEvents;
+  bool diagnosticMemoryEvents;
+  bool diagnosticWebEvents;
+  bool diagnosticSchedulerEvents;
+  bool diagnosticCheckpointEvents;
+  unsigned long diagnosticSnapshotIntervalMs;
+  unsigned long diagnosticExportEventLimit;
   bool mdnsHostnameAutomatic;
   String mdnsHostname;
   bool accessPointEnabled;
@@ -6343,8 +6458,12 @@ PortableConfig readPersistedPortableConfig() {
   preferences.begin("survey", true);
   c.wifiScanIntervalSeconds =
       preferences.getULong("wifiInterval", scanIntervalSeconds);
+  c.bluetoothScanIntervalSeconds =
+      preferences.getULong("bleInterval", bleScanIntervalSeconds);
   c.bluetoothSurveyEnabled =
       preferences.getBool("bleEnabled", bleSurveyEnabled);
+  c.captureHiddenNetworks =
+      preferences.getBool("captureHidden", captureHiddenNetworks);
   c.statusLedEnabled =
       preferences.getBool("ledEnabled", statusLedEnabled);
   c.liveUpdatesEnabled =
@@ -6361,6 +6480,22 @@ PortableConfig readPersistedPortableConfig() {
     c.wifiScanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
   if (c.wifiScanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS)
     c.wifiScanIntervalSeconds = MAX_SCAN_INTERVAL_SECONDS;
+  if (c.bluetoothScanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS)
+    c.bluetoothScanIntervalSeconds = MIN_SCAN_INTERVAL_SECONDS;
+  if (c.bluetoothScanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS)
+    c.bluetoothScanIntervalSeconds = MAX_SCAN_INTERVAL_SECONDS;
+
+  preferences.begin("diag", true);
+  c.diagnosticStreamingEnabled = preferences.getBool("enabled", diagnosticStreamingEnabled);
+  c.diagnosticSurveyEvents = preferences.getBool("survey", diagnosticSurveyEvents);
+  c.diagnosticBleEvents = preferences.getBool("ble", diagnosticBleEvents);
+  c.diagnosticMemoryEvents = preferences.getBool("memory", diagnosticMemoryEvents);
+  c.diagnosticWebEvents = preferences.getBool("web", diagnosticWebEvents);
+  c.diagnosticSchedulerEvents = preferences.getBool("scheduler", diagnosticSchedulerEvents);
+  c.diagnosticCheckpointEvents = preferences.getBool("checkpoint", diagnosticCheckpointEvents);
+  c.diagnosticSnapshotIntervalMs = preferences.getULong("snapshotMs", diagnosticSnapshotIntervalMs);
+  c.diagnosticExportEventLimit = preferences.getUInt("eventLimit", diagnosticExportEventLimit);
+  preferences.end();
 
   preferences.begin("ap", true);
   c.accessPointEnabled = preferences.getBool("enabled", true);
@@ -6376,13 +6511,24 @@ PortableConfig readPersistedPortableConfig() {
 // Purpose: Serializes portable non-secret configuration into the configuration-export JSON schema.
 String portableConfigJson(const PortableConfig& c) {
   String json;
-  json.reserve(700);
+  json.reserve(1500);
   json += "{\n";
   json += "  \"configVersion\":" + String(CONFIG_SCHEMA_VERSION) + ",\n";
   json += "  \"wifiScanIntervalSeconds\":" + String(c.wifiScanIntervalSeconds) + ",\n";
+  json += "  \"bluetoothScanIntervalSeconds\":" + String(c.bluetoothScanIntervalSeconds) + ",\n";
   json += "  \"bluetoothSurveyEnabled\":" + String(c.bluetoothSurveyEnabled ? "true" : "false") + ",\n";
+  json += "  \"captureHiddenNetworks\":" + String(c.captureHiddenNetworks ? "true" : "false") + ",\n";
   json += "  \"statusLedEnabled\":" + String(c.statusLedEnabled ? "true" : "false") + ",\n";
   json += "  \"liveUpdatesEnabled\":" + String(c.liveUpdatesEnabled ? "true" : "false") + ",\n";
+  json += "  \"diagnosticStreamingEnabled\":" + String(c.diagnosticStreamingEnabled ? "true" : "false") + ",\n";
+  json += "  \"diagnosticSurveyEvents\":" + String(c.diagnosticSurveyEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticBleEvents\":" + String(c.diagnosticBleEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticMemoryEvents\":" + String(c.diagnosticMemoryEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticWebEvents\":" + String(c.diagnosticWebEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticSchedulerEvents\":" + String(c.diagnosticSchedulerEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticCheckpointEvents\":" + String(c.diagnosticCheckpointEvents ? "true" : "false") + ",\n";
+  json += "  \"diagnosticSnapshotIntervalMs\":" + String(c.diagnosticSnapshotIntervalMs) + ",\n";
+  json += "  \"diagnosticExportEventLimit\":" + String(c.diagnosticExportEventLimit) + ",\n";
   json += "  \"mdnsHostnameAutomatic\":" + String(c.mdnsHostnameAutomatic ? "true" : "false") + ",\n";
   json += "  \"mdnsHostname\":" + jsonQuoted(c.mdnsHostname) + ",\n";
   json += "  \"accessPointEnabled\":" + String(c.accessPointEnabled ? "true" : "false") + ",\n";
@@ -6411,11 +6557,23 @@ public:
       : s(source), pos(0), errorMessage("") {}
 
   bool parse(PortableConfig& out) {
+    unsigned long parsedVersion = 0;
     bool seenVersion = false;
     bool seenInterval = false;
+    bool seenBleInterval = false;
     bool seenBle = false;
+    bool seenCaptureHidden = false;
     bool seenLed = false;
     bool seenLive = false;
+    bool seenDiagEnabled = false;
+    bool seenDiagSurvey = false;
+    bool seenDiagBle = false;
+    bool seenDiagMemory = false;
+    bool seenDiagWeb = false;
+    bool seenDiagScheduler = false;
+    bool seenDiagCheckpoint = false;
+    bool seenDiagSnapshot = false;
+    bool seenDiagLimit = false;
     bool seenHostnameAuto = false;
     bool seenHostname = false;
     bool seenApEnabled = false;
@@ -6443,8 +6601,9 @@ public:
         seenVersion = true;
         unsigned long value = 0;
         if (!parseUnsigned(value)) return fail("configVersion must be an integer.");
-        if (value != CONFIG_SCHEMA_VERSION)
+        if (value != 1 && value != CONFIG_SCHEMA_VERSION)
           return fail("Unsupported configVersion.");
+        parsedVersion = value;
       } else if (key == "wifiScanIntervalSeconds") {
         if (seenInterval) return fail("Duplicate wifiScanIntervalSeconds.");
         seenInterval = true;
@@ -6452,11 +6611,21 @@ public:
         if (!parseUnsigned(value))
           return fail("wifiScanIntervalSeconds must be an integer.");
         out.wifiScanIntervalSeconds = value;
+      } else if (key == "bluetoothScanIntervalSeconds") {
+        if (seenBleInterval) return fail("Duplicate bluetoothScanIntervalSeconds.");
+        seenBleInterval = true;
+        unsigned long value = 0;
+        if (!parseUnsigned(value)) return fail("bluetoothScanIntervalSeconds must be an integer.");
+        out.bluetoothScanIntervalSeconds = value;
       } else if (key == "bluetoothSurveyEnabled") {
         if (seenBle) return fail("Duplicate bluetoothSurveyEnabled.");
         seenBle = true;
         if (!parseBool(out.bluetoothSurveyEnabled))
           return fail("bluetoothSurveyEnabled must be true or false.");
+      } else if (key == "captureHiddenNetworks") {
+        if (seenCaptureHidden) return fail("Duplicate captureHiddenNetworks.");
+        seenCaptureHidden = true;
+        if (!parseBool(out.captureHiddenNetworks)) return fail("captureHiddenNetworks must be true or false.");
       } else if (key == "statusLedEnabled") {
         if (seenLed) return fail("Duplicate statusLedEnabled.");
         seenLed = true;
@@ -6467,6 +6636,33 @@ public:
         seenLive = true;
         if (!parseBool(out.liveUpdatesEnabled))
           return fail("liveUpdatesEnabled must be true or false.");
+      } else if (key == "diagnosticStreamingEnabled") {
+        if (seenDiagEnabled) return fail("Duplicate diagnosticStreamingEnabled."); seenDiagEnabled = true;
+        if (!parseBool(out.diagnosticStreamingEnabled)) return fail("diagnosticStreamingEnabled must be true or false.");
+      } else if (key == "diagnosticSurveyEvents") {
+        if (seenDiagSurvey) return fail("Duplicate diagnosticSurveyEvents."); seenDiagSurvey = true;
+        if (!parseBool(out.diagnosticSurveyEvents)) return fail("diagnosticSurveyEvents must be true or false.");
+      } else if (key == "diagnosticBleEvents") {
+        if (seenDiagBle) return fail("Duplicate diagnosticBleEvents."); seenDiagBle = true;
+        if (!parseBool(out.diagnosticBleEvents)) return fail("diagnosticBleEvents must be true or false.");
+      } else if (key == "diagnosticMemoryEvents") {
+        if (seenDiagMemory) return fail("Duplicate diagnosticMemoryEvents."); seenDiagMemory = true;
+        if (!parseBool(out.diagnosticMemoryEvents)) return fail("diagnosticMemoryEvents must be true or false.");
+      } else if (key == "diagnosticWebEvents") {
+        if (seenDiagWeb) return fail("Duplicate diagnosticWebEvents."); seenDiagWeb = true;
+        if (!parseBool(out.diagnosticWebEvents)) return fail("diagnosticWebEvents must be true or false.");
+      } else if (key == "diagnosticSchedulerEvents") {
+        if (seenDiagScheduler) return fail("Duplicate diagnosticSchedulerEvents."); seenDiagScheduler = true;
+        if (!parseBool(out.diagnosticSchedulerEvents)) return fail("diagnosticSchedulerEvents must be true or false.");
+      } else if (key == "diagnosticCheckpointEvents") {
+        if (seenDiagCheckpoint) return fail("Duplicate diagnosticCheckpointEvents."); seenDiagCheckpoint = true;
+        if (!parseBool(out.diagnosticCheckpointEvents)) return fail("diagnosticCheckpointEvents must be true or false.");
+      } else if (key == "diagnosticSnapshotIntervalMs") {
+        if (seenDiagSnapshot) return fail("Duplicate diagnosticSnapshotIntervalMs."); seenDiagSnapshot = true;
+        if (!parseUnsigned(out.diagnosticSnapshotIntervalMs)) return fail("diagnosticSnapshotIntervalMs must be an integer.");
+      } else if (key == "diagnosticExportEventLimit") {
+        if (seenDiagLimit) return fail("Duplicate diagnosticExportEventLimit."); seenDiagLimit = true;
+        if (!parseUnsigned(out.diagnosticExportEventLimit)) return fail("diagnosticExportEventLimit must be an integer.");
       } else if (key == "mdnsHostnameAutomatic") {
         if (seenHostnameAuto) return fail("Duplicate mdnsHostnameAutomatic.");
         seenHostnameAuto = true;
@@ -6515,10 +6711,12 @@ public:
     if (pos != s.length())
       return fail("Unexpected content after the JSON object.");
 
-    if (!seenVersion || !seenInterval || !seenBle || !seenLed ||
-        !seenLive || !seenHostnameAuto || !seenHostname ||
-        !seenApEnabled || !seenApSsidAuto || !seenApSsid ||
-        !seenCredentials)
+    bool baseFieldsPresent = seenVersion && seenInterval && seenBle && seenLed && seenLive &&
+        seenHostnameAuto && seenHostname && seenApEnabled && seenApSsidAuto && seenApSsid && seenCredentials;
+    bool extendedFieldsPresent = seenBleInterval && seenCaptureHidden && seenDiagEnabled && seenDiagSurvey &&
+        seenDiagBle && seenDiagMemory && seenDiagWeb && seenDiagScheduler && seenDiagCheckpoint &&
+        seenDiagSnapshot && seenDiagLimit;
+    if (!baseFieldsPresent || (parsedVersion >= 2 && !extendedFieldsPresent))
       return fail("Configuration is missing one or more required fields.");
 
     out.mdnsHostname = normalizedMdnsHostname(out.mdnsHostname);
@@ -6531,6 +6729,14 @@ public:
         String(MIN_SCAN_INTERVAL_SECONDS) + " and " +
         String(MAX_SCAN_INTERVAL_SECONDS) + "."
       );
+
+    if (out.bluetoothScanIntervalSeconds < MIN_SCAN_INTERVAL_SECONDS ||
+        out.bluetoothScanIntervalSeconds > MAX_SCAN_INTERVAL_SECONDS)
+      return fail("bluetoothScanIntervalSeconds is outside the supported range.");
+    if (out.diagnosticSnapshotIntervalMs > 3600000UL)
+      return fail("diagnosticSnapshotIntervalMs must be 3600000 or less.");
+    if (out.diagnosticExportEventLimit > DIAGNOSTIC_EVENT_CAPACITY)
+      return fail("diagnosticExportEventLimit exceeds the retained event capacity.");
 
     if (!out.mdnsHostnameAutomatic &&
         !isValidMdnsHostname(out.mdnsHostname))
@@ -6694,7 +6900,7 @@ void handleConfigImport() {
     return;
   }
 
-  PortableConfig requested = {};
+  PortableConfig requested = readPersistedPortableConfig();
   FlatConfigJsonParser parser(body);
   if (!parser.parse(requested)) {
     server.send(
@@ -6720,6 +6926,42 @@ void handleConfigImport() {
     preferences.end();
     scanIntervalSeconds = requested.wifiScanIntervalSeconds;
     lastAutoScanMs = millis();
+    appliedCount++;
+  }
+
+  if (requested.bluetoothScanIntervalSeconds != previous.bluetoothScanIntervalSeconds) {
+    preferences.begin("survey", false);
+    preferences.putULong("bleInterval", requested.bluetoothScanIntervalSeconds);
+    preferences.end();
+    bleScanIntervalSeconds = requested.bluetoothScanIntervalSeconds;
+    lastAutoBleScanMs = millis();
+    appliedCount++;
+  }
+
+  if (requested.captureHiddenNetworks != previous.captureHiddenNetworks) {
+    saveCaptureHiddenNetworks(requested.captureHiddenNetworks);
+    appliedCount++;
+  }
+
+  if (requested.diagnosticStreamingEnabled != previous.diagnosticStreamingEnabled ||
+      requested.diagnosticSurveyEvents != previous.diagnosticSurveyEvents ||
+      requested.diagnosticBleEvents != previous.diagnosticBleEvents ||
+      requested.diagnosticMemoryEvents != previous.diagnosticMemoryEvents ||
+      requested.diagnosticWebEvents != previous.diagnosticWebEvents ||
+      requested.diagnosticSchedulerEvents != previous.diagnosticSchedulerEvents ||
+      requested.diagnosticCheckpointEvents != previous.diagnosticCheckpointEvents ||
+      requested.diagnosticSnapshotIntervalMs != previous.diagnosticSnapshotIntervalMs ||
+      requested.diagnosticExportEventLimit != previous.diagnosticExportEventLimit) {
+    diagnosticStreamingEnabled = requested.diagnosticStreamingEnabled;
+    diagnosticSurveyEvents = requested.diagnosticSurveyEvents;
+    diagnosticBleEvents = requested.diagnosticBleEvents;
+    diagnosticMemoryEvents = requested.diagnosticMemoryEvents;
+    diagnosticWebEvents = requested.diagnosticWebEvents;
+    diagnosticSchedulerEvents = requested.diagnosticSchedulerEvents;
+    diagnosticCheckpointEvents = requested.diagnosticCheckpointEvents;
+    diagnosticSnapshotIntervalMs = requested.diagnosticSnapshotIntervalMs;
+    diagnosticExportEventLimit = requested.diagnosticExportEventLimit;
+    saveDiagnosticStreamingSettings();
     appliedCount++;
   }
 
@@ -6836,6 +7078,20 @@ void handleStatusJsonExport() {
   recordWebWorkTiming("cached-reset-heap-partition-info", workStartMs);
   workStartMs = millis();
   PortableConfig persisted = readPersistedPortableConfig();
+  size_t statusFreeHeap = ESP.getFreeHeap();
+  size_t statusMinFreeHeap = ESP.getMinFreeHeap();
+  bool statusWifiHistoryOk = scanHistory && wifiApTable && wifiScanMetadata && scanHistoryCapacity>=MIN_SCAN_HISTORY_RECORDS && scanHistoryRetentionLimit>=MIN_SCAN_HISTORY_RECORDS && scanHistoryRetentionLimit<=scanHistoryCapacity && historyCount<=scanHistoryRetentionLimit;
+  size_t statusWifiIntegrityAnomalies = wifiHistoryIntegrityAnomalies();
+  bool statusWifiIntegrityOk = statusWifiIntegrityAnomalies == 0;
+  bool statusBleHistoryOk = !bleSurveyEnabled || (bleHistory && bleAddressTable && bleScanMetadata && bleHistoryCapacity>=MIN_BLE_HISTORY_RECORDS && bleHistoryRetentionLimit>=MIN_BLE_HISTORY_RECORDS && bleHistoryRetentionLimit<=bleHistoryCapacity && bleHistoryCount<=bleHistoryRetentionLimit);
+  bool statusConfigOk = scanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && scanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS && (!bleSurveyEnabled || (bleScanIntervalSeconds>=MIN_SCAN_INTERVAL_SECONDS && bleScanIntervalSeconds<=MAX_SCAN_INTERVAL_SECONDS));
+  bool statusInitialDone = !initialWifiScanPending && (!bleSurveyEnabled || !initialBleScanPending);
+  bool statusAutos = !bleSurveyEnabled || autoBleScanEnabled;
+  bool statusCadenceOverdue = wifiAutoScanCadenceOverdue();
+  bool statusMemoryOk = (bleSurveyEnabled ? statusFreeHeap >= 24*1024 : statusFreeHeap >= HEAP_WARN_BYTES) && (bleSurveyEnabled ? statusMinFreeHeap >= DUAL_RADIO_MIN_HEAP_WARN_BYTES : statusMinFreeHeap >= HEAP_WARN_BYTES);
+  bool statusResetWarn = resetReason==ESP_RST_PANIC || resetReason==ESP_RST_INT_WDT || resetReason==ESP_RST_TASK_WDT || resetReason==ESP_RST_WDT || resetReason==ESP_RST_BROWNOUT;
+  bool statusOverallFail = !wifiSubsystemInitialized || (bleSurveyEnabled && !bleInitialized) || !statusWifiHistoryOk || !statusBleHistoryOk || !statusConfigOk;
+  bool statusOverallWarn = !statusOverallFail && (!statusInitialDone || !statusAutos || statusCadenceOverdue || !statusWifiIntegrityOk || !statusMemoryOk || !spiffsMounted || !mdnsStarted || statusResetWarn);
   recordWebWorkTiming("read-persisted-config", workStartMs);
 
   server.sendHeader(
@@ -6857,6 +7113,7 @@ void handleStatusJsonExport() {
   diagnosticSendContent("  \"firmware\":{");
   diagnosticSendContent("\"file\":" + jsonQuoted(FIRMWARE_FILE));
   diagnosticSendContent(",\"version\":" + jsonQuoted(FIRMWARE_VERSION));
+  diagnosticSendContent(",\"build\":" + jsonQuoted(String(__DATE__) + " " + String(__TIME__)));
   diagnosticSendContent(",\"arduinoEsp32\":" + jsonQuoted(ESP_ARDUINO_VERSION_STR));
   diagnosticSendContent(",\"espIdf\":" + jsonQuoted(String(esp_get_idf_version())));
   diagnosticSendContent("},\n");
@@ -6889,9 +7146,32 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"freeHeapBytes\":" + String(ESP.getFreeHeap()));
   diagnosticSendContent(",\"minimumFreeHeapBytes\":" + String(ESP.getMinFreeHeap()));
   diagnosticSendContent(",\"largestFreeBlockBytes\":" + String(largestBlock));
+  diagnosticSendContent(",\"surveyMemoryMode\":" + jsonQuoted(bleSurveyEnabled ? String("Wi-Fi + Bluetooth") : String("Wi-Fi only")));
+  diagnosticSendContent(",\"targetHeapReserveBytes\":" + String(bleSurveyEnabled ? DUAL_RADIO_HEAP_RESERVE_BYTES : HISTORY_HEAP_RESERVE_BYTES));
   diagnosticSendContent("},\n");
 
   markWebResponsePhase("memory");
+  diagnosticSendContent("  \"systemHealth\":{");
+  diagnosticSendContent("\"wifiSurvey\":" + jsonQuoted(wifiSubsystemInitialized ? String("PASS") : String("FAIL")));
+  diagnosticSendContent(",\"bluetoothSurvey\":" + jsonQuoted(bleSurveyEnabled ? (bleInitialized ? String("PASS") : String("FAIL")) : String("Disabled")));
+  diagnosticSendContent(",\"automaticSurveying\":" + jsonQuoted(statusAutos ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"memory\":" + jsonQuoted(statusMemoryOk ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"overall\":" + jsonQuoted(statusOverallFail ? String("FAIL") : (statusOverallWarn ? String("WARN") : String("PASS"))));
+  diagnosticSendContent(",\"wifiHistoryBuffer\":" + jsonQuoted(statusWifiHistoryOk ? String("PASS") : String("FAIL")));
+  diagnosticSendContent(",\"wifiHistoryIntegrity\":" + jsonQuoted(statusWifiIntegrityOk ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"wifiHistoryIntegrityAnomalies\":" + String(statusWifiIntegrityAnomalies));
+  diagnosticSendContent(",\"bleHistoryBuffer\":" + jsonQuoted(statusBleHistoryOk ? String("PASS") : String("FAIL")));
+  diagnosticSendContent(",\"scanConfiguration\":" + jsonQuoted(statusConfigOk ? String("PASS") : String("FAIL")));
+  diagnosticSendContent(",\"initialBootScans\":" + jsonQuoted(statusInitialDone ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"wifiAutoScanCadence\":" + jsonQuoted(statusCadenceOverdue ? String("WARN") : String("PASS")));
+  diagnosticSendContent(",\"restartCheckpointStorage\":" + jsonQuoted(spiffsMounted ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"mdnsHostname\":" + jsonQuoted(mdnsStarted ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"heapReserve\":" + jsonQuoted(statusMemoryOk ? String("PASS") : String("WARN")));
+  diagnosticSendContent(",\"bootResetDiagnostic\":" + jsonQuoted(statusResetWarn ? String("WARN") : String("PASS")));
+  diagnosticSendContent(",\"applicationSpace\":" + jsonQuoted(unusedAppBytes>64*1024 ? String("PASS") : String("WARN")));
+  diagnosticSendContent("},\n");
+
+  markWebResponsePhase("system-health");
   diagnosticSendContent("  \"network\":{");
   diagnosticSendContent("\"stationConnected\":");
   diagnosticSendContent(WiFi.status() == WL_CONNECTED ? "true" : "false");
@@ -6924,6 +7204,10 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"mdnsHostname\":" + jsonQuoted(mdnsHostname));
   diagnosticSendContent(",\"mdnsStarted\":");
   diagnosticSendContent(mdnsStarted ? "true" : "false");
+  diagnosticSendContent(",\"mdnsStatus\":" + jsonQuoted(mdnsStatusMessage));
+  diagnosticSendContent(",\"friendlyWebAddress\":" + jsonQuoted(mdnsWebAddress()));
+  diagnosticSendContent(",\"accessPointMac\":" + jsonQuoted(WiFi.softAPmacAddress()));
+  diagnosticSendContent(",\"wifiMode\":" + jsonQuoted(wifiModeLabel(WiFi.getMode())));
   diagnosticSendContent("},\n");
 
   markWebResponsePhase("network");
@@ -7015,6 +7299,20 @@ void handleStatusJsonExport() {
   diagnosticSendContent("],\n");
 
   markWebResponsePhase("boot-checkpoints");
+  diagnosticSendContent("  \"systemState\":{");
+  diagnosticSendContent("\"statusLedAvailable\":" + String(STATUS_LED_AVAILABLE ? "true" : "false"));
+  diagnosticSendContent(",\"statusLedEnabled\":" + String(statusLedEnabled ? "true" : "false"));
+  diagnosticSendContent(",\"restartCheckpointStatus\":" + jsonQuoted(sessionCheckpointStatus));
+  diagnosticSendContent(",\"restoredThisBoot\":" + String(sessionRestoredThisBoot ? "true" : "false"));
+  diagnosticSendContent(",\"spiffsMounted\":" + String(spiffsMounted ? "true" : "false"));
+  diagnosticSendContent(",\"bleBootMode\":" + jsonQuoted(bleSurveyEnabled ? String("Enabled") : String("Disabled")));
+  diagnosticSendContent(",\"diagnosticStreamingEnabled\":" + String(diagnosticStreamingEnabled ? "true" : "false"));
+  diagnosticSendContent(",\"diagnosticSnapshotIntervalMs\":" + String(diagnosticSnapshotIntervalMs));
+  diagnosticSendContent(",\"diagnosticExportEventLimit\":" + String(diagnosticExportEventLimit));
+  diagnosticSendContent(",\"captureHiddenNetworks\":" + String(captureHiddenNetworks ? "true" : "false"));
+  diagnosticSendContent("},\n");
+
+  markWebResponsePhase("system-state");
   diagnosticSendContent("  \"channelAnalysis\":{");
   diagnosticSendContent("\"valid\":");
   diagnosticSendContent(channel.valid ? "true" : "false");
@@ -7104,7 +7402,7 @@ void handleSettingsPage() {
   markWebResponsePhase("survey-mode");
 
   s += "<div class=\"card advanced-only\"><h2>Wi-Fi Capture</h2><form class=\"controls\" action=\"/wifi-capture-settings\" method=\"post\">"
-    "<div class=\"control\"><label><input type=\"checkbox\" name=\"captureHidden\" value=\"1\" " + String(captureHiddenNetworks ? "checked" : "") + "> Capture Hidden Networks</label></div>"
+    "<div class=\"control\"><label><input type=\"checkbox\" name=\"captureHidden\" value=\"1\" " + String(captureHiddenNetworks ? "checked" : "") + "> Include hidden networks in history</label></div>"
     "<button type=\"submit\">Apply Wi-Fi Capture Settings</button></form>"
     "<div class=\"note\">When disabled, networks without an advertised SSID still contribute to current RF/channel analysis but do not consume retained-history or AP-table capacity. Existing hidden observations age out normally.</div></div>";
   diagnosticSendContent(s); s.remove(0);
@@ -7223,6 +7521,9 @@ void handleBleModeChange() {
 
   saveBleSurveyEnabled(requested);
 
+  // Complete checkpoint work before sending the restart page so the browser receives a stable response before reboot begins.
+  checkpointBeforeControlledRestart();
+
   server.send(200, "text/html",
     String("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">") +
     themeBootstrapScript() + pageStyles() +
@@ -7230,12 +7531,11 @@ void handleBleModeChange() {
     String(requested ? "enabled" : "disabled") +
     " after restart.</p><p>The ESP32 is restarting now. This page will reconnect automatically.</p>"
     "<p id=\"reconnect-status\">Waiting for the surveyor...</p><p><a class=\"button\" href=\"/ble\">Return to Bluetooth Survey</a></p></div></div>"
-    "<script>(function(){setTimeout(function retry(){fetch('/ble',{cache:'no-store'}).then(function(r){"
+    "<script>(function(){setTimeout(function retry(){fetch('/api/ping',{cache:'no-store'}).then(function(r){"
     "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
     "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
 
-  checkpointBeforeControlledRestart();
-  delay(750);
+  delay(1000);
   ESP.restart();
 }
 
@@ -7325,6 +7625,100 @@ void handleSaveAccessPointSettings() {
 }
 
 
+
+// Purpose: Lightweight readiness endpoint used by restart/reconnect pages.
+void handleApiPing() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "ok");
+}
+
+// Purpose: Performs a controlled System-page restart and refuses destructive history loss until explicitly confirmed.
+void handleSystemRestart() {
+  markExplicitUserInteraction();
+  bool eraseHistory = server.hasArg("erase") && server.arg("erase") == "1";
+  bool hasSurveyHistory = historyCount > 0 || (bleSurveyEnabled && bleHistoryCount > 0);
+
+  if (!eraseHistory && hasSurveyHistory) {
+    if (!checkpointBeforeControlledRestart()) {
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(409, "application/json", "{\"ok\":false,\"historyPreserved\":false,\"confirmationRequired\":true}");
+      return;
+    }
+  }
+
+  if (eraseHistory) {
+    String detail;
+    discardSurveySessionCheckpoint(detail);
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", String("{\"ok\":true,\"historyPreserved\":") + ((!eraseHistory && hasSurveyHistory) ? "true" : "false") + ",\"restarting\":true}");
+  delay(750);
+  ESP.restart();
+}
+
+// Purpose: Provides version-agnostic operational guidance with stable anchors used by contextual card help buttons.
+void handleHelpPage() {
+  beginWebResponseProfile("/help");
+  markExplicitUserInteraction();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ESP32 Wireless Surveyor Help</title>");
+  sendThemeBootstrapScript();
+  diagnosticSendContent(pageStyles());
+  diagnosticSendContent("</head><body><div class=\"container\">");
+  sendSiteNavigation("help");
+  diagnosticSendContent("<h1>Help</h1><div class=\"card\"><h2>Using this Help page</h2><p>This page explains what each part of the surveyor shows, why it matters, and how to use it. The ? button on a card opens the matching section here.</p></div>");
+
+  const char* sections[] = {
+    "about-cards|About cards|Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. Use the ? button on a card to jump into Help.",
+    "survey-controls|Survey Status & Controls|Use this card to confirm that scanning is active, see when the last scan completed, change the automatic scan interval, and request a manual scan. Live Updates refresh the browser display; they do not trigger radio scans.",
+    "history|History|History is the rolling RAM record used by the web interface and CSV export. When the buffer fills, older observations age out as new observations arrive. The retained time window therefore depends on scan rate and how many observations each scan produces.",
+    "rssi-history|RSSI History|RSSI is received signal strength in dBm. Values closer to zero are stronger. Select an entry in Observed Networks or Observed Devices to plot its retained observations, then hover over a graph point to see scan and signal details.",
+    "observed-networks|Observed Networks|This table summarizes retained Wi-Fi access points. Access points are distinguished by BSSID, so several radios can share one SSID and still appear separately. Select a network to redraw RSSI History.",
+    "observed-devices|Observed Devices|This table summarizes retained Bluetooth devices. Bluetooth addresses can change or be private, so an address is not always a permanent device identity. Select a device to redraw RSSI History.",
+    "channel-analysis|Observed Channel Interference|This card estimates 2.4 GHz Wi-Fi interference from the access points seen in the latest scan. It considers signal strength and channel overlap; it does not measure actual airtime use, noise floor, or non-Wi-Fi interference.",
+    "infrastructure-wifi|Infrastructure Wi-Fi|This is the network connection used to reach the surveyor through an existing Wi-Fi network. Survey collection is designed to continue even if infrastructure connectivity is unavailable.",
+    "survey-health|Survey Health|Health checks summarize scan cadence, history integrity, and related operating conditions. PASS means the check is currently satisfactory; WARN identifies a nonfatal condition worth reviewing.",
+    "scheduler-diagnostics|Survey Scheduler Diagnostics|Developer information separates scan starts, completions, retries, and request deferrals. Use it to determine whether a problem is in scheduling, scan startup, or scan completion.",
+    "csv-diagnostics|CSV Diagnostics|Shows CSV export counts and recent export performance. This is useful when testing responsiveness with a large retained history or simultaneous browser activity.",
+    "wifi-memory|Wi-Fi Memory Diagnostics|Shows compact-history allocation, AP identity-table use, metadata use, heap margin, and history-integrity checks. Near-capacity tests should remain responsive without corrupting retained references.",
+    "ble-memory|BLE Implementation Diagnostics|Shows Bluetooth address-table, scan-metadata, history, and heap usage. These values are especially useful when Bluetooth and Wi-Fi surveying run together and share limited RAM.",
+    "device|Device|Identifies the running firmware and hardware, build time, uptime, and reset reason. Record this information when comparing devices or reporting a problem.",
+    "system-health|System Health|A quick summary of the device state. Use Standard view for the result and deeper views for the individual checks behind a warning.",
+    "memory|Memory|Free heap is working memory available now. Minimum free heap is the lowest margin seen since startup. Largest free block helps show whether free memory is fragmented into pieces too small for a large allocation.",
+    "network|Network|Shows infrastructure connection state, the surveyor's own access point, mDNS address, MAC addresses, channel, and reconnect information used to diagnose how the web interface is being reached.",
+    "diagnostics-export|Diagnostics Export|Downloads a JSON snapshot of System information, survey state, configuration, boot memory checkpoints, and recent bounded diagnostic events. It is intended to make troubleshooting snapshots portable.",
+    "restart-device|Restart Device|A normal System restart first tries to preserve current survey history. If preservation fails, the device does not restart until you explicitly confirm that the current Wi-Fi and Bluetooth history can be erased.",
+    "boot-heap|Boot Heap Checkpoints|Developer startup measurements show how free heap, minimum heap, and the largest contiguous block change as major subsystems initialize.",
+    "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint is consumed so it is not repeatedly restored on later boots.",
+    "history-test-tools|History Test Tools|Developer prefill creates synthetic history at selected capacity targets for UI, rollover, and performance testing. Synthetic entries are not evidence of radio endurance or RF behavior.",
+    "settings-network|Infrastructure Network|Save or clear the Wi-Fi credentials used to join an existing network. Passwords are intentionally excluded from configuration backup files.",
+    "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. A hostname change requires restart so the new identity can be advertised from startup.",
+    "device-ap|Device AP|The surveyor can provide its own Wi-Fi access point for direct browser access. Changing AP state, SSID, or password can require reconnecting to the device after restart.",
+    "survey-mode|Survey Mode|Bluetooth surveying can be enabled or disabled. Bluetooth consumes additional RAM, so changing this mode requires restart and changes how survey-history memory is divided.",
+    "wifi-capture|Wi-Fi Capture|Hidden networks are always detectable for RF/channel analysis. When hidden-history capture is disabled, future hidden observations do not consume AP-table or retained-history capacity; existing hidden history ages out normally.",
+    "interface-indicators|Interface & Indicators|Status LED behavior is stored on the device. Theme and View are browser-local display choices, so different browsers can use different presentation preferences.",
+    "configuration|Configuration Backup & Restore|Configuration export contains the device's non-secret configurable settings. Import validates the complete supported schema before writing settings. Wi-Fi and AP passwords are intentionally excluded."
+  };
+  const size_t sectionCount = sizeof(sections) / sizeof(sections[0]);
+  for (size_t i = 0; i < sectionCount; i++) {
+    String item = sections[i];
+    int p1 = item.indexOf('|');
+    int p2 = item.indexOf('|', p1 + 1);
+    if (p1 < 0 || p2 < 0) continue;
+    String id = item.substring(0, p1);
+    String title = item.substring(p1 + 1, p2);
+    String body = item.substring(p2 + 1);
+    diagnosticSendContent("<div class=\"card help-section\" id=\"" + htmlEscape(id) + "\"><h2>" + htmlEscape(title) + "</h2><p>" + htmlEscape(body) + "</p></div>");
+  }
+  diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
+  sendThemeScript();
+  diagnosticSendContent("</div></body></html>");
+  diagnosticSendContent("");
+  endWebResponseProfile();
+}
+
 // ============================================================
 // Web server
 // ============================================================
@@ -7339,6 +7733,9 @@ void startWebServer() {
   server.on("/scan", []() { runDiagnosticWebHandler("/scan", handleWebScan); });
   server.on("/system", HTTP_GET, []() { runDiagnosticWebHandler("/system", handleSystemStatus); });
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
+  server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
+  server.on("/api/ping", HTTP_GET, []() { handleApiPing(); });
+  server.on("/restart-device", HTTP_POST, []() { runDiagnosticWebHandler("/restart-device", handleSystemRestart); });
   server.on("/status.json", HTTP_GET, []() { runDiagnosticWebHandler("/status.json", handleStatusJsonExport); });
   server.on("/api/diag/event-limit", HTTP_POST, []() { runDiagnosticWebHandler("/api/diag/event-limit", handleDiagnosticEventLimit); });
   server.on("/config.json", HTTP_GET, []() { runDiagnosticWebHandler("/config.json", handleConfigExport); });
