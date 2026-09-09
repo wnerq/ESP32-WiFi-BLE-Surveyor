@@ -2,13 +2,13 @@
 // Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
 //
 // Git commit:
-// Harden web responsiveness under rapid scans, slow clients, and constrained heap
+// Correct deferred-card delivery while preserving V38g web resilience
 //
 // - make Live Updates off stop browser polling entirely
 // - serialize and throttle expensive history-card requests
 // - defer expensive fragments while scans, exports, or low-memory pressure are active
 // - return the Wi-Fi page shell before constructing history tables and plots
-// - stream smaller response chunks and abandon work for disconnected clients
+// - stream smaller response chunks without truncating valid chunked responses
 // - service completed Wi-Fi scans between response chunks
 // - retain fixed-size current/last web-operation diagnostics in status.json
 // - skip optional serial snapshots while the UART transmit buffer is congested
@@ -36,8 +36,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect38g_web_resilience.ino";
-const char* FIRMWARE_VERSION = "38g";
+const char* FIRMWARE_FILE = "WifiConnect38h_web_resilience_fix.ino";
+const char* FIRMWARE_VERSION = "38h";
 
 
 Preferences preferences;
@@ -1649,17 +1649,10 @@ void recordWebWorkTiming(const char* label, uint32_t startMs) {
 const size_t WEB_RESPONSE_BUFFER_FLUSH_BYTES = 1024;
 String webResponseBuffer;
 bool webResponseBuffering = false;
-bool webResponseAborted = false;
 
 // Purpose: Accounts for one actual network write while preserving page-response timing diagnostics.
 void sendProfiledContentNow(const String& content) {
-  if (webResponseAborted || content.length() == 0) return;
-  WiFiClient client = server.client();
-  if (!client.connected()) {
-    webResponseAborted = true;
-    webOperationState.disconnectedAborts++;
-    return;
-  }
+  if (content.length() == 0) return;
   uint32_t startMs = millis();
   server.sendContent(content);
   yield();
@@ -1693,7 +1686,6 @@ void flushDiagnosticWebResponseBuffer() {
 
 // Purpose: Appends bytes while keeping individual network writes near the configured response-chunk size.
 void appendDiagnosticWebResponseBytes(const char* data, size_t length) {
-  if (webResponseAborted) return;
   if (!webResponseBuffering) {
     if (length == 0) return;
     String direct;
@@ -1732,7 +1724,6 @@ void beginWebResponseProfile(const char* route) {
   webResponseBuffer.remove(0);
   webResponseBuffer.reserve(WEB_RESPONSE_BUFFER_FLUSH_BYTES + 128);
   webResponseBuffering = true;
-  webResponseAborted = false;
   setWebOperationPhase("response-start");
 
   if (!webResponseProfile.active) return;
@@ -5702,7 +5693,7 @@ void handleWebScan() {
       "let scan=" + String(scanCounter) + ";"
       "const toggle=document.getElementById('live-updates-toggle');"
       "const plotBssid='" + jsEscape(selectedBSSID) + "';"
-      "let updating=false;let pollBusy=false;let retryTimer=0;let lastDetailRefresh=0;"
+      "let pollBusy=false;let requestBusy=false;let lastDetailRefresh=0;const requestQueue=[];const queued={};"
       "const scanButton=document.getElementById('wifi-scan-now');"
       "const scanState=document.getElementById('wifi-scan-state');"
       "const intervalInput=document.getElementById('interval');"
@@ -5715,10 +5706,11 @@ void handleWebScan() {
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/wifi/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
       "if(scanButton){scanButton.addEventListener('click',function(){showScanState(true,'Wi-Fi scan in progress…');fetch('/scan-now',{cache:'no-store'}).then(function(r){if(!r.ok&&r.status!==202)throw new Error();return r.json();}).then(function(s){showScanState(!!s.scanning,s.scanning?'Wi-Fi scan in progress…':(s.message||''));}).catch(function(){showScanState(false,'Unable to start scan');});});}"
-      "async function loadInto(url,id){const r=await fetch(url,{cache:'no-store'});if(r.status===503)return false;if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(id);if(e)e.innerHTML=h;return true;}"
-      "function retryDetails(){if(retryTimer)return;retryTimer=setTimeout(function(){retryTimer=0;repaint();},2200);}"
-      "async function repaint(){if(updating)return;updating=true;try{if(!await loadInto('/api/wifi/observed','wifi-observed-card')){retryDetails();return;}if(!await loadInto('/api/wifi/channel','wifi-channel-region')){retryDetails();return;}if(plotBssid&&!await loadInto('/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),'rssi-plot')){retryDetails();return;}lastDetailRefresh=Date.now();}catch(e){retryDetails();}finally{updating=false;}}"
-      "async function poll(){if(!toggle||!toggle.checked||pollBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;}}"
+      "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
+      "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
+      "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(job.id);if(e)e.innerHTML=h;lastDetailRefresh=Date.now();}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;requestBusy=false;pump();}}"
+      "function repaint(){enqueue('observed','/api/wifi/observed','wifi-observed-card');enqueue('channel','/api/wifi/channel','wifi-channel-region');if(plotBssid)enqueue('plot','/api/wifi/plot?bssid='+encodeURIComponent(plotBssid),'rssi-plot');}"
+      "async function poll(){if(!toggle||!toggle.checked||pollBusy||requestBusy)return;pollBusy=true;try{const r=await fetch('/api/wifi/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(!s.live){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;if(Date.now()-lastDetailRefresh>=15000)repaint();}}catch(e){}finally{pollBusy=false;pump();}}"
       "setTimeout(repaint,250);setInterval(poll,2000);"
       "})();</script>";
     diagnosticSendContent(refreshScript);
@@ -6169,15 +6161,16 @@ void handleBLESurvey() {
   sendThemeScript();
   {
     String refreshScript =
-      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let updating=false;let pollBusy=false;let retryTimer=0;const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
+      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let pollBusy=false;let requestBusy=false;const requestQueue=[];const queued={};const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak " + String(bleAddressPeakReferenced) + "; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak " + String(bleScanMetadataPeakUsed) + "');text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/ble/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
       "if(intervalApply)intervalApply.addEventListener('click',saveInterval);if(intervalInput){intervalInput.addEventListener('change',saveInterval);intervalInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();saveInterval();intervalInput.blur();}});}"
-      "async function loadInto(url,id){const r=await fetch(url,{cache:'no-store'});if(r.status===503)return false;if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(id);if(e)e.innerHTML=h;return true;}"
-      "function retryDetails(){if(retryTimer)return;retryTimer=setTimeout(function(){retryTimer=0;repaint();},2200);}"
-      "async function repaint(){if(updating)return;updating=true;try{if(!await loadInto('/api/ble/observed','ble-observed-card')){retryDetails();return;}if(address&&!await loadInto('/api/ble/plot?address='+encodeURIComponent(address),'rssi-plot')){retryDetails();return;}}catch(e){retryDetails();}finally{updating=false;}}"
-      "async function poll(){if(!toggle||!toggle.checked||pollBusy)return;pollBusy=true;try{const r=await fetch('/api/ble/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(s.live===false){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;repaint();}}catch(e){}finally{pollBusy=false;}}"
+      "function enqueue(key,url,id){if(queued[key])return;queued[key]=true;requestQueue.push({key:key,url:url,id:id});pump();}"
+      "function retry(job){setTimeout(function(){requestQueue.push(job);pump();},1200+Math.floor(Math.random()*3800));}"
+      "async function pump(){if(requestBusy||pollBusy||!requestQueue.length)return;requestBusy=true;const job=requestQueue.shift();let delayed=false;try{const r=await fetch(job.url,{cache:'no-store'});if(r.status===503){delayed=true;retry(job);}else{if(!r.ok)throw new Error();const h=await r.text();const e=document.getElementById(job.id);if(e)e.innerHTML=h;}}catch(e){delayed=true;retry(job);}finally{if(!delayed)queued[job.key]=false;requestBusy=false;pump();}}"
+      "function repaint(){enqueue('observed','/api/ble/observed','ble-observed-card');if(address)enqueue('plot','/api/ble/plot?address='+encodeURIComponent(address),'rssi-plot');}"
+      "async function poll(){if(!toggle||!toggle.checked||pollBusy||requestBusy)return;pollBusy=true;try{const r=await fetch('/api/ble/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();if(s.live===false){toggle.checked=false;return;}applyStatus(s);if(s.scan!==scan){scan=s.scan;repaint();}}catch(e){}finally{pollBusy=false;pump();}}"
       "setInterval(poll,2000);})();</script>";
     diagnosticSendContent(refreshScript);
   }
