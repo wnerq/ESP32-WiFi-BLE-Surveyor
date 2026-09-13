@@ -50,8 +50,8 @@
 // Firmware identity
 // ============================================================
 
-const char* FIRMWARE_FILE = "WifiConnect40a1_scan_recovery_watchdog_20260908_2123.ino";
-const char* FIRMWARE_VERSION = "40a1";
+const char* FIRMWARE_FILE = "WifiConnect40a2_infra_visibility_diagnostics_20260912_0850.ino";
+const char* FIRMWARE_VERSION = "40a2";
 const char* FIRMWARE_CHANGE_SUMMARY = "Add automatic Wi-Fi scan recovery watchdog with checkpointed restart";
 
 
@@ -415,6 +415,22 @@ bool nativeReconnectStateInitialized = false;
 bool nativeReconnectSawDisconnect = false;
 bool nativeReconnectWasConnected = false;
 uint32_t nativeReconnectObservedCount = 0;
+
+// Infrastructure visibility diagnostics are updated from the normal completed
+// survey scan. They intentionally do not start another scan or force reconnect.
+bool infrastructureObservationInitialized = false;
+bool infrastructureSavedNetworkConfigured = false;
+bool infrastructureSavedNetworkSeenLatestScan = false;
+bool infrastructureStationConnectedLatestScan = false;
+bool infrastructureVisibleDisconnectedActive = false;
+int infrastructureSavedNetworkBestRssi = -127;
+int infrastructureSavedNetworkBestChannel = 0;
+String infrastructureSavedNetworkBestBssid = "";
+uint32_t infrastructureSavedNetworkLastSeenMs = 0;
+uint32_t infrastructureVisibleDisconnectedSinceMs = 0;
+uint32_t infrastructureSavedNetworkSeenScanCount = 0;
+uint32_t infrastructureSavedNetworkSeenDisconnectedScanCount = 0;
+uint32_t infrastructureVisibleDisconnectedTransitionCount = 0;
 
 BleObservation* bleHistory = nullptr;
 size_t bleHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
@@ -3845,37 +3861,130 @@ bool connectUsingSavedCredentials() {
 }
 
 
-// Purpose: Legacy reconnect decision hook; native ESP32 auto-reconnect is preferred in the current design.
+// Purpose: Observes whether the saved infrastructure SSID is visible in the just-completed
+// survey scan and whether the station is connected. V40a2 is instrumentation-only:
+// this function may arm the pre-existing pending flag, but loop() does not service an
+// application-side reconnect attempt.
 void considerInfrastructureReconnectAfterScan(int networkCount) {
-  if (WiFi.status() == WL_CONNECTED || networkCount <= 0) {
-    if (WiFi.status() == WL_CONNECTED) infrastructureReconnectPending = false;
-    return;
-  }
-
   String savedSsid;
   String savedPassword;
-  if (!loadCredentials(savedSsid, savedPassword) || savedSsid.length() == 0) {
-    infrastructureReconnectPending = false;
-    return;
-  }
+  bool configured =
+    loadCredentials(savedSsid, savedPassword) && savedSsid.length() > 0;
+  bool connected = WiFi.status() == WL_CONNECTED;
 
   bool seen = false;
-  for (int i = 0; i < networkCount; i++) {
-    if (WiFi.SSID(i) == savedSsid) {
-      seen = true;
-      break;
+  int bestRssi = -127;
+  int bestChannel = 0;
+  String bestBssid = "";
+
+  if (configured && networkCount > 0) {
+    for (int i = 0; i < networkCount; i++) {
+      if (WiFi.SSID(i) != savedSsid) continue;
+
+      int rssi = WiFi.RSSI(i);
+      if (!seen || rssi > bestRssi) {
+        seen = true;
+        bestRssi = rssi;
+        bestChannel = WiFi.channel(i);
+        const uint8_t* candidateBssid = WiFi.BSSID(i);
+        if (candidateBssid != nullptr) {
+          char candidateBssidText[18];
+          formatBssid(candidateBssid, candidateBssidText);
+          bestBssid = candidateBssidText;
+        } else {
+          bestBssid = "";
+        }
+      }
     }
   }
 
-  if (!seen) {
+  bool previousConfigured = infrastructureSavedNetworkConfigured;
+  bool previousSeen = infrastructureSavedNetworkSeenLatestScan;
+  bool previousConnected = infrastructureStationConnectedLatestScan;
+  bool previousVisibleDisconnected = infrastructureVisibleDisconnectedActive;
+
+  infrastructureSavedNetworkConfigured = configured;
+  infrastructureSavedNetworkSeenLatestScan = seen;
+  infrastructureStationConnectedLatestScan = connected;
+  infrastructureSavedNetworkBestRssi = seen ? bestRssi : -127;
+  infrastructureSavedNetworkBestChannel = seen ? bestChannel : 0;
+  infrastructureSavedNetworkBestBssid = seen ? bestBssid : "";
+
+  if (seen) {
+    infrastructureSavedNetworkLastSeenMs = millis();
+    infrastructureSavedNetworkSeenScanCount++;
+    if (!connected) infrastructureSavedNetworkSeenDisconnectedScanCount++;
+  }
+
+  bool visibleDisconnected = configured && seen && !connected;
+  infrastructureVisibleDisconnectedActive = visibleDisconnected;
+
+  if (visibleDisconnected && !previousVisibleDisconnected) {
+    infrastructureVisibleDisconnectedSinceMs = millis();
+    infrastructureVisibleDisconnectedTransitionCount++;
+
+    String detail =
+      "ssid=" + savedSsid +
+      " rssi=" + String(bestRssi) +
+      " ch=" + String(bestChannel) +
+      " bssid=" + bestBssid +
+      " wifiStatus=" + String((int)WiFi.status()) +
+      " ip=" + WiFi.localIP().toString();
+    recordDiagnosticEvent("INFRA VISIBLE/DISCONNECTED", detail);
+
+    Serial.print("[INFRA OBS] VISIBLE_BUT_DISCONNECTED ssid=");
+    Serial.print(savedSsid);
+    Serial.print(" rssi=");
+    Serial.print(bestRssi);
+    Serial.print(" ch=");
+    Serial.print(bestChannel);
+    Serial.print(" bssid=");
+    Serial.print(bestBssid);
+    Serial.print(" WiFi.status=");
+    Serial.print((int)WiFi.status());
+    Serial.print(" IP=");
+    Serial.println(WiFi.localIP());
+  } else if (!visibleDisconnected && previousVisibleDisconnected) {
+    String reason = connected ? "station connected" : (seen ? "state changed" : "saved SSID no longer visible");
+    recordDiagnosticEvent("INFRA VISIBLE/DISCONNECTED CLEAR", reason);
+    Serial.print("[INFRA OBS] VISIBLE_BUT_DISCONNECTED cleared: ");
+    Serial.println(reason);
+    infrastructureVisibleDisconnectedSinceMs = 0;
+  }
+
+  if (
+    !infrastructureObservationInitialized ||
+    configured != previousConfigured ||
+    seen != previousSeen ||
+    connected != previousConnected
+  ) {
+    Serial.print("[INFRA OBS] configured=");
+    Serial.print(configured ? "yes" : "no");
+    Serial.print(" seen=");
+    Serial.print(seen ? "yes" : "no");
+    Serial.print(" connected=");
+    Serial.print(connected ? "yes" : "no");
+    Serial.print(" WiFi.status=");
+    Serial.print((int)WiFi.status());
+    if (seen) {
+      Serial.print(" rssi=");
+      Serial.print(bestRssi);
+      Serial.print(" ch=");
+      Serial.print(bestChannel);
+      Serial.print(" bssid=");
+      Serial.print(bestBssid);
+    }
+    Serial.println();
+  }
+
+  infrastructureObservationInitialized = true;
+
+  // Preserve V40a1's pending indication for diagnostics, but V40a2 deliberately
+  // does not call serviceInfrastructureReconnect() from loop().
+  if (connected || !configured || !seen) {
     infrastructureReconnectPending = false;
     return;
   }
-
-  // Presence in the most recently completed survey scan is the trigger. The
-  // actual WiFi.begin() call is
-  // deferred until after scan result cleanup so reconnect does not add a scan
-  // or block the completed-scan processing path.
   infrastructureReconnectPending = true;
 }
 
@@ -6873,18 +6982,46 @@ void handleDiagnosticsPage() {
     "<div class=\"row developer-only\"><span class=\"label\">Automatic Retry Backoff</span><span class=\"value\">" + String(WIFI_AUTOSCAN_RETRY_BACKOFF_MS/1000.0f,1) + " s; " + String(wifiAutoScanRetryPending ? "retry pending" : "idle") + "</span></div>"
     "<div class=\"row developer-only\"><span class=\"label\">User Interaction Defer</span><span class=\"value\">" + String(USER_INTERACTION_DEFER_MS/1000.0f,1) + " s</span></div></div>";
 
+  String savedInfraSsid;
+  String savedInfraPassword;
+  bool savedInfraConfigured = loadCredentials(savedInfraSsid, savedInfraPassword) && savedInfraSsid.length() > 0;
+  String infraObservedState = !savedInfraConfigured
+    ? String("NOT_CONFIGURED")
+    : (connected
+        ? String("CONNECTED")
+        : (infrastructureSavedNetworkSeenLatestScan
+            ? String("VISIBLE_BUT_DISCONNECTED")
+            : String("DISCONNECTED_NOT_VISIBLE")));
+
   d += "<div class=\"card advanced-only\"><h2>Infrastructure Connectivity</h2>"
     "<div class=\"row\"><span class=\"label\">Connection State</span><span class=\"value\">" + String(connected ? "Connected" : "Disconnected") + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">WiFi.status()</span><span class=\"value\">" + String((int)WiFi.status()) + "</span></div>";
+    "<div class=\"row\"><span class=\"label\">WiFi.status()</span><span class=\"value\">" + String((int)WiFi.status()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Observed State</span><span class=\"value\">" + infraObservedState + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Configured Infra SSID</span><span class=\"value\">" + htmlEscape(savedInfraConfigured ? savedInfraSsid : String("-")) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Seen In Latest Survey Scan</span><span class=\"value\">" + String(savedInfraConfigured ? (infrastructureSavedNetworkSeenLatestScan ? "Yes" : "No") : "-") + "</span></div>";
   if (connected) {
     d += "<div class=\"row\"><span class=\"label\">SSID</span><span class=\"value\">" + htmlEscape(WiFi.SSID()) + "</span></div>"
       "<div class=\"row\"><span class=\"label\">BSSID</span><span class=\"value\">" + WiFi.BSSIDstr() + "</span></div>"
       "<div class=\"row\"><span class=\"label\">Channel</span><span class=\"value\">" + String(WiFi.channel()) + "</span></div>"
       "<div class=\"row\"><span class=\"label\">IP Address</span><span class=\"value\">" + WiFi.localIP().toString() + "</span></div>";
   }
-  d += "<div class=\"row developer-only\"><span class=\"label\">Native Reconnect Transitions</span><span class=\"value\">" + String(nativeReconnectObservedCount) + "</span></div>"
+  if (savedInfraConfigured && infrastructureSavedNetworkSeenLatestScan) {
+    d += "<div class=\"row\"><span class=\"label\">Observed Infra Signal</span><span class=\"value\">" + String(infrastructureSavedNetworkBestRssi) + " dBm</span></div>"
+      "<div class=\"row\"><span class=\"label\">Observed Infra Channel</span><span class=\"value\">" + String(infrastructureSavedNetworkBestChannel) + "</span></div>"
+      "<div class=\"row developer-only\"><span class=\"label\">Observed Infra BSSID</span><span class=\"value\">" + htmlEscape(infrastructureSavedNetworkBestBssid) + "</span></div>";
+  }
+  d += "<div class=\"row advanced-only\"><span class=\"label\">Infra Seen Scans</span><span class=\"value\">" + String(infrastructureSavedNetworkSeenScanCount) + "</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Seen While Disconnected</span><span class=\"value\">" + String(infrastructureSavedNetworkSeenDisconnectedScanCount) + " scan(s)</span></div>"
+    "<div class=\"row advanced-only\"><span class=\"label\">Visible + Disconnected Transitions</span><span class=\"value\">" + String(infrastructureVisibleDisconnectedTransitionCount) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Visible + Disconnected Since</span><span class=\"value\">" +
+      String(infrastructureVisibleDisconnectedActive ? runtimeAgeLabel(infrastructureVisibleDisconnectedSinceMs) : String("-")) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Last Seen</span><span class=\"value\">" +
+      String(infrastructureSavedNetworkLastSeenMs ? runtimeAgeLabel(infrastructureSavedNetworkLastSeenMs) : String("Not seen this boot")) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Native Reconnect Transitions</span><span class=\"value\">" + String(nativeReconnectObservedCount) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Reconnect Pending (not serviced)</span><span class=\"value\">" + String(infrastructureReconnectPending ? "Yes" : "No") + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Application Reconnect Attempts</span><span class=\"value\">" + String(infrastructureReconnectAttemptCount) + "</span></div>"
     "<div class=\"row developer-only\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div>"
-    "<div class=\"note developer-only\">Detailed disconnect reasons and reconnect-attempt history are planned for a later V40 revision.</div></div>";
+    "<div class=\"note developer-only\">V40a2 observes configured-network visibility and station state only. Explicit application-side reconnect is intentionally not serviced.</div></div>";
 
   d += "<div class=\"card advanced-only\"><h2>Memory</h2>"
     "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0,1) + " KB</span></div>"
