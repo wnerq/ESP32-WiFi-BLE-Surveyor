@@ -1,32 +1,5 @@
 // ESP32 Wireless Surveyor firmware.
-// V39e: replaces self-referential Help-page ? links with a compact return arrow that goes back to the originating page.
-// V39b: adds a fixed-size server-side web stall trace so abnormal sends survive until diagnostics can be downloaded.
-// V39a added the Developer-view sticky Capture Diagnostics button; V39b preserves that behavior.
-// Provides Wi-Fi/BLE surveying, a browser interface, serial controls, session checkpointing, and developer diagnostics.
-//
-// Git commit:
 // Add end-to-end web transport/browser diagnostics to isolate intermittent deferred-loader failures
-//
-// - assign a unique page ID to every Wi-Fi root response and expose it in HTML and HTTP headers
-// - add independent guard/deferred/tail HTML markers and browser execution breadcrumbs
-// - report browser guard, loader, repaint, tail, error, and rejection stages back to the ESP32
-// - correlate deferred fragment requests with the originating page ID
-// - detect response-buffer reserve/append failures and count any dropped bytes
-// - capture per-page minimum free heap/largest block and client connection state around sends
-// - export the new transport/browser diagnostics in status.json
-// - preserve V38i serialized fragment loading, retries, throttling, and Live Updates behavior
-// - serialize and throttle expensive history-card requests
-// - defer expensive fragments while scans, exports, or low-memory pressure are active
-// - return the Wi-Fi page shell before constructing history tables and plots
-// - stream smaller response chunks without truncating valid chunked responses
-// - service completed Wi-Fi scans between response chunks
-// - retain fixed-size current/last web-operation diagnostics in status.json
-// - skip optional serial snapshots while the UART transmit buffer is congested
-// - retain the last 8 abnormal server-side web stalls without dynamic allocation
-// - record individual response sends >=150 ms and profiled responses >=500 ms
-// - export retained stall evidence in status.json after the browser/server recovers
-// - detect long repaint-to-first-fragment arrival gaps even when the ESP32 main loop remains free
-//
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <WiFi.h>
 #include <WebServer.h>
