@@ -1,5 +1,5 @@
 // ESP32 Wireless Surveyor firmware.
-// Add end-to-end web transport/browser diagnostics to isolate intermittent deferred-loader failures
+// Centralized nonblocking diagnostic LEDs alongside infrastructure recovery and the web terminal.
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,9 +18,81 @@
 #include <esp_arduino_version.h>
 #include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/timers.h>
+
+enum LedDiagEvent : uint8_t {
+  LED_EVENT_NONE, LED_EVENT_WIFI_SCAN, LED_EVENT_BLE_SCAN,
+  LED_EVENT_WEBPAGE, LED_EVENT_SERIAL_RX, LED_EVENT_INFRA_HEARTBEAT,
+  LED_EVENT_INFRA_RECONNECT_ATTEMPT, LED_EVENT_INFRA_RECONNECTED,
+  LED_EVENT_BOOT_COMPLETE, LED_EVENT_SELF_TEST, LED_EVENT_CONTROLLED_REBOOT,
+  LED_EVENT_COUNT
+};
+void ledDiagEvent(LedDiagEvent event);
+void ledDiagService();
+void ledDiagSerialRx();
+void ledDiagSetInfraConfigured(bool configured);
+void ledDiagUpdateInfraState();
+void requestControlledRestart(uint32_t minimumDelayMs);
+
+// All sketch Serial output goes through this bounded mirror. Framework/ROM logs
+// written directly to UART are outside the mirror. Input still comes from UART.
+class SurveySerialMirror : public Stream {
+ public:
+  static constexpr size_t CAPACITY = 8192;
+  void begin(unsigned long baud) { Serial.begin(baud); }
+  int available() override { return Serial.available(); }
+  int availableForWrite() override { return Serial.availableForWrite(); }
+  int read() override {
+    int value = Serial.read();
+    if (value >= 0) ledDiagSerialRx();
+    // Stream's existing timed reads may wait for a partial command. Advance
+    // already-requested indications while waiting; TX never generates events.
+    ledDiagService();
+    return value;
+  }
+  int peek() override { return Serial.peek(); }
+  void flush() override { Serial.flush(); }
+  using Print::write;
+  size_t write(uint8_t value) override { return write(&value, 1); }
+  size_t write(const uint8_t* data, size_t length) override {
+    // Capture before UART transmission so terminal evidence does not depend on
+    // a serial monitor being attached or on the UART accepting every byte.
+    for (size_t offset = 0; offset < length;) {
+      size_t count = min((size_t)128, length - offset);
+      portENTER_CRITICAL(&mux);
+      for (size_t i = 0; i < count; ++i) buffer[next++ % CAPACITY] = data[offset + i];
+      portEXIT_CRITICAL(&mux);
+      offset += count;
+    }
+    Serial.write(data, length);
+    return length;
+  }
+  size_t snapshot(uint64_t& cursor, uint8_t* out, size_t limit, bool& dropped, bool& more) {
+    portENTER_CRITICAL(&mux);
+    uint64_t oldest = next > CAPACITY ? next - CAPACITY : 0;
+    dropped = cursor < oldest || cursor > next;
+    if (dropped) cursor = oldest;
+    size_t count = (size_t)min((uint64_t)limit, next - cursor);
+    for (size_t i = 0; i < count; ++i) out[i] = buffer[cursor++ % CAPACITY];
+    more = cursor < next;
+    portEXIT_CRITICAL(&mux);
+    return count;
+  }
+ private:
+  uint8_t buffer[CAPACITY] = {};
+  uint64_t next = 0;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+};
+SurveySerialMirror surveySerial;
+// Keep the existing print sites and Arduino compatibility source using one sink.
+#undef Serial
+#define Serial surveySerial
+uint32_t terminalBootId = 0;
 
 void recordDiagnosticEvent(const char* category, const String& detail);
+void saveInfrastructureRecoverySummary();
+void serviceInfrastructureReconnect();
+void serviceNativeReconnectDiagnostics();
+void cancelInfrastructureReconnect(const char* reason);
 void clearScanHistory();
 void clearBleHistory();
 void discardObservationsForScanSlot(uint16_t slot);
@@ -32,8 +104,8 @@ bool userInteractionDeferActive();
 // ============================================================
 
 const char* FIRMWARE_FILE = "src/main.cpp (PlatformIO)";
-const char* FIRMWARE_VERSION = "40a2";
-const char* FIRMWARE_CHANGE_SUMMARY = "Add automatic Wi-Fi scan recovery watchdog with checkpointed restart";
+const char* FIRMWARE_VERSION = "40a4";
+const char* FIRMWARE_CHANGE_SUMMARY = "Add centralized nonblocking LED diagnostics for infrastructure, web, serial, boot and restart";
 
 
 Preferences preferences;
@@ -41,7 +113,8 @@ WebServer server(80);
 
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
-const uint32_t INFRA_RECONNECT_BACKOFF_MS = 30000;
+const uint32_t INFRA_NATIVE_GRACE_MS = 20000;
+const uint32_t INFRA_RECONNECT_BACKOFF_MS[] = {10000, 30000, 60000, 120000, 300000};
 const uint32_t INFRA_RECONNECT_ATTEMPT_WINDOW_MS = WIFI_TIMEOUT_MS;
 
 bool webServerStarted = false;
@@ -140,12 +213,9 @@ bool bleSurveyEnabled = false;
 // onboard LED on the specific board being used.
 const bool STATUS_LED_AVAILABLE = true;
 bool statusLedEnabled = true;
-bool statusLedSelfTestOverride = false;
 bool webAutoRefreshEnabled = true;
 const uint8_t STATUS_LED_PIN = 2;
 const bool STATUS_LED_ACTIVE_HIGH = true;
-const TickType_t WIFI_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(75);
-const TickType_t BLE_SCAN_LED_PERIOD_TICKS = pdMS_TO_TICKS(125);
 
 
 // ScanRecord remains a synthesized view used by the existing UI/CSV code.
@@ -276,8 +346,6 @@ const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
 size_t bootHeapCheckpointCount = 0;
 
-TimerHandle_t statusLedTimer = nullptr;
-volatile bool statusLedState = false;
 
 WifiObservation* scanHistory = nullptr;
 size_t scanHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
@@ -412,6 +480,95 @@ uint32_t infrastructureVisibleDisconnectedSinceMs = 0;
 uint32_t infrastructureSavedNetworkSeenScanCount = 0;
 uint32_t infrastructureSavedNetworkSeenDisconnectedScanCount = 0;
 uint32_t infrastructureVisibleDisconnectedTransitionCount = 0;
+
+bool infrastructureReconnectPending = false;
+bool infrastructureReconnectAttemptActive = false;
+bool infrastructureReconnectAttempted = false;
+uint32_t infrastructureReconnectAttemptStartedMs = 0;
+uint32_t lastInfrastructureReconnectAttemptMs = 0;
+uint32_t infrastructureReconnectAttemptCount = 0;
+uint32_t infrastructureReconnectSuccessCount = 0;
+uint32_t infrastructureDisconnectStartedMs = 0;
+bool infrastructureDisconnectActive = false;
+bool infrastructureAttemptAssociated = false;
+bool infrastructureAttemptIssuedConnect = false;
+bool infrastructureUserConnectionActive = false;
+bool infrastructureUserRecoveryPending = false;
+bool infrastructureBootConnectionActive = false;
+uint8_t infrastructureBackoffStep = 0;
+uint32_t infrastructureBackoffStartedMs = 0;
+uint32_t infrastructureBackoffDelayMs = 0;
+uint32_t infrastructureLastSuccessMs = 0;
+uint32_t infrastructureAssociationFailures = 0;
+uint32_t infrastructureIpFailures = 0;
+const char* infrastructureRecoveryState = "BOOT";
+
+// Wi-Fi callbacks only copy fixed data; Strings, logging and NVS stay in loop().
+portMUX_TYPE infrastructureEventMux = portMUX_INITIALIZER_UNLOCKED;
+uint16_t infrastructureEventDisconnectReason = 0;
+uint32_t infrastructureEventDisconnectCount = 0;
+uint32_t infrastructureEventAssociationCount = 0;
+uint32_t infrastructureHandledDisconnectCount = 0;
+uint32_t infrastructureAttemptAssociationBaseline = 0;
+
+struct InfrastructureRecoverySummary {
+  uint32_t version = 1;
+  uint32_t disconnectDurationMs = 0;
+  uint32_t visibleScans = 0;
+  uint32_t appAttempts = 0;
+  uint32_t recoveryDurationMs = 0;
+  int16_t lastRssi = -127;
+  uint16_t disconnectReason = 0;
+  uint8_t lastChannel = 0;
+  bool seen = false;
+  bool nativeRecovered = false;
+  char source[24] = "BOOT";
+  char result[32] = "none";
+};
+InfrastructureRecoverySummary infrastructureLastRecovery;
+InfrastructureRecoverySummary infrastructurePreviousRecovery;
+bool infrastructureRecoverySummaryDirty = false;
+
+void observeInfrastructureEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  portENTER_CRITICAL(&infrastructureEventMux);
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    infrastructureEventDisconnectReason = info.wifi_sta_disconnected.reason;
+    ++infrastructureEventDisconnectCount;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    ++infrastructureEventAssociationCount;
+  }
+  portEXIT_CRITICAL(&infrastructureEventMux);
+}
+
+bool infrastructureHasIp() {
+  return WiFi.status() == WL_CONNECTED && (uint32_t)WiFi.localIP() != 0;
+}
+
+void loadInfrastructureRecoverySummary() {
+  Preferences saved;
+  if (!saved.begin("infra-recovery", true)) return;
+  if (saved.getBytesLength("last") == sizeof(infrastructurePreviousRecovery)) {
+    saved.getBytes("last", &infrastructurePreviousRecovery, sizeof(infrastructurePreviousRecovery));
+    if (infrastructurePreviousRecovery.version != 1) infrastructurePreviousRecovery = {};
+    infrastructurePreviousRecovery.source[sizeof(infrastructurePreviousRecovery.source) - 1] = 0;
+    infrastructurePreviousRecovery.result[sizeof(infrastructurePreviousRecovery.result) - 1] = 0;
+  }
+  saved.end();
+}
+
+// One small, versioned summary at controlled restart, independent of history
+// checkpoint compatibility. Never persist credentials or the terminal buffer.
+void saveInfrastructureRecoverySummary() {
+  serviceNativeReconnectDiagnostics();
+  if (!infrastructureRecoverySummaryDirty) return;
+  if (infrastructureDisconnectActive)
+    infrastructureLastRecovery.disconnectDurationMs = millis() - infrastructureDisconnectStartedMs;
+  Preferences saved;
+  if (!saved.begin("infra-recovery", false)) return;
+  if (saved.putBytes("last", &infrastructureLastRecovery, sizeof(infrastructureLastRecovery)) == sizeof(infrastructureLastRecovery))
+    infrastructureRecoverySummaryDirty = false;
+  saved.end();
+}
 
 BleObservation* bleHistory = nullptr;
 size_t bleHistoryCapacity = 0;        // Physical observation capacity allocated at boot.
@@ -567,107 +724,192 @@ void captureBootHeapCheckpoint(const char* stage) {
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
-// Purpose: Drives the status LED to the requested logical state while honoring whether LED output is available.
-void writeStatusLed(bool on) {
-  if (!STATUS_LED_AVAILABLE) return;
-  if (on && !statusLedEnabled && !statusLedSelfTestOverride) return;
+// Patterns alternate ON/OFF, except reboot begins with a brief OFF phase so
+// all five flashes remain visible even when it preempts an illuminated LED.
+// Final OFF phases keep adjacent
+// indications visually separate. No timers, heap allocation or flash writes.
+struct LedDiagPattern {
+  uint8_t priority;
+  uint8_t count;
+  uint16_t ms[12];
+};
+const LedDiagPattern LED_DIAG_PATTERNS[LED_EVENT_COUNT] = {
+  {0, 0, {}},
+  {2, 2, {75, 75}},                         // Wi-Fi scan, repeated while active
+  {1, 2, {125, 125}},                       // Preserve BLE scan indication too
+  {3, 2, {50, 50}},                         // Human page/action
+  {4, 4, {25, 25, 25, 75}},                 // Actual serial RX
+  {5, 4, {80, 100, 80, 100}},               // Heartbeat, starts every 3 seconds
+  {6, 6, {60, 60, 60, 60, 60, 60}},         // Application reconnect attempt
+  {7, 2, {750, 100}},                       // Connected with IP
+  {8, 4, {100, 120, 650, 100}},             // Boot complete, once
+  {2, 8, {180, 180, 180, 180, 180, 180, 650, 100}}, // Explicit hardware self-test
+  {9, 11, {60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60}} // Controlled reboot
+};
 
-  statusLedState = on;
-  bool electricalHigh =
-      STATUS_LED_ACTIVE_HIGH ? on : !on;
-  digitalWrite(STATUS_LED_PIN, electricalHigh ? HIGH : LOW);
-}
-
-// Purpose: FreeRTOS timer callback used to toggle or advance status-LED scan indication.
-void statusLedTimerCallback(TimerHandle_t) {
-  writeStatusLed(!statusLedState);
-}
-
-// Purpose: Configures the status LED pin and creates the timer used for nonblocking indications.
-void initializeStatusLed() {
-  if (!STATUS_LED_AVAILABLE) return;
-
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  writeStatusLed(false);
-
-  statusLedTimer = xTimerCreate(
-      "surveyLed",
-      WIFI_SCAN_LED_PERIOD_TICKS,
-      pdTRUE,
-      nullptr,
-      statusLedTimerCallback);
-}
-
-// Purpose: Starts the periodic LED indication used while a radio scan is active.
-void startScanLed(TickType_t periodTicks) {
-  if (!STATUS_LED_AVAILABLE || !statusLedEnabled || statusLedTimer == nullptr) return;
-
-  writeStatusLed(true);
-  xTimerStop(statusLedTimer, 0);
-  xTimerChangePeriod(statusLedTimer, periodTicks, 0);
-}
-
-// Purpose: Stops scan indication and returns the status LED to its normal state.
-void stopScanLed() {
-  if (!STATUS_LED_AVAILABLE) return;
-
-  if (statusLedTimer != nullptr) {
-    xTimerStop(statusLedTimer, 0);
+// Sole owner of the GPIO and all diagnostic LED state. Main-loop callers only
+// submit semantic events/state. Wi-Fi callbacks never touch this manager.
+class DiagnosticLedManager {
+ public:
+  void begin() {
+    if (STATUS_LED_AVAILABLE) pinMode(STATUS_LED_PIN, OUTPUT);
+    initialized = true;
+    writeOutput(false, true);
   }
-
-  writeStatusLed(false);
-}
-
-void statusLedPulse(
-  unsigned long onMs,
-  unsigned long offMs
-) {
-  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
-
-  writeStatusLed(true);
-  delay(onMs);
-  writeStatusLed(false);
-  delay(offMs);
-}
-
-// Purpose: Shows the early-boot LED pattern before the web interface is ready.
-void indicateBootStarted() {
-  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
-
-  statusLedPulse(90, 90);
-  statusLedPulse(90, 0);
-}
-
-// Purpose: Shows the final startup LED state based on detected failure or warning conditions.
-void indicateStartupStatus(bool failed, bool warning) {
-  if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && !statusLedSelfTestOverride)) return;
-
-  if (failed) {
-    for (int i = 0; i < 3; i++) statusLedPulse(300, 220);
-    return;
+  void event(LedDiagEvent event) {
+    if (event <= LED_EVENT_NONE || event >= LED_EVENT_COUNT || event == LED_EVENT_INFRA_HEARTBEAT) return;
+    if (event == LED_EVENT_BOOT_COMPLETE) {
+      if (runtimeReady) return;
+      runtimeReady = true;
+    }
+    if (!runtimeReady) return;
+    if (event == LED_EVENT_WIFI_SCAN) { wifiScan = true; service(); return; }
+    if (event == LED_EVENT_BLE_SCAN) { bleScan = true; service(); return; }
+    if (event == LED_EVENT_CONTROLLED_REBOOT) {
+      if (rebootRequested) return;
+      rebootRequested = true;
+      rebootComplete = !STATUS_LED_AVAILABLE || !statusLedEnabled;
+    }
+    if ((!STATUS_LED_AVAILABLE || !statusLedEnabled) && event != LED_EVENT_SELF_TEST) { service(); return; }
+    if (active == event || (pending & (1U << event))) return;
+    pending |= 1U << event; // Coalesce repetitions; bounded to one of each event.
+    service();
   }
-
-  if (warning) {
-    for (int i = 0; i < 2; i++) statusLedPulse(250, 220);
-    return;
+  void scanFinished(bool bluetooth) {
+    if (bluetooth) bleScan = false; else wifiScan = false;
+    service();
   }
+  void setInfraDisconnected(bool value) {
+    if (infraDisconnected == value) return;
+    infraDisconnected = value;
+    heartbeatDue = value;
+    Serial.print("[LED] INFRA_DISCONNECTED active="); Serial.println(value ? 1 : 0);
+    service();
+  }
+  void service() {
+    const uint32_t startedUs = micros();
+    const uint32_t now = millis();
+    if (runtimeReady && serviceSeen) {
+      uint32_t gap = now - lastServiceMs;
+      if (gap > maxServiceGapMs) maxServiceGapMs = gap;
+    }
+    serviceSeen = runtimeReady;
+    lastServiceMs = now;
+    step(now);
+    uint32_t elapsedUs = micros() - startedUs;
+    if (elapsedUs > maxServiceUs) maxServiceUs = elapsedUs;
+  }
+  bool rebootFinished() const { return rebootRequested && rebootComplete; }
+  bool ready() const { return runtimeReady; }
+  uint32_t maxServiceUs = 0;
+  uint32_t maxServiceGapMs = 0;
 
-  statusLedPulse(650, 0);
+ private:
+  bool initialized = false, runtimeReady = false, output = false;
+  bool wifiScan = false, bleScan = false, infraDisconnected = false;
+  bool heartbeatDue = false, rebootRequested = false, rebootComplete = false;
+  bool serviceSeen = false;
+  uint16_t pending = 0;
+  LedDiagEvent active = LED_EVENT_NONE;
+  uint8_t phase = 0;
+  uint32_t phaseStartedMs = 0, heartbeatStartedMs = 0, lastServiceMs = 0;
+
+  void writeOutput(bool on, bool force = false) {
+    if (!initialized || !STATUS_LED_AVAILABLE) return;
+    if (!statusLedEnabled && active != LED_EVENT_SELF_TEST) on = false;
+    if (!force && output == on) return;
+    output = on;
+    digitalWrite(STATUS_LED_PIN, (STATUS_LED_ACTIVE_HIGH ? on : !on) ? HIGH : LOW);
+  }
+  void step(uint32_t now) {
+    if (!initialized || !runtimeReady) return;
+    if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && active != LED_EVENT_SELF_TEST && !(pending & (1U << LED_EVENT_SELF_TEST)))) {
+      if (rebootRequested) rebootComplete = true;
+      active = LED_EVENT_NONE; pending = 0; writeOutput(false); return;
+    }
+    if (rebootComplete) { active = LED_EVENT_NONE; pending = 0; writeOutput(false); return; }
+    if ((active == LED_EVENT_WIFI_SCAN && !wifiScan) ||
+        (active == LED_EVENT_BLE_SCAN && !bleScan) ||
+        (active == LED_EVENT_INFRA_HEARTBEAT && !infraDisconnected)) active = LED_EVENT_NONE;
+
+    // At most one phase advance per call. After a long pre-existing handler,
+    // stretch the pattern instead of replaying missed flashes in a tight loop.
+    if (active != LED_EVENT_NONE && (uint32_t)(now - phaseStartedMs) >= LED_DIAG_PATTERNS[active].ms[phase]) {
+      ++phase;
+      phaseStartedMs = now;
+      if (phase == LED_DIAG_PATTERNS[active].count) {
+        if (active == LED_EVENT_CONTROLLED_REBOOT) rebootComplete = true;
+        active = LED_EVENT_NONE;
+      }
+    }
+    if (rebootComplete) { pending = 0; writeOutput(false); return; }
+
+    LedDiagEvent next = LED_EVENT_NONE;
+    // Fixed-size priority selection, not a loop waiting for LED timing.
+    if (pending) {
+      for (uint8_t i = 1; i < LED_EVENT_COUNT; ++i) {
+        if ((pending & (1U << i)) && LED_DIAG_PATTERNS[i].priority > LED_DIAG_PATTERNS[next].priority)
+          next = (LedDiagEvent)i;
+      }
+    }
+    if (infraDisconnected && (heartbeatDue || (uint32_t)(now - heartbeatStartedMs) >= 3000) &&
+        LED_DIAG_PATTERNS[next].priority < LED_DIAG_PATTERNS[LED_EVENT_INFRA_HEARTBEAT].priority)
+      next = LED_EVENT_INFRA_HEARTBEAT;
+    if (next == LED_EVENT_NONE && wifiScan) next = LED_EVENT_WIFI_SCAN;
+    if (next == LED_EVENT_NONE && bleScan) next = LED_EVENT_BLE_SCAN;
+    if (next != LED_EVENT_NONE && LED_DIAG_PATTERNS[next].priority > LED_DIAG_PATTERNS[active].priority) {
+      active = next; phase = 0; phaseStartedMs = now;
+      pending &= ~(1U << next);
+      if (next == LED_EVENT_INFRA_HEARTBEAT) { heartbeatDue = false; heartbeatStartedMs = now; }
+    }
+    writeOutput(active != LED_EVENT_NONE && (phase % 2) == (active == LED_EVENT_CONTROLLED_REBOOT ? 1 : 0));
+  }
+};
+
+DiagnosticLedManager diagnosticLed;
+bool ledDiagInfraConfigured = false;
+void ledDiagEvent(LedDiagEvent event) { diagnosticLed.event(event); }
+void ledDiagService() { diagnosticLed.service(); }
+void ledDiagSerialRx() { ledDiagEvent(LED_EVENT_SERIAL_RX); }
+void ledDiagScanFinished(bool bluetooth = false) { diagnosticLed.scanFinished(bluetooth); }
+void ledDiagSetInfraDisconnected(bool active) { diagnosticLed.setInfraDisconnected(active); }
+void ledDiagUpdateInfraState() {
+  ledDiagSetInfraDisconnected(ledDiagInfraConfigured && (WiFi.getMode() & WIFI_MODE_STA) && !infrastructureHasIp());
 }
-
-// Purpose: Runs a short visible LED pattern so the user can verify the configured indicator hardware.
-void runStatusLedSelfTest() {
-  if (!STATUS_LED_AVAILABLE) return;
-
-  if (statusLedTimer != nullptr) xTimerStop(statusLedTimer, 0);
-  statusLedSelfTestOverride = true;
-  writeStatusLed(false);
-  delay(120);
-  for (int i = 0; i < 3; i++) statusLedPulse(180, 180);
-  writeStatusLed(true);
-  delay(650);
-  writeStatusLed(false);
-  statusLedSelfTestOverride = false;
+void ledDiagSetInfraConfigured(bool configured) {
+  ledDiagInfraConfigured = configured;
+  ledDiagUpdateInfraState();
+}
+void ledDiagInfraAttempt(const char* source) {
+  if (!diagnosticLed.ready()) return;
+  ledDiagEvent(LED_EVENT_INFRA_RECONNECT_ATTEMPT);
+  Serial.print("[LED] INFRA_RECONNECT_ATTEMPT source="); Serial.println(source);
+}
+void ledDiagInfraReconnected(const char* source) {
+  if (!diagnosticLed.ready()) return;
+  ledDiagSetInfraDisconnected(false);
+  ledDiagEvent(LED_EVENT_INFRA_RECONNECTED);
+  Serial.print("[LED] INFRA_RECONNECTED source="); Serial.println(source);
+}
+// Exact allowlist: polling endpoints (including terminal data and status.json)
+// never generate a page event. POSTs below are explicit settings/user actions.
+bool ledDiagIsHumanRequest(const char* route, bool post) {
+  const char* const pages[] = {"/", "/scan", "/system", "/diagnostics", "/settings", "/help", "/ble", "/ap", "/terminal"};
+  const char* const actions[] = {
+    "/restart-device", "/config/import", "/wifi-save", "/wifi-clear", "/hostname-save",
+    "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
+    "/api/wifi/interval", "/api/ble/interval", "/api/diag/event-limit", "/history-prefill",
+    "/session-save", "/session-discard", "/ble-mode", "/ap-save"
+  };
+  const char* const getActions[] = {"/scan-now", "/scan-settings", "/scan-clear", "/scanlog.csv", "/ble-scan", "/ble-settings", "/ble-clear", "/blelog.csv", "/config.json"};
+  if (!route) return false;
+  if (post) {
+    for (const char* action : actions) if (strcmp(route, action) == 0) return true;
+  } else {
+    for (const char* page : pages) if (strcmp(route, page) == 0) return true;
+    for (const char* action : getActions) if (strcmp(route, action) == 0) return true;
+  }
+  return false;
 }
 
 
@@ -678,6 +920,7 @@ void runStatusLedSelfTest() {
 // Purpose: Reads one complete command line from Serial without changing the command parser itself.
 String readSerialLine() {
   while (!Serial.available()) {
+    ledDiagService();
     if (webServerStarted) {
       server.handleClient();
     }
@@ -884,6 +1127,7 @@ void saveBleSurveyEnabled(bool enabled) {
 // Purpose: Persists interface preferences that are stored on the ESP32 rather than in the browser.
 void saveInterfaceSettings(bool ledEnabled, bool autoRefreshEnabled) {
   statusLedEnabled = ledEnabled;
+  ledDiagService();
   webAutoRefreshEnabled = autoRefreshEnabled;
   preferences.begin("survey", false);
   preferences.putBool("ledEnabled", statusLedEnabled);
@@ -943,7 +1187,7 @@ bool startAccessPoint() {
     Serial.println(apSSID);
 
     Serial.print("AP Password: ");
-    Serial.println(apPassword);
+  Serial.println("[redacted]");
 
     Serial.print("AP IP:       ");
     Serial.println(WiFi.softAPIP());
@@ -1303,12 +1547,16 @@ void initializeSessionStorageAndRestore() {
 
 // Purpose: Waits briefly for active work to finish, then saves a checkpoint before an intentional reboot.
 bool checkpointBeforeControlledRestart() {
-  if (historyCount == 0 && (!bleSurveyEnabled || bleHistoryCount == 0)) return true;
+  if (historyCount == 0 && (!bleSurveyEnabled || bleHistoryCount == 0)) {
+    saveInfrastructureRecoverySummary();
+    return true;
+  }
   uint32_t waitStarted = millis();
   while (wifiScanInProgress && (uint32_t)(millis() - waitStarted) < 10000) {
     serviceLoggedWifiScan();
     delay(10);
   }
+  saveInfrastructureRecoverySummary();
   String detail;
   return saveSurveySessionCheckpoint(detail);
 }
@@ -1440,16 +1688,68 @@ void handleSessionCheckpointDiscard() {
 
 // Purpose: Observes infrastructure Wi-Fi link transitions so native ESP32 auto-reconnect behavior can be diagnosed.
 void serviceNativeReconnectDiagnostics() {
-  bool connected = WiFi.status() == WL_CONNECTED;
+  bool connected = infrastructureHasIp();
+  ledDiagUpdateInfraState();
+  uint32_t now = millis();
+  uint32_t disconnectEvents;
+  uint16_t reason;
+  portENTER_CRITICAL(&infrastructureEventMux);
+  disconnectEvents = infrastructureEventDisconnectCount;
+  reason = infrastructureEventDisconnectReason;
+  portEXIT_CRITICAL(&infrastructureEventMux);
   if (!nativeReconnectStateInitialized) {
     nativeReconnectStateInitialized = true;
     nativeReconnectWasConnected = connected;
-    return;
   }
-  if (nativeReconnectWasConnected && !connected) nativeReconnectSawDisconnect = true;
-  if (!nativeReconnectWasConnected && connected && nativeReconnectSawDisconnect) {
-    nativeReconnectObservedCount++;
+  if (!connected && !infrastructureDisconnectActive) {
+    infrastructureDisconnectActive = true;
+    infrastructureDisconnectStartedMs = now;
+    infrastructureLastRecovery = {};
+    nativeReconnectSawDisconnect = true;
+    infrastructureRecoverySummaryDirty = true;
+    recordDiagnosticEvent("INFRA LOST", "station has no IP; native grace started");
+  }
+  if (disconnectEvents != infrastructureHandledDisconnectCount) {
+    infrastructureHandledDisconnectCount = disconnectEvents;
+    // Keep the RF failure reason, not our later intentional cancellation.
+    if (reason != WIFI_REASON_ASSOC_LEAVE) infrastructureLastRecovery.disconnectReason = reason;
+    recordDiagnosticEvent("INFRA DISC", "reason=" + String(reason));
+    infrastructureRecoverySummaryDirty = true;
+  }
+  if (connected && infrastructureDisconnectActive) {
+    bool application = infrastructureReconnectAttemptActive && infrastructureAttemptIssuedConnect;
+    const char* source = infrastructureBootConnectionActive ? "BOOT" : (infrastructureUserRecoveryPending ? "USER_REQUEST" :
+      (application ? "SAVED_NETWORK_DISCOVERY" : "NATIVE_RECONNECT"));
+    if (infrastructureBootConnectionActive || infrastructureUserRecoveryPending) {
+      infrastructureUserRecoveryPending = false;
+    } else if (application) {
+      ++infrastructureReconnectSuccessCount;
+    } else {
+      ++nativeReconnectObservedCount;
+      infrastructureLastRecovery.nativeRecovered = true;
+    }
+    infrastructureLastRecovery.disconnectDurationMs = now - infrastructureDisconnectStartedMs;
+    infrastructureLastRecovery.recoveryDurationMs = application ? now - infrastructureReconnectAttemptStartedMs : infrastructureLastRecovery.disconnectDurationMs;
+    snprintf(infrastructureLastRecovery.source, sizeof(infrastructureLastRecovery.source), "%s", source);
+    snprintf(infrastructureLastRecovery.result, sizeof(infrastructureLastRecovery.result), "connected-with-ip");
+    infrastructureLastSuccessMs = now;
+    infrastructureRecoverySummaryDirty = true;
+    recordDiagnosticEvent("INFRA SUCCESS", String(source) + " outage=" + String(infrastructureLastRecovery.disconnectDurationMs) + "ms");
+    ledDiagInfraReconnected(source);
+    Serial.print("[INFRA] Connected with IP via "); Serial.println(source);
+    infrastructureDisconnectActive = false;
     nativeReconnectSawDisconnect = false;
+  }
+  if (connected) {
+    infrastructureReconnectPending = false;
+    infrastructureReconnectAttemptActive = false;
+    infrastructureReconnectAttempted = false;
+    infrastructureBackoffStep = 0;
+    infrastructureBackoffDelayMs = 0;
+    infrastructureVisibleDisconnectedActive = false;
+    infrastructureVisibleDisconnectedSinceMs = 0;
+    infrastructureStationConnectedLatestScan = true;
+    infrastructureRecoveryState = "CONNECTED";
   }
   nativeReconnectWasConnected = connected;
 }
@@ -1609,6 +1909,7 @@ void setWebOperationPhase(const char* phase) {
 
 // Purpose: Runs a registered HTTP handler while retaining allocation-free current/last operation diagnostics.
 void runDiagnosticWebHandler(const char* route, void (*handler)()) {
+  if (ledDiagIsHumanRequest(route, server.method() == HTTP_POST)) ledDiagEvent(LED_EVENT_WEBPAGE);
   uint32_t startMs = millis();
   webOperationState.active = true;
   webOperationState.activeSinceMs = startMs;
@@ -1919,12 +2220,16 @@ void beginWebResponseProfile(const char* route) {
 
 // Purpose: Buffers response text so small logical fragments become moderate network writes.
 void diagnosticSendContent(const String& content) {
+  ledDiagService();
   appendDiagnosticWebResponseBytes(content.c_str(), content.length());
+  ledDiagService();
 }
 
 // Purpose: Buffers literal response text without creating a temporary String for each call.
 void diagnosticSendContent(const char* content) {
+  ledDiagService();
   appendDiagnosticWebResponseBytes(content, strlen(content));
+  ledDiagService();
 }
 
 // Purpose: Records elapsed work and send activity for one logical response-generation phase.
@@ -2565,20 +2870,14 @@ String wifiScanStatusMessage = "Idle";
 
 // Saved infrastructure Wi-Fi reconnects opportunistically from survey results.
 // No extra scan is started just for connectivity recovery.
-bool infrastructureReconnectPending = false;
-bool infrastructureReconnectAttemptActive = false;
-bool infrastructureReconnectAttempted = false;
-uint32_t infrastructureReconnectAttemptStartedMs = 0;
-uint32_t lastInfrastructureReconnectAttemptMs = 0;
-uint32_t infrastructureReconnectAttemptCount = 0;
-uint32_t infrastructureReconnectSuccessCount = 0;
-
 bool loadCredentials(String& ssid, String& password);
 void considerInfrastructureReconnectAfterScan(int networkCount);
 void serviceNativeReconnectDiagnostics();
 
 // Purpose: Converts a completed ESP32 Wi-Fi scan into compact retained observations and updates scan state.
 int processCompletedWifiScan(int networkCount) {
+  // Inspect raw results before history capacity checks, including serial scans.
+  if (networkCount >= 0) considerInfrastructureReconnectAfterScan(networkCount);
   scanCounter++;
   lastScanUptimeMs = surveySessionUptimeMs();
   wifiScanCompletedSinceBoot = true;
@@ -2752,13 +3051,14 @@ void noteAutomaticScanFailure() {
 
 // Purpose: Legacy synchronous wrapper that starts a logged Wi-Fi scan and waits for its completion.
 int performLoggedScan() {
+  cancelInfrastructureReconnect("manual-scan");
   ensureWiFiStationMode();
 
-  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
+  ledDiagEvent(LED_EVENT_WIFI_SCAN);
   uint32_t scanStartMs = millis();
   int networkCount = WiFi.scanNetworks(false, true);
   uint32_t scanDurationMs = millis() - scanStartMs;
-  stopScanLed();
+  ledDiagScanFinished();
 
   int result = processCompletedWifiScan(networkCount);
   if (networkCount >= 0) recordWifiScanDuration(scanDurationMs);
@@ -2771,6 +3071,10 @@ int performLoggedScan() {
 // Purpose: Starts an asynchronous Wi-Fi scan when scheduling and resource conditions permit it.
 bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   if (wifiScanInProgress) return false;
+  if (infrastructureReconnectAttemptActive) {
+    if (automaticTrigger) return false;
+    cancelInfrastructureReconnect("manual-scan");
+  }
 
   ensureWiFiStationMode();
   WiFi.scanDelete();
@@ -2797,7 +3101,7 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   wifiInitialScanCheckpointPending =
       wifiInitialScanCheckpointPending || initialCheckpoint;
   wifiScanStatusMessage = "Wi-Fi scan in progress...";
-  startScanLed(WIFI_SCAN_LED_PERIOD_TICKS);
+  ledDiagEvent(LED_EVENT_WIFI_SCAN);
   return true;
 }
 
@@ -2809,7 +3113,7 @@ void serviceLoggedWifiScan() {
   if (result == WIFI_SCAN_RUNNING) {
     uint32_t elapsedMs = millis() - wifiCurrentScanStartMs;
     if (elapsedMs < WIFI_SCAN_WATCHDOG_MS) return;
-    stopScanLed();
+    ledDiagScanFinished();
     WiFi.scanDelete();
     wifiScanInProgress = false;
     wifiScanStatusMessage = "Timed out; recovery scheduled";
@@ -2824,7 +3128,7 @@ void serviceLoggedWifiScan() {
   }
 
   uint32_t scanDurationMs = millis() - wifiCurrentScanStartMs;
-  stopScanLed();
+  ledDiagScanFinished();
   wifiScanInProgress = false;
 
   if (result == WIFI_SCAN_FAILED) {
@@ -2841,7 +3145,6 @@ void serviceLoggedWifiScan() {
 
   processCompletedWifiScan(result);
   noteSuccessfulWifiScan();
-  considerInfrastructureReconnectAfterScan(result);
   recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
     wifiAutoScanCompletionCount++;
@@ -2918,8 +3221,7 @@ void serviceWifiScanRecoveryWatchdog() {
   Serial.print(" / ");
   Serial.print(WIFI_RECOVERY_BOOT_LIMIT);
   Serial.println(". Restarting ESP32...");
-  delay(250);
-  ESP.restart();
+  requestControlledRestart(250);
 }
 
 // ============================================================
@@ -3391,14 +3693,14 @@ int performLoggedBLEScanWithTrigger(const char* trigger) {
     Serial.println();
   }
 
-  startScanLed(BLE_SCAN_LED_PERIOD_TICKS);
+  ledDiagEvent(LED_EVENT_BLE_SCAN);
   uint32_t apiStartMs = millis();
   bool started = scan->start(BLE_SCAN_DURATION_SECONDS * 1000UL, false, true);
   uint32_t apiEndMs = millis();
   bleDiagnosticLastApiDurationMs = (uint32_t)(apiEndMs - apiStartMs);
 
   if (!started) {
-    stopScanLed();
+    ledDiagScanFinished(true);
     bleDiagnosticScanActive = false;
     bleDiagnosticLastScanEndMs = millis();
     bleStatusMessage = "BLE scan failed to start.";
@@ -3428,7 +3730,7 @@ void serviceCompletedBLEScan() {
   bleAsyncCompletionPending = false;
 
   uint32_t completionMs = bleAsyncCompletionMs;
-  stopScanLed();
+  ledDiagScanFinished(true);
 
   bleDiagnosticLastHeapAfterApi = ESP.getFreeHeap();
   bleDiagnosticLastLargestAfterApi = diagnosticLargestFreeBlock();
@@ -3570,6 +3872,10 @@ void saveCredentials(const String& ssid, const String& password) {
   preferences.putString("password", password);
   preferences.end();
 
+  infrastructureSavedNetworkConfigured = ssid.length() > 0;
+  ledDiagSetInfraConfigured(ssid.length() > 0);
+  infrastructureSavedNetworkSeenLatestScan = false;
+  infrastructureReconnectPending = false;
   Serial.println("Wi-Fi credentials saved.");
 }
 
@@ -3582,15 +3888,22 @@ bool loadCredentials(String& ssid, String& password) {
 
   preferences.end();
 
+  ledDiagSetInfraConfigured(ssid.length() > 0);
   return ssid.length() > 0;
 }
 
 // Purpose: Deletes saved infrastructure Wi-Fi credentials from NVS.
 void eraseCredentials() {
+  cancelInfrastructureReconnect("credentials-cleared");
   preferences.begin("wifi", false);
   preferences.clear();
   preferences.end();
 
+  infrastructureSavedNetworkConfigured = false;
+  ledDiagSetInfraConfigured(false);
+  infrastructureSavedNetworkSeenLatestScan = false;
+  infrastructureVisibleDisconnectedActive = false;
+  infrastructureVisibleDisconnectedSinceMs = 0;
   Serial.println("Saved Wi-Fi credentials erased.");
 }
 
@@ -3714,7 +4027,7 @@ bool wifiAutoScanCadenceOverdue() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
 
-  if (csvExportInProgress || userInteractionDeferActive() || wifiScanInProgress)
+  if (csvExportInProgress || userInteractionDeferActive() || wifiScanInProgress || infrastructureReconnectAttemptActive)
     return false;
 
   if (!wifiScanCompletedSinceBoot)
@@ -3730,6 +4043,9 @@ bool wifiAutoScanCadenceOverdue() {
 String wifiAutoScanDiagnosticLabel() {
   uint32_t now = millis();
   uint32_t intervalMs = scanIntervalSeconds * 1000UL;
+
+  if (infrastructureReconnectAttemptActive)
+    return "DEFERRED - infrastructure recovery (15 s maximum)";
 
   if (csvExportInProgress)
     return "PAUSED - CSV export in progress";
@@ -3782,6 +4098,10 @@ String wifiAutoScanLastCompletionLabel() {
 
 // Purpose: Attempts infrastructure Wi-Fi connection with supplied credentials while preserving survey operation.
 bool connectToWiFi(const String& ssid, const String& password) {
+  cancelInfrastructureReconnect("user-request");
+  serviceNativeReconnectDiagnostics();
+  infrastructureUserConnectionActive = true;
+  infrastructureUserRecoveryPending = true;
   Serial.println();
   Serial.print("Connecting to ");
   Serial.print(ssid);
@@ -3796,12 +4116,15 @@ bool connectToWiFi(const String& ssid, const String& password) {
 
   unsigned long startTime = millis();
 
-  while (WiFi.status() != WL_CONNECTED) {
+  while (!infrastructureHasIp()) {
     if (millis() - startTime >= WIFI_TIMEOUT_MS) {
       Serial.println();
       Serial.println("Connection timed out.");
 
       WiFi.disconnect();
+      infrastructureUserConnectionActive = false;
+      infrastructureUserRecoveryPending = false;
+      serviceNativeReconnectDiagnostics();
       return false;
     }
 
@@ -3822,6 +4145,9 @@ bool connectToWiFi(const String& ssid, const String& password) {
   Serial.print(WiFi.RSSI());
   Serial.println(" dBm");
 
+  infrastructureUserConnectionActive = false;
+  serviceNativeReconnectDiagnostics();
+  infrastructureUserRecoveryPending = false;
   return true;
 }
 
@@ -3838,20 +4164,22 @@ bool connectUsingSavedCredentials() {
   Serial.print("Saved Wi-Fi network: ");
   Serial.println(ssid);
 
-  return connectToWiFi(ssid, password);
+  infrastructureBootConnectionActive = true;
+  bool connected = connectToWiFi(ssid, password);
+  infrastructureBootConnectionActive = false;
+  return connected;
 }
 
 
 // Purpose: Observes whether the saved infrastructure SSID is visible in the just-completed
-// survey scan and whether the station is connected. V40a2 is instrumentation-only:
-// this function may arm the pre-existing pending flag, but loop() does not service an
-// application-side reconnect attempt.
+// survey scan and whether the station is connected. Only scan evidence arms recovery.
 void considerInfrastructureReconnectAfterScan(int networkCount) {
+  serviceNativeReconnectDiagnostics();
   String savedSsid;
   String savedPassword;
   bool configured =
     loadCredentials(savedSsid, savedPassword) && savedSsid.length() > 0;
-  bool connected = WiFi.status() == WL_CONNECTED;
+  bool connected = infrastructureHasIp();
 
   bool seen = false;
   int bestRssi = -127;
@@ -3894,7 +4222,14 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
   if (seen) {
     infrastructureSavedNetworkLastSeenMs = millis();
     infrastructureSavedNetworkSeenScanCount++;
-    if (!connected) infrastructureSavedNetworkSeenDisconnectedScanCount++;
+    if (!connected) {
+      infrastructureSavedNetworkSeenDisconnectedScanCount++;
+      infrastructureLastRecovery.seen = true;
+      ++infrastructureLastRecovery.visibleScans;
+      infrastructureLastRecovery.lastRssi = bestRssi;
+      infrastructureLastRecovery.lastChannel = bestChannel;
+      infrastructureRecoverySummaryDirty = true;
+    }
   }
 
   bool visibleDisconnected = configured && seen && !connected;
@@ -3960,8 +4295,7 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
 
   infrastructureObservationInitialized = true;
 
-  // Preserve V40a1's pending indication for diagnostics, but V40a2 deliberately
-  // does not call serviceInfrastructureReconnect() from loop().
+  // A newer scan that cannot see the saved SSID revokes the pending evidence.
   if (connected || !configured || !seen) {
     infrastructureReconnectPending = false;
     return;
@@ -3970,75 +4304,149 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
 }
 
 
-// Purpose: Services application-side infrastructure reconnect state when such a retry has been explicitly armed.
+uint32_t infrastructureBackoffRemainingMs() {
+  uint32_t elapsed = millis() - infrastructureBackoffStartedMs;
+  return elapsed < infrastructureBackoffDelayMs ? infrastructureBackoffDelayMs - elapsed : 0;
+}
+
+void finishInfrastructureAttempt(const char* result) {
+  infrastructureReconnectAttemptActive = false;
+  infrastructureReconnectPending = false; // Require a fresh completed scan for another attempt.
+  infrastructureBackoffStartedMs = millis();
+  infrastructureBackoffDelayMs = INFRA_RECONNECT_BACKOFF_MS[infrastructureBackoffStep];
+  if (infrastructureBackoffStep < 4) ++infrastructureBackoffStep;
+  infrastructureRecoveryState = "BACKOFF";
+  infrastructureLastRecovery.recoveryDurationMs = millis() - infrastructureReconnectAttemptStartedMs;
+  snprintf(infrastructureLastRecovery.result, sizeof(infrastructureLastRecovery.result), "%s", result);
+  infrastructureRecoverySummaryDirty = true;
+  recordDiagnosticEvent("INFRA RESULT", String(result) + " retry-after=" + String(infrastructureBackoffDelayMs) + "ms");
+  Serial.print("[INFRA] "); Serial.println(result);
+}
+
+void cancelInfrastructureReconnect(const char* reason) {
+  // Observe a just-completed connection before deciding to cancel it.
+  serviceNativeReconnectDiagnostics();
+  if (infrastructureReconnectAttemptActive) {
+    esp_wifi_disconnect(); // No wait; preserve AP and credentials/native policy.
+    finishInfrastructureAttempt(reason);
+  }
+  infrastructureReconnectPending = false;
+}
+
+// Purpose: Supplements native reconnect using completed-scan evidence. No waits,
+// radio-mode changes, extra survey scans, or credentials in diagnostics.
 void serviceInfrastructureReconnect() {
-  if (WiFi.status() == WL_CONNECTED) {
-    infrastructureReconnectPending = false;
-    if (infrastructureReconnectAttemptActive) {
-      infrastructureReconnectAttemptActive = false;
-      infrastructureReconnectSuccessCount++;
-      Serial.print("Infrastructure Wi-Fi reconnected automatically: ");
-      Serial.println(WiFi.SSID());
+  serviceNativeReconnectDiagnostics();
+  if (infrastructureHasIp() || infrastructureUserConnectionActive) return;
+  uint32_t now = millis();
+  bool associated = WiFi.STA.connected();
+  if (infrastructureReconnectAttemptActive) {
+    uint32_t associations;
+    portENTER_CRITICAL(&infrastructureEventMux);
+    associations = infrastructureEventAssociationCount;
+    portEXIT_CRITICAL(&infrastructureEventMux);
+    if (associated || associations != infrastructureAttemptAssociationBaseline) infrastructureAttemptAssociated = true;
+    const char* state = associated ? "WAITING_FOR_IP" : "CONNECTING";
+    if (strcmp(infrastructureRecoveryState, state) != 0) recordDiagnosticEvent("INFRA STATE", state);
+    infrastructureRecoveryState = state;
+    if ((uint32_t)(now - infrastructureReconnectAttemptStartedMs) >= INFRA_RECONNECT_ATTEMPT_WINDOW_MS) {
+      if (associated) ++infrastructureIpFailures;
+      else ++infrastructureAssociationFailures;
+      esp_wifi_disconnect();
+      finishInfrastructureAttempt(associated ? "ip-timeout" : (infrastructureAttemptAssociated ? "association-lost" : "association-timeout"));
     }
     return;
   }
-
-  uint32_t now = millis();
-
-  if (
-    infrastructureReconnectAttemptActive &&
-    (uint32_t)(now - infrastructureReconnectAttemptStartedMs) >=
-      INFRA_RECONNECT_ATTEMPT_WINDOW_MS
-  ) {
-    infrastructureReconnectAttemptActive = false;
+  if (!infrastructureSavedNetworkConfigured) { infrastructureRecoveryState = "DISABLED"; return; }
+  if ((uint32_t)(now - infrastructureDisconnectStartedMs) < INFRA_NATIVE_GRACE_MS) {
+    infrastructureRecoveryState = "NATIVE_RECOVERY"; return;
   }
+  if (infrastructureBackoffRemainingMs()) { infrastructureRecoveryState = "BACKOFF"; return; }
+  if (!infrastructureReconnectPending) { infrastructureRecoveryState = "WAITING_FOR_KNOWN_NETWORK"; return; }
+  infrastructureRecoveryState = "CONNECT_PENDING";
+  if (wifiScanInProgress || WiFi.scanComplete() == WIFI_SCAN_RUNNING || bleDiagnosticScanActive ||
+      csvExportInProgress || userInteractionDeferActive() || initialWifiScanPending) return;
+  // Never postpone an already-due survey to start recovery. At short survey
+  // intervals an attempt may defer subsequent automatic scans for at most 15 s.
+  if ((uint32_t)(now - lastAutoScanMs) >= scanIntervalSeconds * 1000UL) return;
 
-  if (
-    !infrastructureReconnectPending ||
-    wifiScanInProgress ||
-    csvExportInProgress ||
-    userInteractionDeferActive()
-  ) {
-    return;
-  }
-
-  if (
-    infrastructureReconnectAttempted &&
-    (uint32_t)(now - lastInfrastructureReconnectAttemptMs) <
-      INFRA_RECONNECT_BACKOFF_MS
-  ) {
-    return;
-  }
-
-  String savedSsid;
-  String savedPassword;
-  if (!loadCredentials(savedSsid, savedPassword) || savedSsid.length() == 0) {
+  String savedSsid, savedPassword;
+  if (!loadCredentials(savedSsid, savedPassword) || savedSsid.length() > 32 || savedPassword.length() > 63) {
     infrastructureReconnectPending = false;
+    infrastructureSavedNetworkConfigured = false;
+    infrastructureRecoveryState = "DISABLED";
     return;
   }
-
   infrastructureReconnectPending = false;
   infrastructureReconnectAttemptActive = true;
   infrastructureReconnectAttempted = true;
   infrastructureReconnectAttemptStartedMs = now;
   lastInfrastructureReconnectAttemptMs = now;
-  infrastructureReconnectAttemptCount++;
+  infrastructureAttemptIssuedConnect = !associated;
+  if (!associated) {
+    ++infrastructureReconnectAttemptCount;
+    ++infrastructureLastRecovery.appAttempts;
+  }
+  infrastructureUserRecoveryPending = false;
+  infrastructureAttemptAssociated = associated;
+  portENTER_CRITICAL(&infrastructureEventMux);
+  infrastructureAttemptAssociationBaseline = infrastructureEventAssociationCount;
+  portEXIT_CRITICAL(&infrastructureEventMux);
+  snprintf(infrastructureLastRecovery.source, sizeof(infrastructureLastRecovery.source), "%s", associated ? "NATIVE_RECONNECT" : "SAVED_NETWORK_DISCOVERY");
+  snprintf(infrastructureLastRecovery.result, sizeof(infrastructureLastRecovery.result), "in-progress");
+  infrastructureRecoverySummaryDirty = true;
+  infrastructureRecoveryState = associated ? "WAITING_FOR_IP" : "CONNECTING";
+  recordDiagnosticEvent("INFRA ATTEMPT", "attempt=" + String(infrastructureReconnectAttemptCount));
+  Serial.print("[INFRA] "); Serial.println(associated ? "Waiting for native association IP" : "Starting saved-network recovery");
+  // Native association already succeeded: allow IP acquisition its bounded
+  // window instead of tearing the link down and restarting association.
+  if (associated) return;
+  ledDiagInfraAttempt("SAVED_NETWORK_DISCOVERY");
 
-  Serial.print("Saved infrastructure network observed; reconnect attempt #");
-  Serial.print(infrastructureReconnectAttemptCount);
-  Serial.print(" to ");
-  Serial.println(savedSsid);
-
-  // WiFi.begin() is asynchronous here. Survey scanning remains the primary
-  // activity; no blocking wait loop and no extra reconnect-specific scan.
-  ensureWiFiStationMode();
-  WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+  // WiFi.begin() can wait inside STA.connect() if native association races us.
+  // Use the driver's non-waiting operations with the existing STA config/DHCP
+  // interface established at boot. Preserve security settings, release stale
+  // channel/BSSID pins and use only the saved credential pair.
+  wifi_config_t config = {};
+  esp_err_t result = esp_wifi_get_config(WIFI_IF_STA, &config);
+  if (result == ESP_OK) {
+    memset(config.sta.ssid, 0, sizeof(config.sta.ssid));
+    memset(config.sta.password, 0, sizeof(config.sta.password));
+    memcpy(config.sta.ssid, savedSsid.c_str(), savedSsid.length());
+    memcpy(config.sta.password, savedPassword.c_str(), savedPassword.length());
+    config.sta.bssid_set = false;
+    config.sta.channel = 0;
+    esp_wifi_disconnect();
+    result = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (result == ESP_OK) result = esp_wifi_connect();
+  }
+  memset(config.sta.password, 0, sizeof(config.sta.password));
+  if (result != ESP_OK) {
+    recordDiagnosticEvent("INFRA START", "driver-error=" + String((int)result));
+    finishInfrastructureAttempt("start-failed");
+  }
 }
 
 
 // ============================================================
 // Informational Wi-Fi scan
 // ============================================================
+
+String infrastructureSummaryJson(const InfrastructureRecoverySummary& summary) {
+  String json; json.reserve(560);
+  json = "{\"disconnectDurationMs\":" + String(summary.disconnectDurationMs);
+  json += ",\"seen\":" + String(summary.seen ? "true" : "false");
+  json += ",\"visibleScans\":" + String(summary.visibleScans);
+  json += ",\"lastRssi\":" + String(summary.lastRssi);
+  json += ",\"lastChannel\":" + String(summary.lastChannel);
+  json += ",\"disconnectReason\":" + String(summary.disconnectReason);
+  json += ",\"appAttempts\":" + String(summary.appAttempts);
+  json += ",\"nativeRecovered\":" + String(summary.nativeRecovered ? "true" : "false");
+  json += ",\"source\":" + jsonQuoted(summary.source);
+  json += ",\"result\":" + jsonQuoted(summary.result);
+  json += ",\"recoveryDurationMs\":" + String(summary.recoveryDurationMs) + "}";
+  return json;
+}
 
 // Purpose: Runs the interactive/serial Wi-Fi scan presentation path.
 void scanNetworks() {
@@ -5755,6 +6163,7 @@ void sendSiteNavigation(const String& active) {
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
   nav += "<a href=\"/diagnostics\"" + activeNavClass(active, "diagnostics") + ">Diagnostics</a>";
+  nav += "<a href=\"/terminal\" class=\"developer-only\">Terminal</a>";
   nav += "<a href=\"/settings\"" + activeNavClass(active, "settings") + ">Settings</a>";
   nav += "<a href=\"/help\"" + activeNavClass(active, "help") + ">Help</a>";
   nav += "</nav><label class=\"live-control\"><input id=\"live-updates-toggle\" type=\"checkbox\"";
@@ -6999,10 +7408,15 @@ void handleDiagnosticsPage() {
     "<div class=\"row developer-only\"><span class=\"label\">Last Seen</span><span class=\"value\">" +
       String(infrastructureSavedNetworkLastSeenMs ? runtimeAgeLabel(infrastructureSavedNetworkLastSeenMs) : String("Not seen this boot")) + "</span></div>"
     "<div class=\"row developer-only\"><span class=\"label\">Native Reconnect Transitions</span><span class=\"value\">" + String(nativeReconnectObservedCount) + "</span></div>"
-    "<div class=\"row developer-only\"><span class=\"label\">Reconnect Pending (not serviced)</span><span class=\"value\">" + String(infrastructureReconnectPending ? "Yes" : "No") + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Reconnect Pending</span><span class=\"value\">" + String(infrastructureReconnectPending ? "Yes" : "No") + "</span></div>"
     "<div class=\"row developer-only\"><span class=\"label\">Application Reconnect Attempts</span><span class=\"value\">" + String(infrastructureReconnectAttemptCount) + "</span></div>"
     "<div class=\"row developer-only\"><span class=\"label\">Wi-Fi Mode</span><span class=\"value\">" + wifiModeLabel(WiFi.getMode()) + "</span></div>"
-    "<div class=\"note developer-only\">V40a2 observes configured-network visibility and station state only. Explicit application-side reconnect is intentionally not serviced.</div></div>";
+    "<div class=\"row developer-only\"><span class=\"label\">Recovery State</span><span class=\"value\">" + String(infrastructureRecoveryState) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Last Recovery Result / Source</span><span class=\"value\">" + htmlEscape(infrastructureLastRecovery.result) + " / " + htmlEscape(infrastructureLastRecovery.source) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Reconnect Successes / Association Failures / IP Failures</span><span class=\"value\">" + String(infrastructureReconnectSuccessCount) + " / " + String(infrastructureAssociationFailures) + " / " + String(infrastructureIpFailures) + "</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Retry Backoff Remaining</span><span class=\"value\">" + String(infrastructureBackoffRemainingMs()/1000) + " s</span></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Before Last Controlled Restart</span><span class=\"value\">" + htmlEscape(infrastructurePreviousRecovery.result) + " / " + htmlEscape(infrastructurePreviousRecovery.source) + "; outage " + String(infrastructurePreviousRecovery.disconnectDurationMs/1000) + " s</span></div>"
+    "<div class=\"note developer-only\">Native reconnect has first opportunity. Saved-network scan evidence enables bounded recovery. Full recovery evidence is included in status.json. <a href=\"/terminal\">Open serial terminal</a>.</div></div>";
 
   d += "<div class=\"card advanced-only\"><h2>Memory</h2>"
     "<div class=\"row\"><span class=\"label\">Free Heap</span><span class=\"value\">" + String(freeHeap/1024.0,1) + " KB</span></div>"
@@ -7679,7 +8093,7 @@ void handleConfigImport() {
     preferences.putBool("ledEnabled", requested.statusLedEnabled);
     preferences.end();
     statusLedEnabled = requested.statusLedEnabled;
-    if (!statusLedEnabled) stopScanLed();
+    ledDiagService();
     appliedCount++;
   }
 
@@ -7904,6 +8318,14 @@ void handleStatusJsonExport() {
     String(infrastructureReconnectSuccessCount));
   diagnosticSendContent(",\"nativeAutoReconnectEnabled\":true");
   diagnosticSendContent(",\"nativeReconnectTransitions\":" + String(nativeReconnectObservedCount));
+  diagnosticSendContent(",\"infrastructureRecovery\":{\"state\":" + jsonQuoted(infrastructureRecoveryState));
+  diagnosticSendContent(",\"backoffRemainingMs\":" + String(infrastructureBackoffRemainingMs()));
+  diagnosticSendContent(",\"lastSuccessMs\":" + String(infrastructureLastSuccessMs));
+  diagnosticSendContent(",\"disconnectedForMs\":" + String(infrastructureDisconnectActive ? millis() - infrastructureDisconnectStartedMs : 0));
+  diagnosticSendContent(",\"associationFailures\":" + String(infrastructureAssociationFailures));
+  diagnosticSendContent(",\"ipFailures\":" + String(infrastructureIpFailures));
+  diagnosticSendContent(",\"last\":" + infrastructureSummaryJson(infrastructureLastRecovery));
+  diagnosticSendContent(",\"beforeControlledRestart\":" + infrastructureSummaryJson(infrastructurePreviousRecovery) + "}");
   diagnosticSendContent(",\"accessPointRunning\":");
   diagnosticSendContent(apRunning ? "true" : "false");
   diagnosticSendContent(",\"accessPointSSID\":" + jsonQuoted(apSSID));
@@ -8023,6 +8445,8 @@ void handleStatusJsonExport() {
   diagnosticSendContent("  \"systemState\":{");
   diagnosticSendContent("\"statusLedAvailable\":" + String(STATUS_LED_AVAILABLE ? "true" : "false"));
   diagnosticSendContent(",\"statusLedEnabled\":" + String(statusLedEnabled ? "true" : "false"));
+  diagnosticSendContent(",\"ledServiceMaxUs\":" + String(diagnosticLed.maxServiceUs));
+  diagnosticSendContent(",\"ledServiceMaxGapMs\":" + String(diagnosticLed.maxServiceGapMs));
   diagnosticSendContent(",\"restartCheckpointStatus\":" + jsonQuoted(sessionCheckpointStatus));
   diagnosticSendContent(",\"restoredThisBoot\":" + String(sessionRestoredThisBoot ? "true" : "false"));
   diagnosticSendContent(",\"spiffsMounted\":" + String(spiffsMounted ? "true" : "false"));
@@ -8253,8 +8677,7 @@ void handleHostnameSave() {
     "</head><body><div class=\"container\"><div class=\"card\"><h1>Hostname Updated</h1><p>The ESP32 will advertise as <strong>" +
     htmlEscape(mdnsHostname) + ".local</strong> after restart.</p><p>The ESP32 is restarting now.</p></div></div></body></html>");
   checkpointBeforeControlledRestart();
-  delay(750);
-  ESP.restart();
+  requestControlledRestart(750);
 }
 
 // Purpose: Saves ESP32-resident interface settings such as the status LED preference.
@@ -8266,7 +8689,7 @@ void handleInterfaceSettings() {
   }
   bool requestedLed = server.arg("ledEnabled") == "1";
   saveInterfaceSettings(requestedLed, webAutoRefreshEnabled);
-  if (!statusLedEnabled) stopScanLed();
+  ledDiagService();
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", String("{\"saved\":true,\"enabled\":") + (statusLedEnabled ? "true" : "false") + "}");
 }
@@ -8281,9 +8704,9 @@ void handleWifiCaptureSettings() {
 // Purpose: Runs the status LED self-test requested from the Settings page.
 void handleLedSelfTest() {
   markExplicitUserInteraction();
-  runStatusLedSelfTest();
+  ledDiagEvent(LED_EVENT_SELF_TEST);
   server.sendHeader("Location", "/settings");
-  server.send(303, "text/plain", "Status LED self-test complete.");
+  server.send(303, "text/plain", "Status LED self-test scheduled.");
 }
 
 // Purpose: Validates infrastructure Wi-Fi credentials, connects, and saves them only after connection succeeds.
@@ -8366,8 +8789,7 @@ void handleBleModeChange() {
     "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
     "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
 
-  delay(1000);
-  ESP.restart();
+  requestControlledRestart(1000);
 }
 
 // Purpose: Deletes saved infrastructure Wi-Fi credentials and returns the radio to a usable station/AP mode.
@@ -8451,8 +8873,7 @@ void handleSaveAccessPointSettings() {
   );
 
   checkpointBeforeControlledRestart();
-  delay(750);
-  ESP.restart();
+  requestControlledRestart(750);
 }
 
 
@@ -8463,18 +8884,26 @@ void handleApiPing() {
   server.send(200, "text/plain", "ok");
 }
 
-// Web-triggered restarts are deferred until after the HTTP handler returns.
-// Restarting directly inside WebServer::handleClient() can interrupt the response/handler
-// lifecycle; serial restarts do not have that constraint.
-bool webRestartPending = false;
-uint32_t webRestartRequestedMs = 0;
-const uint32_t WEB_RESTART_DELAY_MS = 750;
+// Extend the existing deferred web restart mechanism to every intentional
+// reboot. Checkpoint/confirmation policy stays at its original call sites.
+bool controlledRestartPending = false;
+uint32_t controlledRestartRequestedMs = 0;
+uint32_t controlledRestartMinimumDelayMs = 0;
 
-void servicePendingWebRestart() {
-  if (!webRestartPending) return;
-  if ((uint32_t)(millis() - webRestartRequestedMs) < WEB_RESTART_DELAY_MS) return;
-  Serial.println("Web restart request complete. Restarting ESP32...");
-  delay(50);
+void requestControlledRestart(uint32_t minimumDelayMs) {
+  if (controlledRestartPending) return;
+  controlledRestartPending = true;
+  controlledRestartRequestedMs = millis();
+  controlledRestartMinimumDelayMs = minimumDelayMs;
+  ledDiagEvent(LED_EVENT_CONTROLLED_REBOOT);
+  Serial.println("[LED] CONTROLLED_REBOOT requested");
+}
+
+void servicePendingControlledRestart() {
+  if (!controlledRestartPending) return;
+  ledDiagService();
+  if ((uint32_t)(millis() - controlledRestartRequestedMs) < controlledRestartMinimumDelayMs ||
+      !diagnosticLed.rebootFinished()) return;
   ESP.restart();
 }
 
@@ -8500,10 +8929,8 @@ void handleSystemRestart() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", String("{\"ok\":true,\"historyPreserved\":") + ((!eraseHistory && hasSurveyHistory) ? "true" : "false") + ",\"restarting\":true}");
 
-  // Let this HTTP handler return cleanly, then restart from loop(). This mirrors
-  // the proven serial restart path while allowing the web response to complete.
-  webRestartPending = true;
-  webRestartRequestedMs = millis();
+  // Let this HTTP handler and the five-flash LED pattern complete before reboot.
+  requestControlledRestart(750);
 }
 
 // Purpose: Provides version-agnostic operational guidance with stable anchors used by contextual card help buttons.
@@ -8589,6 +9016,105 @@ void handleHelpPage() {
 // Web server
 // ============================================================
 
+// Polls copy at most 1 KB and deliberately bypass HTTP diagnostics and interaction
+// defer: watching the terminal must neither log its own polling nor pause scans.
+void handleTerminalData() {
+  String requested = server.arg("cursor");
+  if (requested.length() > 16) { server.send(400, "text/plain", "Invalid cursor"); return; }
+  for (size_t i = 0; i < requested.length(); ++i) {
+    if (requested[i] < '0' || requested[i] > '9') { server.send(400, "text/plain", "Invalid cursor"); return; }
+  }
+  uint64_t cursor = requested.length() ? strtoull(requested.c_str(), nullptr, 10) : 0;
+  if (server.arg("boot") != String(terminalBootId)) cursor = 0;
+  uint8_t bytes[1024];
+  bool dropped, more;
+  size_t count = surveySerial.snapshot(cursor, bytes, sizeof(bytes), dropped, more);
+  char next[24]; snprintf(next, sizeof(next), "%llu", (unsigned long long)cursor);
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Terminal-Boot", String(terminalBootId));
+  server.sendHeader("X-Terminal-Next", next);
+  server.sendHeader("X-Terminal-Dropped", dropped ? "1" : "0");
+  server.sendHeader("X-Terminal-More", more ? "1" : "0");
+  String body;
+  if (!body.reserve(count + 1)) { server.send(503, "text/plain", "Low memory; retry"); return; }
+  body.concat((const char*)bytes, count);
+  server.send(200, "application/octet-stream", body);
+}
+
+void handleTerminalPage() {
+  ledDiagEvent(LED_EVENT_WEBPAGE);
+  beginWebResponseProfile("/terminal");
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Surveyor Terminal</title>");
+  sendThemeBootstrapScript();
+  diagnosticSendContent(pageStyles());
+  diagnosticSendContent("<style>#terminal-output{height:55vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;border:1px solid #888;border-radius:6px;font:13px/1.45 monospace}.terminal-controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.terminal-controls input[type=text]{max-width:100%}</style></head><body><div class=\"container\">");
+  sendSiteNavigation("terminal");
+  diagnosticSendContent(R"TERMINAL(
+<h1>Serial Terminal</h1><div class="card">
+<p>Recent firmware serial output, including startup and enabled diagnostics. The device retains the latest 8 KB; this browser keeps up to 64 KB. ROM and library UART logs are not captured. Read-only; use Serial for commands.</p>
+<div class="terminal-controls"><button id="terminal-pause" type="button">Pause</button>
+<label><input id="terminal-scroll" type="checkbox" checked> Auto-scroll</label>
+<label>Filter <input id="terminal-filter" type="text" placeholder="Text to match"></label>
+<button id="terminal-clear" type="button">Clear view</button>
+<button id="terminal-download" type="button">Download captured text</button></div>
+<p id="terminal-status" role="status">Connecting…</p><pre id="terminal-output" tabindex="0" aria-label="Serial output"></pre></div>
+<script>
+(function(){
+  const output=document.getElementById('terminal-output'),status=document.getElementById('terminal-status');
+  const pause=document.getElementById('terminal-pause'),scroll=document.getElementById('terminal-scroll');
+  const filter=document.getElementById('terminal-filter'),live=document.getElementById('live-updates-toggle');
+  let cursor='0',boot='',captured='',paused=false,decoder=new TextDecoder(),gapSeen=false;
+  function render(){
+    const term=filter.value.toLowerCase();
+    output.textContent=term?captured.split('\n').filter(line=>line.toLowerCase().includes(term)).join('\n'):captured;
+    if(scroll.checked)output.scrollTop=output.scrollHeight;
+  }
+  function append(text){captured=(captured+text).slice(-65536);render();}
+  pause.onclick=()=>{paused=!paused;pause.textContent=paused?'Resume':'Pause';status.textContent=paused?'Paused — device capture continues.':'Resuming…';};
+  filter.oninput=render;
+  document.getElementById('terminal-clear').onclick=()=>{captured='';gapSeen=false;render();};
+  document.getElementById('terminal-download').onclick=()=>{
+    const url=URL.createObjectURL(new Blob([captured],{type:'text/plain;charset=utf-8'}));
+    const link=document.createElement('a');link.href=url;link.download='surveyor-terminal-'+(boot||'capture')+'.txt';link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  };
+  async function poll(){
+    let delay=1000;
+    if(paused||document.hidden||!live.checked){
+      if(!paused&&!live.checked)status.textContent='Live updates are off.';
+      setTimeout(poll,1000);return;
+    }
+    const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
+    try{
+      const response=await fetch('/api/terminal?cursor='+cursor+'&boot='+boot,{cache:'no-store',signal:controller.signal});
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      const nextBoot=response.headers.get('X-Terminal-Boot'),next=response.headers.get('X-Terminal-Next');
+      if(!nextBoot||!next)throw new Error('Missing terminal cursor');
+      const bytes=await response.arrayBuffer();
+      if(boot&&boot!==nextBoot){append('\n[Device restarted — new capture]\n');decoder=new TextDecoder();gapSeen=false;}
+      if(response.headers.get('X-Terminal-Dropped')==='1'){
+        append('\n[Earlier output no longer retained by device]\n');decoder=new TextDecoder();gapSeen=true;
+      }
+      append(decoder.decode(bytes,{stream:true}));boot=nextBoot;cursor=next;
+      const more=response.headers.get('X-Terminal-More')==='1';
+      status.textContent=paused?'Paused — device capture continues.':(more?'Catching up…':'Live')+(gapSeen?' — some earlier output was overwritten.':'');
+      delay=more?100:1000;
+    }catch(error){status.textContent='Disconnected — retrying ('+error.message+').';delay=2000;}
+    finally{clearTimeout(timeout);setTimeout(poll,delay);}
+  }
+  poll();
+})();
+</script>
+)TERMINAL");
+  sendThemeScript();
+  diagnosticSendContent("</div></body></html>");
+  diagnosticSendContent("");
+  endWebResponseProfile();
+}
+
 // Purpose: Registers all HTTP routes and starts the ESP32 web server.
 void startWebServer() {
   if (webServerStarted) {
@@ -8599,6 +9125,8 @@ void startWebServer() {
   server.on("/scan", []() { runDiagnosticWebHandler("/scan", handleWebScan); });
   server.on("/system", HTTP_GET, []() { runDiagnosticWebHandler("/system", handleSystemStatus); });
   server.on("/diagnostics", HTTP_GET, []() { runDiagnosticWebHandler("/diagnostics", handleDiagnosticsPage); });
+  server.on("/terminal", HTTP_GET, handleTerminalPage);
+  server.on("/api/terminal", HTTP_GET, handleTerminalData);
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
   server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
   server.on("/api/ping", HTTP_GET, []() { handleApiPing(); });
@@ -9023,7 +9551,8 @@ void handleSerialCommand() {
 
   // Echo a sanitized receive line so captured logs preserve command context without exposing passwords.
   String echoedCommand = command;
-  if (command.startsWith("appass ")) echoedCommand = "appass ********";
+  String commandPrefix = command; commandPrefix.toLowerCase();
+  if (commandPrefix.startsWith("appass")) echoedCommand = "appass ********";
   echoedCommand.toCharArray(lastSerialCommand, sizeof(lastSerialCommand));
   Serial.print("[RX] ");
   Serial.println(lastSerialCommand);
@@ -9118,13 +9647,13 @@ void handleSerialCommand() {
     if (requested==bleSurveyEnabled) { Serial.println("Bluetooth Survey mode already set."); printSettingsSerial(); return; }
     saveBleSurveyEnabled(requested);
     Serial.print("Bluetooth Survey will be "); Serial.print(requested?"enabled":"disabled"); Serial.println(" after restart. Restarting...");
-    checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    checkpointBeforeControlledRestart(); requestControlledRestart(500); return;
   }
 
   if (command.equalsIgnoreCase("selftest")) { printSoftwareSelfTestsSerial(); Serial.print("> "); return; }
-  if (command.equalsIgnoreCase("led test")) { Serial.println("Running status LED self-test..."); runStatusLedSelfTest(); Serial.println("LED self-test complete."); Serial.print("> "); return; }
+  if (command.equalsIgnoreCase("led test")) { ledDiagEvent(LED_EVENT_SELF_TEST); Serial.println("Status LED self-test scheduled."); Serial.print("> "); return; }
   if (command.equalsIgnoreCase("led on") || command.equalsIgnoreCase("led off")) {
-    bool requested=command.endsWith("on"); saveInterfaceSettings(requested,webAutoRefreshEnabled); if(!requested) stopScanLed();
+    bool requested=command.endsWith("on"); saveInterfaceSettings(requested,webAutoRefreshEnabled); ledDiagService();
     Serial.print("Status LED "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
   }
   if (command.equalsIgnoreCase("refresh on") || command.equalsIgnoreCase("refresh off")) {
@@ -9147,29 +9676,29 @@ void handleSerialCommand() {
     }
     saveMdnsHostname(requested);
     Serial.print("mDNS hostname saved as "); Serial.print(mdnsHostname); Serial.println(".local. Restarting...");
-    checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    checkpointBeforeControlledRestart(); requestControlledRestart(500); return;
   }
 
   if (command.equalsIgnoreCase("ap on") || command.equalsIgnoreCase("ap off")) {
     bool requested=command.endsWith("on"); saveAccessPointSettings(requested,apSSID,apPassword);
-    Serial.println("Device AP setting saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    Serial.println("Device AP setting saved. Restarting..."); checkpointBeforeControlledRestart(); requestControlledRestart(500); return;
   }
   if (command.startsWith("apssid ")) {
     String requested=commandArgument(command,"apssid"); requested.trim();
     if (requested.length()==0 || requested.length()>32) { Serial.println("AP SSID must be 1-32 characters."); printSettingsSerial(); return; }
-    saveAccessPointSettings(apEnabled,requested,apPassword); Serial.println("AP SSID saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    saveAccessPointSettings(apEnabled,requested,apPassword); Serial.println("AP SSID saved. Restarting..."); checkpointBeforeControlledRestart(); requestControlledRestart(500); return;
   }
   if (command.startsWith("appass ")) {
     String requested=commandArgument(command,"appass");
     if (requested.length()<8 || requested.length()>63) { Serial.println("AP password must be 8-63 characters."); printSettingsSerial(); return; }
-    saveAccessPointSettings(apEnabled,apSSID,requested); Serial.println("AP password saved. Restarting..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return;
+    saveAccessPointSettings(apEnabled,apSSID,requested); Serial.println("AP password saved. Restarting..."); checkpointBeforeControlledRestart(); requestControlledRestart(500); return;
   }
 
   if (command.equalsIgnoreCase("version") || command.equalsIgnoreCase("v")) { printFirmwareInfo(); Serial.print("> "); return; }
   if (command.equalsIgnoreCase("mac")) { printMacAddress(); Serial.print("> "); return; }
-  if (command.equalsIgnoreCase("restart")) { Serial.println("Restarting ESP32..."); checkpointBeforeControlledRestart(); delay(500); ESP.restart(); return; }
+  if (command.equalsIgnoreCase("restart")) { Serial.println("Restarting ESP32..."); checkpointBeforeControlledRestart(); requestControlledRestart(500); return; }
 
-  Serial.print("Unknown command: "); Serial.println(command);
+  Serial.print("Unknown command: "); Serial.println(echoedCommand);
   Serial.println("Enter 'h' for the main menu.");
   Serial.print("> ");
 }
@@ -9180,6 +9709,7 @@ void handleSerialCommand() {
 
 // Purpose: Arduino entry point that initializes hardware, settings, radios, histories, checkpoint restore, web services, and initial survey scheduling.
 void setup() {
+  terminalBootId = esp_random();
   Serial.begin(115200);
   delay(1500);
 
@@ -9187,10 +9717,10 @@ void setup() {
   loadSurveyModeSettings();
   loadDiagnosticStreamingSettings();
   loadWifiRecoveryState();
+  loadInfrastructureRecoverySummary();
   captureBootHeapCheckpoint("Settings loaded");
-  initializeStatusLed();
+  diagnosticLed.begin();
   captureBootHeapCheckpoint("Status LED initialized");
-  indicateBootStarted();
   captureBootStaticSystemInfo();
 
   Serial.println();
@@ -9221,6 +9751,7 @@ void setup() {
     Serial.println();
   }
 
+  WiFi.onEvent(observeInfrastructureEvent);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   delay(WIFI_STARTUP_SETTLE_MS);
@@ -9315,7 +9846,8 @@ void setup() {
        (bleSurveyEnabled &&
         (bleHistoryCapacity == MIN_BLE_HISTORY_RECORDS || bleAddressTableFullDrops > 0)));
 
-  indicateStartupStatus(startupFailed, startupWarning);
+  Serial.print("Startup status: ");
+  Serial.println(startupFailed ? "FAIL" : (startupWarning ? "WARN" : "PASS"));
 
   surveyServicesReadyMs = millis();
   lastAutoScanMs = surveyServicesReadyMs;
@@ -9324,6 +9856,9 @@ void setup() {
   initialBleScanPending = bleSurveyEnabled;
 
   printMenu();
+  ledDiagUpdateInfraState();
+  ledDiagEvent(LED_EVENT_BOOT_COMPLETE);
+  Serial.println("[LED] BOOT_COMPLETE");
 }
 
 
@@ -9343,6 +9878,7 @@ void serviceInitialSurveyScans() {
     initialWifiScanPending &&
     elapsed >= INITIAL_WIFI_SCAN_DELAY_MS &&
     !wifiScanInProgress &&
+    !infrastructureReconnectAttemptActive &&
     !csvExportInProgress &&
     !userInteractionDeferActive()
   ) {
@@ -9370,6 +9906,7 @@ void serviceInitialSurveyScans() {
 
 // Purpose: Schedules automatic Wi-Fi scans while honoring active work, interaction defer, retry backoff, and configured interval.
 void serviceAutomaticScan() {
+  if (infrastructureReconnectAttemptActive) return;
   if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress || userInteractionDeferActive()) return;
 
   uint32_t now = millis();
@@ -9413,16 +9950,26 @@ void serviceAutomaticBLEScan() {
 // Purpose: Arduino main loop that continuously services web requests, serial commands, scan completion, reconnect diagnostics, and automatic survey scheduling.
 void loop() {
   serviceLoopGapDiagnostics();
+  ledDiagUpdateInfraState();
+  ledDiagService();
+
+  // Once the requesting handler has returned, reserve this short window for
+  // the restart pattern. Further HTTP/serial work must not stretch its pulses.
+  if (controlledRestartPending) {
+    servicePendingControlledRestart();
+    delay(5); // Existing loop yield, not a wait for an LED pattern.
+    return;
+  }
 
   if (webServerStarted) {
     server.handleClient();
     armUserInteractionDeferAfterWebService();
+    ledDiagService();
   }
 
-  // A web restart is intentionally serviced only after handleClient() returns.
-  // While the short restart delay is active, do not start new survey work.
-  if (webRestartPending) {
-    servicePendingWebRestart();
+  // Service a restart requested by the just-completed HTTP handler.
+  if (controlledRestartPending) {
+    servicePendingControlledRestart();
     delay(5);
     return;
   }
@@ -9431,11 +9978,19 @@ void loop() {
   serviceCompletedBLEScan();
   serviceLoggedWifiScan();
   serviceWifiScanRecoveryWatchdog();
-  serviceNativeReconnectDiagnostics();
+  if (controlledRestartPending) return;
+  serviceInfrastructureReconnect();
+  // With Device AP disabled, boot may have had no usable interface. Bring up
+  // the web UI once recovery obtains an IP, after setup has allocated history.
+  if (!webServerStarted && infrastructureHasIp()) {
+    startWebServer();
+    startMdnsService();
+  }
   serviceInitialSurveyScans();
   serviceAutomaticScan();
   serviceAutomaticBLEScan();
   handleSerialCommand();
+  ledDiagService();
 
   delay(5);
 }
