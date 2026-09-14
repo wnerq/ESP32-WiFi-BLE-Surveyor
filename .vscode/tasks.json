@@ -1,0 +1,36 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ESP32: Serial Debug Monitor",
+            "type": "process",
+            "command": "pio",
+            "windows": {
+                "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
+            },
+            "args": [
+                "device", "monitor",
+                "--project-dir", "${workspaceFolder}",
+                "--environment", "esp32dev",
+                "--port", "${input:esp32SerialPort}"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "clear": false
+            },
+            "runOptions": { "instanceLimit": 1 },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "esp32SerialPort",
+            "type": "promptString",
+            "description": "ESP32 USB serial port (currently COM4)",
+            "default": "COM4"
+        }
+    ]
+}

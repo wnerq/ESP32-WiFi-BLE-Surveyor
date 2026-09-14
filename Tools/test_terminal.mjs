@@ -9,19 +9,20 @@ const html = source.split('R"TERMINAL(')[1].split(')TERMINAL"')[0];
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const elements = new Map();
 for (const id of ['terminal-output','terminal-status','terminal-pause','terminal-scroll',
-  'terminal-filter','live-updates-toggle','terminal-clear','terminal-download']) {
-  elements.set(id, {textContent:'',value:'',checked:true,scrollTop:0,scrollHeight:42});
+  'terminal-filter','live-updates-toggle','terminal-clear','terminal-download',
+  'terminal-command','terminal-send','terminal-command-status','terminal-hide-input','terminal-command-form']) {
+  elements.set(id, {textContent:'',value:'',checked:true,scrollTop:0,scrollHeight:42,disabled:false,focus(){}});
 }
 const get = id => elements.get(id);
 const document = {hidden:false,getElementById:get,createElement:()=>({click(){}})};
 const timers = new Map();
-let timerId=0,requests=[],responses=[],download;
+let timerId=0,requests=[],responses=[],requestOptions=[],download;
 const context = {
-  document,TextDecoder,AbortController,Blob,
+  document,TextDecoder,TextEncoder,AbortController,Blob,
   URL:{createObjectURL(blob){download=blob;return 'blob:test';},revokeObjectURL(){}},
   setTimeout(fn,delay){timers.set(++timerId,{fn,delay});return timerId;},
   clearTimeout(id){timers.delete(id);},
-  async fetch(url){requests.push(url);const next=responses.shift();if(next instanceof Error)throw next;assert.ok(next,'Unexpected fetch');return next;},
+  async fetch(url,options){requests.push(url);requestOptions.push(options);const next=responses.shift();if(next instanceof Error)throw next;assert.ok(next,'Unexpected fetch');return next;},
 };
 function response(text, {boot='100',next='10',dropped='0',more='0',status=200}={}) {
   const bytes=typeof text==='string'?new TextEncoder().encode(text):text;
@@ -65,3 +66,27 @@ document.hidden=false;get('live-updates-toggle').checked=false;await step();
 assert.match(get('terminal-status').textContent,/Live updates are off/);
 assert.equal(requests.length,count);
 console.log('PASS: terminal polling, pause/resume, filtering, literal markup, gap/restart recovery, UTF-8, error retry, clear/download and memory bound');
+
+// Command entry uses POST, clears input, resumes output and never retries a command.
+get('terminal-command').value='wifi on';responses.push(response('',{status:202}));
+await get('terminal-command-form').onsubmit({preventDefault(){}});
+assert.equal(requests.at(-1),'/api/terminal/command');
+assert.equal(requestOptions.at(-1).method,'POST');
+assert.equal(requestOptions.at(-1).body,'wifi on');
+assert.equal(requestOptions.at(-1).headers['X-Terminal-Command'],'1');
+assert.equal(get('terminal-command').value,'');
+assert.equal(get('live-updates-toggle').checked,true);
+assert.match(get('terminal-command-status').textContent,/Queued/);
+const beforeLong=requests.length;
+get('terminal-command').value='\u00e9'.repeat(100);
+await get('terminal-command-form').onsubmit({preventDefault(){}});
+assert.equal(requests.length,beforeLong);assert.match(get('terminal-command-status').textContent,/192 bytes/);
+get('terminal-hide-input').checked=true;get('terminal-hide-input').onchange();
+assert.equal(get('terminal-command').type,'password');
+get('terminal-command').value='appass private123';responses.push(new Error('offline'));
+await get('terminal-command-form').onsubmit({preventDefault(){}});
+assert.match(get('terminal-command-status').textContent,/could not be confirmed/);
+assert.equal(get('terminal-command').value,'');
+assert.ok(!get('terminal-output').textContent.includes('private123'));
+assert.equal(requests.length,beforeLong+1); // no automatic command retry
+console.log('PASS: terminal command POST, byte limit, hidden input, acknowledgment and ambiguous delivery');

@@ -41,7 +41,8 @@ The browser retains at most 64 KB of text. Downloads contain that captured text,
 including lines hidden by the filter. The page shows markers for device restart
 and overwritten device output. Clear view does not erase the device ring.
 
-The page is read-only. Serial commands remain available through the UART.
+The V40a3 page was read-only. V40a6 adds web command entry; see
+[SERIAL_DEBUG.md](SERIAL_DEBUG.md). Serial commands remain available through the UART.
 
 ## Automated checks
 

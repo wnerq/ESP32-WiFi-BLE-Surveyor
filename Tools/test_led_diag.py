@@ -41,6 +41,12 @@ struct Edge { uint32_t ms; bool on; };
 std::vector<Edge> edges;
 void pinMode(int pin,int mode){assert(pin==2 && mode==OUTPUT);}
 void digitalWrite(int pin,int on){assert(pin==2);pinOn=on;edges.push_back({nowMs,bool(on)});}
+bool accessWindow=false, attachOk=true;
+uint8_t lastDuty=0;
+bool wifiAccessWindowActive(){return accessWindow;}
+bool ledcAttach(uint8_t pin,uint32_t freq,uint8_t bits){assert(pin==2 && freq==5000 && bits==8);return attachOk;}
+bool ledcWrite(uint8_t pin,uint32_t duty){assert(duty<=255);lastDuty=duty;digitalWrite(pin,duty!=0);return true;}
+
 struct WifiFake { int mode=1; int getMode(){return mode;} } WiFi;
 bool hasIp=false;
 bool infrastructureHasIp(){return hasIp;}
@@ -80,6 +86,7 @@ void advance(uint32_t duration){
   for(uint32_t i=0;i<duration;i+=5){nowMs+=5;ledDiagService();}
 }
 void reset(bool boot=true){
+  accessWindow=false;attachOk=true;lastDuty=0;
   diagnosticLed=DiagnosticLedManager();ledDiagInfraConfigured=false;
   nowMs=0;microCalls=0;statusLedEnabled=true;hasIp=false;WiFi.mode=1;
   controlledRestartPending=false;ESP.restarts=0;
@@ -188,6 +195,19 @@ int main(){
   reset();ledDiagEvent(LED_EVENT_CONTROLLED_REBOOT);nowMs+=10000;ledDiagService();
   assert(!diagnosticLed.rebootFinished());assert(diagnosticLed.maxServiceGapMs==10000);
   advance(600);assert(diagnosticLed.rebootFinished());
+  // Breathing is a 3s linear rise followed by a 3s fall, with event preemption.
+  reset();accessWindow=true;ledDiagService();assert(lastDuty==0);
+  advance(1500);assert(lastDuty==127);advance(1500);assert(lastDuty==255);
+  advance(1500);assert(lastDuty==127);advance(1500);assert(lastDuty==0);
+  ledDiagEvent(LED_EVENT_WEBPAGE);assert(lastDuty==255);
+  advance(100);assert(lastDuty<20); // resumes the background phase
+  accessWindow=false;ledDiagService();assert(lastDuty==0);
+  accessWindow=true;advance(1500);statusLedEnabled=false;ledDiagService();assert(lastDuty==0);
+  statusLedEnabled=true;ledDiagEvent(LED_EVENT_CONTROLLED_REBOOT);advance(660);
+  assert(diagnosticLed.rebootFinished() && lastDuty==0);
+  reset();nowMs=UINT32_MAX-1499;accessWindow=true;ledDiagService();advance(3000);assert(lastDuty==255);
+  reset(false);attachOk=false;diagnosticLed.begin();ledDiagEvent(LED_EVENT_BOOT_COMPLETE);advance(970);
+  assert(!pinOn); // attach failure retains digital diagnostics
   assert(sizeof(DiagnosticLedManager)<=96);
   std::cout<<"PASS: boot, page, Wi-Fi/BLE scan, RX-only, heartbeat/configuration, attempt/success, priority/preemption, reboot, disabled/self-test, route exclusions, rollover and long gaps\n";
 }
@@ -196,6 +216,7 @@ int main(){
 # Structural guards complement waveform tests and catch future bypasses.
 assert source.count("digitalWrite(STATUS_LED_PIN") == 1
 assert "digitalWrite(STATUS_LED_PIN" in manager
+assert source.count("ledcWrite(STATUS_LED_PIN") == 1
 assert source.count("ESP.restart();") == 1 and "ESP.restart();" in restart
 assert not re.search(r"\b(?:delay|xTimer\w*|statusLedPulse)\s*\(", manager + restart)
 assert not re.search(r"\bwhile\s*\(", manager + restart)

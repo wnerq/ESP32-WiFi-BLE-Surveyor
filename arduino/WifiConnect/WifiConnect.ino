@@ -109,8 +109,8 @@ bool userInteractionDeferActive();
 // ============================================================
 
 const char* FIRMWARE_FILE = "src/main.cpp (PlatformIO)";
-const char* FIRMWARE_VERSION = "40a5";
-const char* FIRMWARE_CHANGE_SUMMARY = "Add configurable connected Wi-Fi power saving and radio-off scan windows";
+const char* FIRMWARE_VERSION = "41";
+const char* FIRMWARE_CHANGE_SUMMARY = "Add collapsible navigation, Developer terminal navigation and terminal controls below output";
 
 
 Preferences preferences;
@@ -229,17 +229,17 @@ uint32_t wifiPowerRetryAfterMs = 0;
 bool wifiPowerRetryPending = false;
 esp_err_t wifiPowerLastError = ESP_OK;
 
+uint32_t wifiAccessWindowSeconds = 60;
 struct WifiPowerWindow {
-  static constexpr uint32_t DURATION_MS = 60000;
   bool armed = false;
   uint32_t startedMs = 0;
   void arm(uint32_t now) { armed = true; startedMs = now; }
   uint32_t remaining(uint32_t now) const {
     uint32_t elapsed = now - startedMs;
-    return armed && elapsed < DURATION_MS ? DURATION_MS - elapsed : 0;
+    return armed && elapsed < wifiAccessWindowSeconds * 1000UL ? wifiAccessWindowSeconds * 1000UL - elapsed : 0;
   }
   bool shouldSleep(uint32_t now, uint32_t intervalMs) const {
-    return armed && intervalMs > DURATION_MS && remaining(now) == 0;
+    return armed && intervalMs > wifiAccessWindowSeconds * 1000UL && remaining(now) == 0;
   }
 };
 WifiPowerWindow wifiPowerWindow;
@@ -248,6 +248,16 @@ void serviceWifiPower();
 void noteWifiPowerScanFinished();
 void saveWifiPowerMode(uint8_t mode);
 const char* wifiPowerModeName();
+bool wifiAccessWindowActive();
+void saveWifiAccessWindow(uint32_t seconds);
+void executeTerminalCommand(String command, bool fromWeb);
+void serviceTerminalCommand();
+char pendingTerminalCommand[193] = {};
+bool terminalCommandPending = false;
+uint8_t webWifiConfigStage = 0;
+String webWifiConfigSsid;
+uint32_t webWifiConfigStartedMs = 0;
+
 const uint8_t STATUS_LED_PIN = 2;
 const bool STATUS_LED_ACTIVE_HIGH = true;
 
@@ -786,7 +796,13 @@ const LedDiagPattern LED_DIAG_PATTERNS[LED_EVENT_COUNT] = {
 class DiagnosticLedManager {
  public:
   void begin() {
-    if (STATUS_LED_AVAILABLE) pinMode(STATUS_LED_PIN, OUTPUT);
+    if (STATUS_LED_AVAILABLE) {
+      pwmReady = ledcAttach(STATUS_LED_PIN, 5000, 8);
+      if (!pwmReady) {
+        pinMode(STATUS_LED_PIN, OUTPUT);
+        Serial.println("[LED] PWM unavailable; using digital indications.");
+      }
+    }
     initialized = true;
     writeOutput(false, true);
   }
@@ -839,7 +855,9 @@ class DiagnosticLedManager {
   uint32_t maxServiceGapMs = 0;
 
  private:
-  bool initialized = false, runtimeReady = false, output = false;
+  bool initialized = false, runtimeReady = false, pwmReady = false, breathing = false;
+  uint8_t output = 0;
+  uint32_t breathStartedMs = 0;
   bool wifiScan = false, bleScan = false, infraDisconnected = false;
   bool heartbeatDue = false, rebootRequested = false, rebootComplete = false;
   bool serviceSeen = false;
@@ -849,14 +867,22 @@ class DiagnosticLedManager {
   uint32_t phaseStartedMs = 0, heartbeatStartedMs = 0, lastServiceMs = 0;
 
   void writeOutput(bool on, bool force = false) {
+    writeBrightness(on ? 255 : 0, force);
+  }
+  void writeBrightness(uint8_t brightness, bool force = false) {
     if (!initialized || !STATUS_LED_AVAILABLE) return;
-    if (!statusLedEnabled && active != LED_EVENT_SELF_TEST) on = false;
-    if (!force && output == on) return;
-    output = on;
-    digitalWrite(STATUS_LED_PIN, (STATUS_LED_ACTIVE_HIGH ? on : !on) ? HIGH : LOW);
+    if (!statusLedEnabled && active != LED_EVENT_SELF_TEST) brightness = 0;
+    if (!force && output == brightness) return;
+    output = brightness;
+    uint8_t duty = STATUS_LED_ACTIVE_HIGH ? brightness : 255 - brightness;
+    if (pwmReady) ledcWrite(STATUS_LED_PIN, duty);
+    else digitalWrite(STATUS_LED_PIN, duty >= 128 ? HIGH : LOW);
   }
   void step(uint32_t now) {
     if (!initialized || !runtimeReady) return;
+    bool accessWindow = wifiAccessWindowActive();
+    if (accessWindow && !breathing) breathStartedMs = now;
+    breathing = accessWindow;
     if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && active != LED_EVENT_SELF_TEST && !(pending & (1U << LED_EVENT_SELF_TEST)))) {
       if (rebootRequested) rebootComplete = true;
       active = LED_EVENT_NONE; pending = 0; writeOutput(false); return;
@@ -896,7 +922,14 @@ class DiagnosticLedManager {
       pending &= ~(1U << next);
       if (next == LED_EVENT_INFRA_HEARTBEAT) { heartbeatDue = false; heartbeatStartedMs = now; }
     }
-    writeOutput(active != LED_EVENT_NONE && (phase % 2) == (active == LED_EVENT_CONTROLLED_REBOOT ? 1 : 0));
+    if (active == LED_EVENT_NONE && breathing) {
+      // Lowest-priority indication: three seconds up, three seconds down.
+      uint32_t position = (uint32_t)(now - breathStartedMs) % 6000;
+      uint32_t ramp = position <= 3000 ? position : 6000 - position;
+      writeBrightness((uint8_t)(ramp * 255 / 3000));
+    } else {
+      writeOutput(active != LED_EVENT_NONE && (phase % 2) == (active == LED_EVENT_CONTROLLED_REBOOT ? 1 : 0));
+    }
   }
 };
 
@@ -1075,6 +1108,8 @@ void loadSurveyModeSettings() {
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
   wifiPowerMode = preferences.getUChar("wifiPower", 0);
   if (wifiPowerMode > 2) wifiPowerMode = 0;
+  wifiAccessWindowSeconds = preferences.getUInt("wifiWindow", 60);
+  if (wifiAccessWindowSeconds < 5 || wifiAccessWindowSeconds > 3600) wifiAccessWindowSeconds = 60;
   captureHiddenNetworks = preferences.getBool("captureHidden", true);
   scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
   bleScanIntervalSeconds = preferences.getULong("bleInterval", bleScanIntervalSeconds);
@@ -5426,6 +5461,9 @@ String pageStyles() {
   }
 
   /* View-depth model: Standard < Advanced < Developer. */
+  .site-navigation > summary { cursor: pointer; padding: 8px 0; font-weight: 600; }
+  .site-navigation[open] > summary { margin-bottom: 8px; }
+  html[data-view="developer"] .nav a.developer-only { display: inline-flex !important; }
   .advanced-only, .developer-only { display: none !important; }
   html[data-view="advanced"] div.advanced-only,
   html[data-view="developer"] div.advanced-only,
@@ -6221,12 +6259,12 @@ String contextHelpScript() {
 void sendSiteNavigation(const String& active) {
   String nav;
   nav.reserve(1400);
-  nav += "<div class=\"sticky-interface-card\"><div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><div class=\"header-actions\"><nav class=\"nav\">";
+  nav += "<details id=\"site-navigation\" class=\"sticky-interface-card site-navigation\" open><summary>Navigation &amp; controls</summary><div class=\"site-header\"><div class=\"site-title\">ESP32 Wireless Surveyor</div><div class=\"header-actions\"><nav class=\"nav\">";
   nav += "<a href=\"/\"" + activeNavClass(active, "wifi") + ">Wi-Fi</a>";
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
   nav += "<a href=\"/diagnostics\"" + activeNavClass(active, "diagnostics") + ">Diagnostics</a>";
-  nav += "<a href=\"/terminal\" class=\"developer-only\">Terminal</a>";
+  nav += "<a href=\"/terminal\" class=\"developer-only" + String(active == "terminal" ? " active" : "") + "\">Terminal</a>";
   nav += "<a href=\"/settings\"" + activeNavClass(active, "settings") + ">Settings</a>";
   nav += "<a href=\"/help\"" + activeNavClass(active, "help") + ">Help</a>";
   nav += "</nav><label class=\"live-control\"><input id=\"live-updates-toggle\" type=\"checkbox\"";
@@ -6234,7 +6272,16 @@ void sendSiteNavigation(const String& active) {
   nav += "> Live updates</label></div></div>";
   diagnosticSendContent(nav);
   sendThemeControl();
-  diagnosticSendContent("</div>");
+  diagnosticSendContent("</details>");
+  diagnosticSendContent(R"NAVCOLLAPSE(<script>
+(function(){
+  const nav=document.getElementById('site-navigation');
+  try{nav.open=localStorage.getItem('surveyor-nav-collapsed')!=='1';}catch(e){}
+  nav.addEventListener('toggle',function(){
+    try{localStorage.setItem('surveyor-nav-collapsed',nav.open?'0':'1');}catch(e){}
+  });
+})();
+</script>)NAVCOLLAPSE");
   diagnosticSendContent(
     "<script>(function(){"
     "const c=document.getElementById('live-updates-toggle');if(!c)return;"
@@ -7617,6 +7664,7 @@ struct PortableConfig {
   bool statusLedEnabled;
   bool liveUpdatesEnabled;
   unsigned long wifiPowerMode;
+  unsigned long wifiAccessWindowSeconds;
   bool diagnosticStreamingEnabled;
   bool diagnosticSurveyEvents;
   bool diagnosticBleEvents;
@@ -7653,6 +7701,8 @@ PortableConfig readPersistedPortableConfig() {
       preferences.getBool("captureHidden", captureHiddenNetworks);
   c.statusLedEnabled =
       preferences.getBool("ledEnabled", statusLedEnabled);
+  c.wifiAccessWindowSeconds = preferences.getUInt("wifiWindow", 60);
+  if (c.wifiAccessWindowSeconds < 5 || c.wifiAccessWindowSeconds > 3600) c.wifiAccessWindowSeconds = 60;
   c.wifiPowerMode = preferences.getUChar("wifiPower", 0);
   if (c.wifiPowerMode > 2) c.wifiPowerMode = 0;
   c.liveUpdatesEnabled =
@@ -7709,6 +7759,7 @@ String portableConfigJson(const PortableConfig& c) {
   json += "  \"captureHiddenNetworks\":" + String(c.captureHiddenNetworks ? "true" : "false") + ",\n";
   json += "  \"statusLedEnabled\":" + String(c.statusLedEnabled ? "true" : "false") + ",\n";
   json += "  \"wifiPowerMode\":" + String(c.wifiPowerMode) + ",\n";
+  json += "  \"wifiAccessWindowSeconds\":" + String(c.wifiAccessWindowSeconds) + ",\n";
   json += "  \"liveUpdatesEnabled\":" + String(c.liveUpdatesEnabled ? "true" : "false") + ",\n";
   json += "  \"diagnosticStreamingEnabled\":" + String(c.diagnosticStreamingEnabled ? "true" : "false") + ",\n";
   json += "  \"diagnosticSurveyEvents\":" + String(c.diagnosticSurveyEvents ? "true" : "false") + ",\n";
@@ -7756,6 +7807,7 @@ public:
     bool seenLed = false;
     bool seenLive = false;
     bool seenPower = false;
+    bool seenWindow = false;
     bool seenDiagEnabled = false;
     bool seenDiagSurvey = false;
     bool seenDiagBle = false;
@@ -7822,6 +7874,11 @@ public:
         seenLed = true;
         if (!parseBool(out.statusLedEnabled))
           return fail("statusLedEnabled must be true or false.");
+      } else if (key == "wifiAccessWindowSeconds") {
+        if (seenWindow) return fail("Duplicate wifiAccessWindowSeconds.");
+        seenWindow = true;
+        if (!parseUnsigned(out.wifiAccessWindowSeconds) || out.wifiAccessWindowSeconds < 5 || out.wifiAccessWindowSeconds > 3600)
+          return fail("wifiAccessWindowSeconds must be an integer from 5 to 3600.");
       } else if (key == "wifiPowerMode") {
         if (seenPower) return fail("Duplicate wifiPowerMode.");
         seenPower = true;
@@ -8170,6 +8227,10 @@ void handleConfigImport() {
     appliedCount++;
   }
 
+  if (requested.wifiAccessWindowSeconds != previous.wifiAccessWindowSeconds) {
+    saveWifiAccessWindow(requested.wifiAccessWindowSeconds);
+    appliedCount++;
+  }
   if (requested.wifiPowerMode != previous.wifiPowerMode) {
     saveWifiPowerMode((uint8_t)requested.wifiPowerMode);
     appliedCount++;
@@ -8395,6 +8456,7 @@ void handleStatusJsonExport() {
     String(infrastructureReconnectSuccessCount));
   diagnosticSendContent(",\"nativeAutoReconnectEnabled\":" + String(WiFi.getAutoReconnect() ? "true" : "false"));
   diagnosticSendContent(",\"wifiPowerMode\":" + String(wifiPowerMode));
+  diagnosticSendContent(",\"wifiAccessWindowSeconds\":" + String(wifiAccessWindowSeconds));
   diagnosticSendContent(",\"wifiPowerAppliedMode\":" + String(wifiPowerAppliedMode));
   diagnosticSendContent(",\"wifiRadioSleeping\":" + String(wifiRadioSleeping ? "true" : "false"));
   diagnosticSendContent(",\"wifiPowerWindowRemainingMs\":" + String(wifiPowerMode == 2 && !wifiRadioSleeping ? wifiPowerWindow.remaining(millis()) : 0));
@@ -8664,15 +8726,33 @@ void handleStatusJsonExport() {
 }
 
 // Purpose: Builds the Settings page with ordinary configuration in Standard and maintenance detail in deeper views.
+bool parseWifiAccessWindow(const String& value, uint32_t& seconds) {
+  if (value.length() == 0 || value.length() > 4) return false;
+  uint32_t parsed = 0;
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (value[i] < '0' || value[i] > '9') return false;
+    parsed = parsed * 10 + (value[i] - '0');
+  }
+  if (parsed < 5 || parsed > 3600) return false;
+  seconds = parsed;
+  return true;
+}
+
 void handleWifiPowerSetting() {
   String mode = server.arg("mode");
   if (!server.hasArg("mode") || (mode != "0" && mode != "1" && mode != "2")) {
     server.send(400, "text/plain", "Mode must be 0, 1, or 2.");
     return;
   }
+  uint32_t seconds = wifiAccessWindowSeconds;
+  if (server.hasArg("window") && !parseWifiAccessWindow(server.arg("window"), seconds)) {
+    server.send(400, "text/plain", "Access window must be 5 to 3600 seconds.");
+    return;
+  }
+  saveWifiAccessWindow(seconds);
   saveWifiPowerMode((uint8_t)mode.toInt());
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>Wi-Fi power mode saved</h1><p>The setting applies now. Radio-off mode closes Wi-Fi after the 60-second window. USB serial: power normal restores continuous access.</p><a href='/settings'>Return to Settings</a>");
+  server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>Wi-Fi power settings saved</h1><p>The setting applies now. Ultra uses the configured access window. Command: wifi on renews the window; power normal restores continuous access.</p><a href='/settings'>Return to Settings</a>");
 }
 
 void handleSettingsPage() {
@@ -8691,7 +8771,7 @@ void handleSettingsPage() {
   for (uint8_t mode = 0; mode < 3; ++mode) {
     diagnosticSendContent("<option value=\"" + String(mode) + "\"" + (wifiPowerMode == mode ? " selected" : "") + ">" + powerLabels[mode] + "</option>");
   }
-  diagnosticSendContent("</select><button type=\"submit\">Save Power Mode</button></form><p>Ultra keeps Wi-Fi awake for 60 seconds after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Page polling does not extend the window. Rejoining Wi-Fi takes part of this time. Use USB serial command <code>power normal</code> to restore continuous access.</p><p>For off time, set the Wi-Fi scan interval above 60 seconds. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
+  diagnosticSendContent("</select><label for=\"wifi-window\">Access window (seconds)</label><input id=\"wifi-window\" name=\"window\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(wifiAccessWindowSeconds) + "\" required><button type=\"submit\">Save Power Settings</button></form><p>Ultra keeps Wi-Fi awake for the configured window after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Page polling does not extend the window. Rejoining Wi-Fi takes part of this time. Use <code>wifi on</code> to reopen the window or <code>power normal</code> for continuous access.</p><p>For off time, set the scan interval longer than the access window. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
   String configuredStationSSID = preferences.getString("ssid", "");
   s += "<div class=\"card\"><h2>Infrastructure Wi-Fi</h2><div class=\"row\"><span class=\"label\">Configured Network</span><span class=\"value\">" + htmlEscape(configuredStationSSID.length() ? configuredStationSSID : String("None")) + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) {
@@ -9140,6 +9220,80 @@ void handleTerminalData() {
   server.send(200, "application/octet-stream", body);
 }
 
+// A bounded mailbox lets HTTP acknowledge commands before blocking legacy
+// commands or controlled restarts execute. Only loop() touches this mailbox.
+void handleTerminalCommand() {
+  server.sendHeader("Cache-Control", "no-store");
+  // Custom header prevents cross-origin HTML form submissions; no CORS is enabled.
+  if (server.header("X-Terminal-Command") != "1") {
+    server.send(403, "text/plain", "Use the terminal command form."); return;
+  }
+  if (terminalCommandPending || controlledRestartPending) {
+    server.send(409, "text/plain", "A command or restart is pending."); return;
+  }
+  if (!server.hasArg("plain") && webWifiConfigStage != 2) {
+    server.send(400, "text/plain", "Missing command."); return;
+  }
+  String command = server.arg("plain");
+  if (command.length() > sizeof(pendingTerminalCommand) - 1) {
+    server.send(413, "text/plain", "Command is too long (192 bytes maximum)."); return;
+  }
+  for (size_t i = 0; i < command.length(); ++i) {
+    if ((uint8_t)command[i] < 32 || command[i] == 127) {
+      server.send(400, "text/plain", "Send one command without control characters."); return;
+    }
+  }
+  command.toCharArray(pendingTerminalCommand, sizeof(pendingTerminalCommand));
+  terminalCommandPending = true;
+  server.send(202, "application/json", "{\"queued\":true}");
+}
+
+void serviceTerminalCommand() {
+  if ((webWifiConfigStage == 1 || webWifiConfigStage == 2) && (uint32_t)(millis() - webWifiConfigStartedMs) >= 120000) {
+    webWifiConfigStage = 3; webWifiConfigSsid = "";
+    // A late password must never fall through to ordinary command echo.
+    terminalCommandPending = false;
+    memset(pendingTerminalCommand, 0, sizeof(pendingTerminalCommand));
+    Serial.println("Web Wi-Fi setup expired. Start again with wifi-config.");
+  }
+  if (!terminalCommandPending || controlledRestartPending || wifiScanInProgress || bleDiagnosticScanActive) return;
+  String command(pendingTerminalCommand);
+  memset(pendingTerminalCommand, 0, sizeof(pendingTerminalCommand));
+  terminalCommandPending = false;
+  if (webWifiConfigStage) {
+    webWifiConfigStartedMs = millis();
+    if (command == "cancel") {
+      webWifiConfigStage = 0; webWifiConfigSsid = "";
+      Serial.println("Web Wi-Fi setup cancelled."); return;
+    }
+    if (webWifiConfigStage == 3) {
+      if (command == "wifi-config") {
+        webWifiConfigStage = 1;
+        Serial.println("Enter the Wi-Fi SSID next (cancel to abort).");
+      } else Serial.println("Setup expired. Enter wifi-config to retry or cancel to return to commands.");
+      return;
+    }
+    if (webWifiConfigStage == 1) {
+      if (command.length() == 0 || command.length() > 32) {
+        Serial.println("SSID must contain 1 to 32 bytes. Retry or enter cancel."); return;
+      }
+      webWifiConfigSsid = command; webWifiConfigStage = 2;
+      Serial.println("Enter password next (empty for open network). Select Hide input before typing; cancel aborts.");
+      return;
+    }
+    if (command.length() != 0 && (command.length() < 8 || command.length() > 63)) {
+      Serial.println("Password must be empty or 8 to 63 bytes. Retry or enter cancel."); return;
+    }
+    webWifiConfigStage = 0;
+    Serial.println("[RX WEB] Wi-Fi password [redacted]");
+    if (connectToWiFi(webWifiConfigSsid, command)) saveCredentials(webWifiConfigSsid, command);
+    webWifiConfigSsid = "";
+    return;
+  }
+  ledDiagEvent(LED_EVENT_WEBPAGE);
+  executeTerminalCommand(command, true);
+}
+
 void handleTerminalPage() {
   ledDiagEvent(LED_EVENT_WEBPAGE);
   beginWebResponseProfile("/terminal");
@@ -9153,13 +9307,19 @@ void handleTerminalPage() {
   sendSiteNavigation("terminal");
   diagnosticSendContent(R"TERMINAL(
 <h1>Serial Terminal</h1><div class="card">
-<p>Recent firmware serial output, including startup and enabled diagnostics. The device retains the latest 8 KB; this browser keeps up to 64 KB. ROM and library UART logs are not captured. Read-only; use Serial for commands.</p>
+<p>Recent firmware serial output, including startup and enabled diagnostics. The device retains the latest 8 KB; this browser keeps up to 64 KB. ROM and library UART logs are not captured. Enter help for commands; responses appear below. Commands can change settings or restart the device.</p>
 <div class="terminal-controls"><button id="terminal-pause" type="button">Pause</button>
-<label><input id="terminal-scroll" type="checkbox" checked> Auto-scroll</label>
 <label>Filter <input id="terminal-filter" type="text" placeholder="Text to match"></label>
 <button id="terminal-clear" type="button">Clear view</button>
 <button id="terminal-download" type="button">Download captured text</button></div>
-<p id="terminal-status" role="status">Connecting…</p><pre id="terminal-output" tabindex="0" aria-label="Serial output"></pre></div>
+<p id="terminal-status" role="status">Connecting…</p><pre id="terminal-output" tabindex="0" aria-label="Serial output"></pre>
+<form id="terminal-command-form" class="terminal-controls" autocomplete="off">
+<label>Command <input id="terminal-command" type="text" maxlength="192" autocomplete="off" spellcheck="false" placeholder="help, wifi on, wifi window 60"></label>
+<label><input id="terminal-hide-input" type="checkbox"> Hide input</label>
+<label><input id="terminal-scroll" type="checkbox" checked> Auto-scroll</label>
+<button id="terminal-send" type="submit">Send</button></form>
+<p id="terminal-command-status" role="status"></p>
+</div>
 <script>
 (function(){
   const output=document.getElementById('terminal-output'),status=document.getElementById('terminal-status');
@@ -9172,6 +9332,23 @@ void handleTerminalPage() {
     if(scroll.checked)output.scrollTop=output.scrollHeight;
   }
   function append(text){captured=(captured+text).slice(-65536);render();}
+  const commandInput=document.getElementById('terminal-command'),send=document.getElementById('terminal-send');
+  const commandStatus=document.getElementById('terminal-command-status');
+  document.getElementById('terminal-hide-input').onchange=function(){commandInput.type=this.checked?'password':'text';};
+  document.getElementById('terminal-command-form').onsubmit=async function(event){
+    event.preventDefault();if(send.disabled)return;
+    const command=commandInput.value;
+    if(new TextEncoder().encode(command).length>192){commandStatus.textContent='Maximum command length is 192 bytes.';return;}
+    send.disabled=true;commandInput.value='';
+    const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
+    try{
+      const response=await fetch('/api/terminal/command',{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8','X-Terminal-Command':'1'},body:command,signal:controller.signal,cache:'no-store'});
+      if(response.status!==202)throw new Error('HTTP '+response.status);
+      paused=false;pause.textContent='Pause';live.checked=true;
+      commandStatus.textContent='Queued. Responses appear in the output; a restart or power change may disconnect this page.';
+    }catch(error){commandStatus.textContent='Command delivery could not be confirmed ('+error.message+'). Check output before sending again.';}
+    finally{clearTimeout(timeout);send.disabled=false;commandInput.focus();}
+  };
   pause.onclick=()=>{paused=!paused;pause.textContent=paused?'Resume':'Pause';status.textContent=paused?'Paused — device capture continues.':'Resuming…';};
   filter.oninput=render;
   document.getElementById('terminal-clear').onclick=()=>{captured='';gapSeen=false;render();};
@@ -9226,6 +9403,7 @@ void startWebServer() {
   server.on("/diagnostics", HTTP_GET, []() { runDiagnosticWebHandler("/diagnostics", handleDiagnosticsPage); });
   server.on("/terminal", HTTP_GET, handleTerminalPage);
   server.on("/api/terminal", HTTP_GET, handleTerminalData);
+  server.on("/api/terminal/command", HTTP_POST, handleTerminalCommand);
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
   server.on("/wifi-power", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-power", handleWifiPowerSetting); });
   server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
@@ -9277,6 +9455,8 @@ void startWebServer() {
     );
   });
 
+  const char* terminalHeaders[] = {"X-Terminal-Command"};
+  server.collectHeaders(terminalHeaders, 1);
   server.begin();
   webServerStarted = true;
 
@@ -9620,6 +9800,9 @@ void printSettingsSerial() {
   Serial.println("  wifi-clear            - Clear saved infrastructure Wi-Fi");
   Serial.println("  ble on|off            - Change BLE mode and restart");
   Serial.println("  led on|off|test       - Status LED control/self-test");
+  Serial.println("  wifi on               - Wake Wi-Fi / renew access window");
+  Serial.println("  wifi window <5..3600>  - Save access-window seconds");
+  Serial.print("Access window seconds: "); Serial.println(wifiAccessWindowSeconds);
   Serial.println("  power normal|connected|ultra - Wi-Fi power mode (saved)");
   Serial.print("Wi-Fi power mode: "); Serial.println(wifiPowerModeName());
   Serial.println("  refresh on|off        - Survey web-page live updates");
@@ -9646,8 +9829,10 @@ String commandArgument(const String& command, const String& prefix) {
 // Purpose: Parses one serial command and dispatches it to the appropriate survey, settings, diagnostic, or test action.
 void handleSerialCommand() {
   if (!Serial.available()) return;
+  executeTerminalCommand(Serial.readStringUntil('\n'), false);
+}
 
-  String command = Serial.readStringUntil('\n');
+void executeTerminalCommand(String command, bool fromWeb) {
   command.trim();
   if (command.length() == 0) { printSerialMainMenu(); return; }
 
@@ -9702,6 +9887,22 @@ void handleSerialCommand() {
     printDeveloperDiagnosticSummary(); return;
   }
 
+  if (command.equalsIgnoreCase("wifi on")) {
+    if (!wakeWifiRadio()) { Serial.println("Wi-Fi wake failed; retry wifi on."); return; }
+    wifiPowerWindow.arm(millis());
+    Serial.print("Wi-Fi awake. Access window: "); Serial.print(wifiAccessWindowSeconds);
+    Serial.println(" seconds in Ultra mode; saved power mode unchanged.");
+    return;
+  }
+  if (command.startsWith("wifi window ")) {
+    uint32_t seconds;
+    if (!parseWifiAccessWindow(commandArgument(command, "wifi window"), seconds)) {
+      Serial.println("Use wifi window <seconds>, from 5 to 3600."); return;
+    }
+    saveWifiAccessWindow(seconds);
+    Serial.print("Wi-Fi access window saved: "); Serial.print(seconds); Serial.println(" seconds.");
+    return;
+  }
   if (command.startsWith("power ")) {
     String mode = commandArgument(command, "power");
     if (mode == "normal" || mode == "connected" || mode == "ultra") {
@@ -9771,6 +9972,10 @@ void handleSerialCommand() {
     Serial.print("Web live updates "); Serial.println(requested?"enabled.":"disabled."); printSettingsSerial(); return;
   }
 
+  if (command.equalsIgnoreCase("wifi-config") && fromWeb) {
+    webWifiConfigStage = 1; webWifiConfigStartedMs = millis();
+    Serial.println("Enter the Wi-Fi SSID as the next web command (cancel to abort)."); return;
+  }
   if (command.equalsIgnoreCase("wifi-config")) { configureWiFi(); printSettingsSerial(); return; }
   if (command.equalsIgnoreCase("wifi-clear")) { eraseCredentials(); WiFi.disconnect(false); ensureWiFiStationMode(); Serial.println("Saved infrastructure Wi-Fi credentials cleared."); printSettingsSerial(); return; }
 
@@ -10065,6 +10270,19 @@ const char* wifiPowerModeName() {
     (wifiPowerMode == 1 ? "Connected power saving" : "Normal");
 }
 
+bool wifiAccessWindowActive() {
+  return wifiPowerMode == 2 && !wifiRadioSleeping && !wifiScanInProgress &&
+    wifiPowerWindow.remaining(millis()) > 0 && (apRunning || infrastructureHasIp());
+}
+
+void saveWifiAccessWindow(uint32_t seconds) {
+  wifiAccessWindowSeconds = seconds;
+  preferences.begin("survey", false);
+  preferences.putUInt("wifiWindow", seconds);
+  preferences.end();
+  wifiPowerWindow.arm(millis());
+}
+
 void saveWifiPowerMode(uint8_t mode) {
   wifiPowerMode = mode;
   preferences.begin("survey", false);
@@ -10130,7 +10348,7 @@ void serviceWifiPower() {
     }
   }
   // Reconnect only after the survey, avoiding connect/scan competition. The
-  // 60-second window includes association/DHCP time; the AP is also available.
+  // configured window includes association/DHCP time; the AP is also available.
   if (wifiPowerWakeConnectionPending && !wifiScanInProgress && !initialWifiScanPending) {
     wifiPowerWakeConnectionPending = false;
     WiFi.setAutoReconnect(true);
@@ -10199,6 +10417,8 @@ void loop() {
     return;
   }
 
+  serviceTerminalCommand();
+  if (controlledRestartPending) return;
   serviceDiagnosticSnapshot();
   serviceCompletedBLEScan();
   serviceLoggedWifiScan();
