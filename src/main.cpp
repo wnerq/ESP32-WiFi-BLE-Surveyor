@@ -104,8 +104,8 @@ bool userInteractionDeferActive();
 // ============================================================
 
 const char* FIRMWARE_FILE = "src/main.cpp (PlatformIO)";
-const char* FIRMWARE_VERSION = "40a4";
-const char* FIRMWARE_CHANGE_SUMMARY = "Add centralized nonblocking LED diagnostics for infrastructure, web, serial, boot and restart";
+const char* FIRMWARE_VERSION = "40a5";
+const char* FIRMWARE_CHANGE_SUMMARY = "Add configurable connected Wi-Fi power saving and radio-off scan windows";
 
 
 Preferences preferences;
@@ -214,6 +214,35 @@ bool bleSurveyEnabled = false;
 const bool STATUS_LED_AVAILABLE = true;
 bool statusLedEnabled = true;
 bool webAutoRefreshEnabled = true;
+// 0: continuously awake, 1: connected modem sleep, 2: Wi-Fi off between scans.
+uint8_t wifiPowerMode = 0;
+uint8_t wifiPowerAppliedMode = 255;
+bool wifiRadioSleeping = false;
+bool wifiPowerWakeConnectionPending = false;
+bool wifiPowerResumeWeb = false;
+uint32_t wifiPowerRetryAfterMs = 0;
+bool wifiPowerRetryPending = false;
+esp_err_t wifiPowerLastError = ESP_OK;
+
+struct WifiPowerWindow {
+  static constexpr uint32_t DURATION_MS = 60000;
+  bool armed = false;
+  uint32_t startedMs = 0;
+  void arm(uint32_t now) { armed = true; startedMs = now; }
+  uint32_t remaining(uint32_t now) const {
+    uint32_t elapsed = now - startedMs;
+    return armed && elapsed < DURATION_MS ? DURATION_MS - elapsed : 0;
+  }
+  bool shouldSleep(uint32_t now, uint32_t intervalMs) const {
+    return armed && intervalMs > DURATION_MS && remaining(now) == 0;
+  }
+};
+WifiPowerWindow wifiPowerWindow;
+bool wakeWifiRadio();
+void serviceWifiPower();
+void noteWifiPowerScanFinished();
+void saveWifiPowerMode(uint8_t mode);
+const char* wifiPowerModeName();
 const uint8_t STATUS_LED_PIN = 2;
 const bool STATUS_LED_ACTIVE_HIGH = true;
 
@@ -874,7 +903,7 @@ void ledDiagSerialRx() { ledDiagEvent(LED_EVENT_SERIAL_RX); }
 void ledDiagScanFinished(bool bluetooth = false) { diagnosticLed.scanFinished(bluetooth); }
 void ledDiagSetInfraDisconnected(bool active) { diagnosticLed.setInfraDisconnected(active); }
 void ledDiagUpdateInfraState() {
-  ledDiagSetInfraDisconnected(ledDiagInfraConfigured && (WiFi.getMode() & WIFI_MODE_STA) && !infrastructureHasIp());
+  ledDiagSetInfraDisconnected(ledDiagInfraConfigured && !wifiRadioSleeping && wifiPowerMode != 2 && (WiFi.getMode() & WIFI_MODE_STA) && !infrastructureHasIp());
 }
 void ledDiagSetInfraConfigured(bool configured) {
   ledDiagInfraConfigured = configured;
@@ -897,7 +926,7 @@ bool ledDiagIsHumanRequest(const char* route, bool post) {
   const char* const pages[] = {"/", "/scan", "/system", "/diagnostics", "/settings", "/help", "/ble", "/ap", "/terminal"};
   const char* const actions[] = {
     "/restart-device", "/config/import", "/wifi-save", "/wifi-clear", "/hostname-save",
-    "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
+    "/wifi-power", "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
     "/api/wifi/interval", "/api/ble/interval", "/api/diag/event-limit", "/history-prefill",
     "/session-save", "/session-discard", "/ble-mode", "/ap-save"
   };
@@ -1039,6 +1068,8 @@ void loadSurveyModeSettings() {
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
   webAutoRefreshEnabled = preferences.getBool("webRefresh", true);
+  wifiPowerMode = preferences.getUChar("wifiPower", 0);
+  if (wifiPowerMode > 2) wifiPowerMode = 0;
   captureHiddenNetworks = preferences.getBool("captureHidden", true);
   scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
   bleScanIntervalSeconds = preferences.getULong("bleInterval", bleScanIntervalSeconds);
@@ -1145,6 +1176,7 @@ void saveWebLiveUpdates(bool enabled) {
 
 // Purpose: Ensures the ESP32 Wi-Fi driver includes station capability without unnecessarily disrupting the Device AP.
 void ensureWiFiStationMode() {
+  if (!wakeWifiRadio()) return;
   wifi_mode_t currentMode = WiFi.getMode();
 
   if (apRunning || apEnabled) {
@@ -1688,6 +1720,19 @@ void handleSessionCheckpointDiscard() {
 
 // Purpose: Observes infrastructure Wi-Fi link transitions so native ESP32 auto-reconnect behavior can be diagnosed.
 void serviceNativeReconnectDiagnostics() {
+  if (wifiRadioSleeping || wifiPowerMode == 2) {
+    // Power cycling is expected, not evidence of a failed native reconnect.
+    portENTER_CRITICAL(&infrastructureEventMux);
+    infrastructureHandledDisconnectCount = infrastructureEventDisconnectCount;
+    portEXIT_CRITICAL(&infrastructureEventMux);
+    infrastructureDisconnectActive = false;
+    nativeReconnectSawDisconnect = false;
+    nativeReconnectWasConnected = infrastructureHasIp();
+    infrastructureRecoveryState = wifiRadioSleeping ? "RADIO_SLEEP" :
+      (infrastructureHasIp() ? "CONNECTED" : "POWER_WINDOW");
+    ledDiagUpdateInfraState();
+    return;
+  }
   bool connected = infrastructureHasIp();
   ledDiagUpdateInfraState();
   uint32_t now = millis();
@@ -1835,6 +1880,8 @@ void diagnosticPrintHeapTriplet() {
 void printDiagnosticSnapshot() {
   diagnosticPrefix("STATUS");
   Serial.print("up="); Serial.print(millis());
+  Serial.print(" powerMode="); Serial.print(wifiPowerMode);
+  Serial.print(" radio="); Serial.print(wifiRadioSleeping ? "off" : "awake");
   Serial.print(" wifiScan="); Serial.print(wifiScanInProgress ? 1 : 0);
   Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
   Serial.print(" wifiObs="); Serial.print(historyCount);
@@ -3053,6 +3100,7 @@ void noteAutomaticScanFailure() {
 int performLoggedScan() {
   cancelInfrastructureReconnect("manual-scan");
   ensureWiFiStationMode();
+  if (wifiRadioSleeping) return WIFI_SCAN_FAILED;
 
   ledDiagEvent(LED_EVENT_WIFI_SCAN);
   uint32_t scanStartMs = millis();
@@ -3060,6 +3108,7 @@ int performLoggedScan() {
   uint32_t scanDurationMs = millis() - scanStartMs;
   ledDiagScanFinished();
 
+  noteWifiPowerScanFinished();
   int result = processCompletedWifiScan(networkCount);
   if (networkCount >= 0) recordWifiScanDuration(scanDurationMs);
   lastAutoScanMs = millis();
@@ -3077,10 +3126,15 @@ bool beginLoggedWifiScan(bool initialCheckpoint, bool automaticTrigger) {
   }
 
   ensureWiFiStationMode();
+  if (wifiRadioSleeping) {
+    if (automaticTrigger) { wifiAutoScanStartFailureCount++; noteAutomaticScanFailure(); }
+    return false;
+  }
   WiFi.scanDelete();
 
   int result = WiFi.scanNetworks(true, true);
   if (result == WIFI_SCAN_FAILED) {
+    noteWifiPowerScanFinished();
     wifiScanStatusMessage = "Failed to start";
     if (automaticTrigger) {
       wifiAutoScanStartFailureCount++;
@@ -3116,6 +3170,7 @@ void serviceLoggedWifiScan() {
     ledDiagScanFinished();
     WiFi.scanDelete();
     wifiScanInProgress = false;
+    noteWifiPowerScanFinished();
     wifiScanStatusMessage = "Timed out; recovery scheduled";
     wifiInitialScanCheckpointPending = false;
     recordDiagnosticEvent("WIFI TIMEOUT", "elapsed=" + String(elapsedMs) + "ms auto=" + String(wifiCurrentScanAutomatic ? "yes" : "no"));
@@ -3127,6 +3182,7 @@ void serviceLoggedWifiScan() {
     return;
   }
 
+  noteWifiPowerScanFinished();
   uint32_t scanDurationMs = millis() - wifiCurrentScanStartMs;
   ledDiagScanFinished();
   wifiScanInProgress = false;
@@ -3167,6 +3223,7 @@ void serviceLoggedWifiScan() {
 
 // Purpose: Escalates persistent Wi-Fi scan-engine failure to a checkpointed controlled restart.
 void serviceWifiScanRecoveryWatchdog() {
+  if (wifiRadioSleeping) return;
   uint32_t now = millis();
 
   // A stable half-hour proves the scanner recovered; clear persistent loop-guard state.
@@ -3288,9 +3345,9 @@ void captureNimBleAdvertisement(const NimBLEAdvertisedDevice* advertisedDevice) 
 
   if (bleScanCaptureCount < BLE_SCAN_CAPTURE_CAPACITY) {
     bleScanCapture[bleScanCaptureCount] = captured;
-    bleScanCaptureCount++;
+    bleScanCaptureCount = bleScanCaptureCount + 1;
   } else {
-    bleScanCaptureDrops++;
+    bleScanCaptureDrops = bleScanCaptureDrops + 1;
   }
   portEXIT_CRITICAL(&bleScanCaptureMux);
 }
@@ -4222,7 +4279,7 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
   if (seen) {
     infrastructureSavedNetworkLastSeenMs = millis();
     infrastructureSavedNetworkSeenScanCount++;
-    if (!connected) {
+    if (!connected && wifiPowerMode != 2) {
       infrastructureSavedNetworkSeenDisconnectedScanCount++;
       infrastructureLastRecovery.seen = true;
       ++infrastructureLastRecovery.visibleScans;
@@ -4232,7 +4289,7 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
     }
   }
 
-  bool visibleDisconnected = configured && seen && !connected;
+  bool visibleDisconnected = configured && seen && !connected && wifiPowerMode != 2;
   infrastructureVisibleDisconnectedActive = visibleDisconnected;
 
   if (visibleDisconnected && !previousVisibleDisconnected) {
@@ -4296,7 +4353,7 @@ void considerInfrastructureReconnectAfterScan(int networkCount) {
   infrastructureObservationInitialized = true;
 
   // A newer scan that cannot see the saved SSID revokes the pending evidence.
-  if (connected || !configured || !seen) {
+  if (wifiPowerMode == 2 || connected || !configured || !seen) {
     infrastructureReconnectPending = false;
     return;
   }
@@ -4337,6 +4394,7 @@ void cancelInfrastructureReconnect(const char* reason) {
 // radio-mode changes, extra survey scans, or credentials in diagnostics.
 void serviceInfrastructureReconnect() {
   serviceNativeReconnectDiagnostics();
+  if (wifiRadioSleeping || wifiPowerMode == 2) return;
   if (infrastructureHasIp() || infrastructureUserConnectionActive) return;
   uint32_t now = millis();
   bool associated = WiFi.STA.connected();
@@ -7553,6 +7611,7 @@ struct PortableConfig {
   bool captureHiddenNetworks;
   bool statusLedEnabled;
   bool liveUpdatesEnabled;
+  unsigned long wifiPowerMode;
   bool diagnosticStreamingEnabled;
   bool diagnosticSurveyEvents;
   bool diagnosticBleEvents;
@@ -7589,6 +7648,8 @@ PortableConfig readPersistedPortableConfig() {
       preferences.getBool("captureHidden", captureHiddenNetworks);
   c.statusLedEnabled =
       preferences.getBool("ledEnabled", statusLedEnabled);
+  c.wifiPowerMode = preferences.getUChar("wifiPower", 0);
+  if (c.wifiPowerMode > 2) c.wifiPowerMode = 0;
   c.liveUpdatesEnabled =
       preferences.getBool("webRefresh", webAutoRefreshEnabled);
   c.mdnsHostnameAutomatic = !preferences.isKey("hostname");
@@ -7642,6 +7703,7 @@ String portableConfigJson(const PortableConfig& c) {
   json += "  \"bluetoothSurveyEnabled\":" + String(c.bluetoothSurveyEnabled ? "true" : "false") + ",\n";
   json += "  \"captureHiddenNetworks\":" + String(c.captureHiddenNetworks ? "true" : "false") + ",\n";
   json += "  \"statusLedEnabled\":" + String(c.statusLedEnabled ? "true" : "false") + ",\n";
+  json += "  \"wifiPowerMode\":" + String(c.wifiPowerMode) + ",\n";
   json += "  \"liveUpdatesEnabled\":" + String(c.liveUpdatesEnabled ? "true" : "false") + ",\n";
   json += "  \"diagnosticStreamingEnabled\":" + String(c.diagnosticStreamingEnabled ? "true" : "false") + ",\n";
   json += "  \"diagnosticSurveyEvents\":" + String(c.diagnosticSurveyEvents ? "true" : "false") + ",\n";
@@ -7688,6 +7750,7 @@ public:
     bool seenCaptureHidden = false;
     bool seenLed = false;
     bool seenLive = false;
+    bool seenPower = false;
     bool seenDiagEnabled = false;
     bool seenDiagSurvey = false;
     bool seenDiagBle = false;
@@ -7754,6 +7817,11 @@ public:
         seenLed = true;
         if (!parseBool(out.statusLedEnabled))
           return fail("statusLedEnabled must be true or false.");
+      } else if (key == "wifiPowerMode") {
+        if (seenPower) return fail("Duplicate wifiPowerMode.");
+        seenPower = true;
+        if (!parseUnsigned(out.wifiPowerMode) || out.wifiPowerMode > 2)
+          return fail("wifiPowerMode must be 0 (normal), 1 (connected saving), or 2 (radio off).");
       } else if (key == "liveUpdatesEnabled") {
         if (seenLive) return fail("Duplicate liveUpdatesEnabled.");
         seenLive = true;
@@ -8097,6 +8165,10 @@ void handleConfigImport() {
     appliedCount++;
   }
 
+  if (requested.wifiPowerMode != previous.wifiPowerMode) {
+    saveWifiPowerMode((uint8_t)requested.wifiPowerMode);
+    appliedCount++;
+  }
   if (requested.liveUpdatesEnabled != previous.liveUpdatesEnabled) {
     saveWebLiveUpdates(requested.liveUpdatesEnabled);
     appliedCount++;
@@ -8316,7 +8388,12 @@ void handleStatusJsonExport() {
     String(infrastructureReconnectAttemptCount));
   diagnosticSendContent(",\"autoReconnectSuccesses\":" +
     String(infrastructureReconnectSuccessCount));
-  diagnosticSendContent(",\"nativeAutoReconnectEnabled\":true");
+  diagnosticSendContent(",\"nativeAutoReconnectEnabled\":" + String(WiFi.getAutoReconnect() ? "true" : "false"));
+  diagnosticSendContent(",\"wifiPowerMode\":" + String(wifiPowerMode));
+  diagnosticSendContent(",\"wifiPowerAppliedMode\":" + String(wifiPowerAppliedMode));
+  diagnosticSendContent(",\"wifiRadioSleeping\":" + String(wifiRadioSleeping ? "true" : "false"));
+  diagnosticSendContent(",\"wifiPowerWindowRemainingMs\":" + String(wifiPowerMode == 2 && !wifiRadioSleeping ? wifiPowerWindow.remaining(millis()) : 0));
+  diagnosticSendContent(",\"wifiPowerLastError\":" + String(wifiPowerLastError));
   diagnosticSendContent(",\"nativeReconnectTransitions\":" + String(nativeReconnectObservedCount));
   diagnosticSendContent(",\"infrastructureRecovery\":{\"state\":" + jsonQuoted(infrastructureRecoveryState));
   diagnosticSendContent(",\"backoffRemainingMs\":" + String(infrastructureBackoffRemainingMs()));
@@ -8582,6 +8659,17 @@ void handleStatusJsonExport() {
 }
 
 // Purpose: Builds the Settings page with ordinary configuration in Standard and maintenance detail in deeper views.
+void handleWifiPowerSetting() {
+  String mode = server.arg("mode");
+  if (!server.hasArg("mode") || (mode != "0" && mode != "1" && mode != "2")) {
+    server.send(400, "text/plain", "Mode must be 0, 1, or 2.");
+    return;
+  }
+  saveWifiPowerMode((uint8_t)mode.toInt());
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>Wi-Fi power mode saved</h1><p>The setting applies now. Radio-off mode closes Wi-Fi after the 60-second window. USB serial: power normal restores continuous access.</p><a href='/settings'>Return to Settings</a>");
+}
+
 void handleSettingsPage() {
   beginWebResponseProfile("/settings");
   markExplicitUserInteraction();
@@ -8593,6 +8681,12 @@ void handleSettingsPage() {
   markWebResponsePhase("header");
 
   String s; s.reserve(1200);
+  diagnosticSendContent("<div class=\"card\"><h2>Wi-Fi Power Saving</h2><form action=\"/wifi-power\" method=\"post\"><label for=\"wifi-power\">Mode</label><select id=\"wifi-power\" name=\"mode\">");
+  const char* powerLabels[] = {"Normal - continuous Wi-Fi", "Connected power saving - web stays available", "Ultra - Wi-Fi off between scans"};
+  for (uint8_t mode = 0; mode < 3; ++mode) {
+    diagnosticSendContent("<option value=\"" + String(mode) + "\"" + (wifiPowerMode == mode ? " selected" : "") + ">" + powerLabels[mode] + "</option>");
+  }
+  diagnosticSendContent("</select><button type=\"submit\">Save Power Mode</button></form><p>Ultra keeps Wi-Fi awake for 60 seconds after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Page polling does not extend the window. Rejoining Wi-Fi takes part of this time. Use USB serial command <code>power normal</code> to restore continuous access.</p><p>For off time, set the Wi-Fi scan interval above 60 seconds. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
   String configuredStationSSID = preferences.getString("ssid", "");
   s += "<div class=\"card\"><h2>Infrastructure Wi-Fi</h2><div class=\"row\"><span class=\"label\">Configured Network</span><span class=\"value\">" + htmlEscape(configuredStationSSID.length() ? configuredStationSSID : String("None")) + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) {
@@ -9128,6 +9222,7 @@ void startWebServer() {
   server.on("/terminal", HTTP_GET, handleTerminalPage);
   server.on("/api/terminal", HTTP_GET, handleTerminalData);
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
+  server.on("/wifi-power", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-power", handleWifiPowerSetting); });
   server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
   server.on("/api/ping", HTTP_GET, []() { handleApiPing(); });
   server.on("/api/web/client-diag", HTTP_POST, []() { handleWebClientDiagnostic(); });
@@ -9520,6 +9615,8 @@ void printSettingsSerial() {
   Serial.println("  wifi-clear            - Clear saved infrastructure Wi-Fi");
   Serial.println("  ble on|off            - Change BLE mode and restart");
   Serial.println("  led on|off|test       - Status LED control/self-test");
+  Serial.println("  power normal|connected|ultra - Wi-Fi power mode (saved)");
+  Serial.print("Wi-Fi power mode: "); Serial.println(wifiPowerModeName());
   Serial.println("  refresh on|off        - Survey web-page live updates");
   Serial.println("  hostname <name>       - Set mDNS hostname and restart");
   Serial.println("  ap on|off             - Enable/disable Device AP and restart");
@@ -9600,6 +9697,14 @@ void handleSerialCommand() {
     printDeveloperDiagnosticSummary(); return;
   }
 
+  if (command.startsWith("power ")) {
+    String mode = commandArgument(command, "power");
+    if (mode == "normal" || mode == "connected" || mode == "ultra") {
+      saveWifiPowerMode(mode == "normal" ? 0 : (mode == "connected" ? 1 : 2));
+      Serial.print("Wi-Fi power mode saved: "); Serial.println(wifiPowerModeName());
+    } else Serial.println("Use power normal|connected|ultra.");
+    return;
+  }
   if (command.equalsIgnoreCase("scan")) { performLoggedScan(); WiFi.scanDelete(); printWifiSurveySerial(); return; }
   if (command.equalsIgnoreCase("wclear")) { clearScanHistory(); Serial.println("Wi-Fi history cleared."); printWifiSurveySerial(); return; }
 
@@ -9752,6 +9857,7 @@ void setup() {
   }
 
   WiFi.onEvent(observeInfrastructureEvent);
+  WiFi.setSleep(wifiPowerMode == 1 ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   delay(WIFI_STARTUP_SETTLE_MS);
@@ -9880,7 +9986,7 @@ void serviceInitialSurveyScans() {
     !wifiScanInProgress &&
     !infrastructureReconnectAttemptActive &&
     !csvExportInProgress &&
-    !userInteractionDeferActive()
+    (wifiPowerMode == 2 || !userInteractionDeferActive())
   ) {
     initialWifiScanPending = false;
     Serial.println("Initial headless Wi-Fi survey scan...");
@@ -9907,7 +10013,8 @@ void serviceInitialSurveyScans() {
 // Purpose: Schedules automatic Wi-Fi scans while honoring active work, interaction defer, retry backoff, and configured interval.
 void serviceAutomaticScan() {
   if (infrastructureReconnectAttemptActive) return;
-  if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress || userInteractionDeferActive()) return;
+  if (wifiScanInProgress || bleDiagnosticScanActive || csvExportInProgress ||
+      (wifiPowerMode != 2 && userInteractionDeferActive())) return;
 
   uint32_t now = millis();
 
@@ -9947,7 +10054,119 @@ void serviceAutomaticBLEScan() {
 // Main loop
 // ============================================================
 
-// Purpose: Arduino main loop that continuously services web requests, serial commands, scan completion, reconnect diagnostics, and automatic survey scheduling.
+// Wi-Fi power policy runs only on the main task, outside HTTP handlers.
+const char* wifiPowerModeName() {
+  return wifiPowerMode == 2 ? "Radio off between scans" :
+    (wifiPowerMode == 1 ? "Connected power saving" : "Normal");
+}
+
+void saveWifiPowerMode(uint8_t mode) {
+  wifiPowerMode = mode;
+  preferences.begin("survey", false);
+  preferences.putUChar("wifiPower", mode);
+  preferences.end();
+  // Apply from loop(), after an HTTP response has returned. Give a new mode
+  // a fresh window rather than cutting off the response that selected it.
+  wifiPowerWindow.arm(millis());
+  if (mode == 2) {
+    infrastructureReconnectAttemptActive = false;
+    infrastructureReconnectPending = false;
+  }
+  wifiPowerRetryPending = false;
+}
+
+// Driver stop/start retains interface configuration and survey data in RAM.
+// Do not tear down Arduino Wi-Fi objects or re-register HTTP routes per scan.
+bool wakeWifiRadio() {
+  if (!wifiRadioSleeping) return true;
+  if (wifiPowerRetryPending && (uint32_t)(millis() - wifiPowerRetryAfterMs) < 5000) return false;
+  wifiPowerLastError = esp_wifi_start();
+  if (wifiPowerLastError != ESP_OK) {
+    wifiPowerRetryPending = true;
+    wifiPowerRetryAfterMs = millis();
+    recordDiagnosticEvent("WIFI POWER", "start failed=" + String(wifiPowerLastError));
+    return false;
+  }
+  wifiRadioSleeping = false;
+  WiFi.setAutoReconnect(wifiPowerMode != 2);
+  wifiPowerRetryPending = false;
+  wifiPowerAppliedMode = 255;
+  apRunning = apEnabled;
+  wifiPowerWakeConnectionPending = infrastructureSavedNetworkConfigured;
+  infrastructureDisconnectActive = false;
+  nativeReconnectStateInitialized = false;
+  if (wifiPowerResumeWeb) server.begin();
+  if (apRunning) startMdnsService();
+  recordDiagnosticEvent("WIFI POWER", "radio awake for survey; web window follows scan");
+  return true;
+}
+
+void noteWifiPowerScanFinished() {
+  wifiPowerWindow.arm(millis());
+}
+
+void serviceWifiPower() {
+  if (controlledRestartPending) return;
+  if (wifiPowerMode != 2 && !wakeWifiRadio()) return;
+  if (wifiRadioSleeping) return;
+  if (!mdnsStarted && infrastructureHasIp()) startMdnsService();
+  if (wifiPowerAppliedMode != wifiPowerMode &&
+      (!wifiPowerRetryPending || (uint32_t)(millis() - wifiPowerRetryAfterMs) >= 5000)) {
+    wifiPowerLastError = WiFi.setSleep(wifiPowerMode == 1 ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE) ? ESP_OK : ESP_FAIL;
+    if (wifiPowerLastError == ESP_OK) {
+      wifiPowerAppliedMode = wifiPowerMode;
+      if (wifiPowerMode != 2) WiFi.setAutoReconnect(true);
+      wifiPowerRetryPending = false;
+      recordDiagnosticEvent("WIFI POWER", wifiPowerModeName());
+    } else {
+      wifiPowerRetryPending = true;
+      wifiPowerRetryAfterMs = millis();
+      recordDiagnosticEvent("WIFI POWER", "power-save apply failed=" + String(wifiPowerLastError));
+    }
+  }
+  // Reconnect only after the survey, avoiding connect/scan competition. The
+  // 60-second window includes association/DHCP time; the AP is also available.
+  if (wifiPowerWakeConnectionPending && !wifiScanInProgress && !initialWifiScanPending) {
+    wifiPowerWakeConnectionPending = false;
+    WiFi.setAutoReconnect(true);
+    esp_err_t result = esp_wifi_connect();
+    recordDiagnosticEvent("WIFI POWER", "post-scan connect result=" + String(result));
+  }
+  if (wifiPowerMode != 2 || initialWifiScanPending || wifiScanInProgress ||
+      bleDiagnosticScanActive || csvExportInProgress || infrastructureUserConnectionActive ||
+      !wifiPowerWindow.shouldSleep(millis(), scanIntervalSeconds * 1000UL)) return;
+  if (wifiPowerRetryPending && (uint32_t)(millis() - wifiPowerRetryAfterMs) < 5000) return;
+
+  // Intentional shutdown must not be recorded as a failed recovery attempt.
+  infrastructureReconnectAttemptActive = false;
+  infrastructureReconnectPending = false;
+  infrastructureDisconnectActive = false;
+  infrastructureVisibleDisconnectedActive = false;
+  infrastructureVisibleDisconnectedSinceMs = 0;
+  nativeReconnectSawDisconnect = false;
+  WiFi.setAutoReconnect(false);
+  wifiPowerResumeWeb = webServerStarted;
+  if (webServerStarted) server.stop();
+  if (mdnsStarted) { MDNS.end(); mdnsStarted = false; }
+  wifiPowerLastError = esp_wifi_stop();
+  if (wifiPowerLastError != ESP_OK) {
+    WiFi.setAutoReconnect(true);
+    if (wifiPowerResumeWeb) server.begin();
+    if (apRunning || infrastructureHasIp()) startMdnsService();
+    wifiPowerRetryPending = true;
+    wifiPowerRetryAfterMs = millis();
+    recordDiagnosticEvent("WIFI POWER", "stop failed=" + String(wifiPowerLastError));
+    return;
+  }
+  wifiRadioSleeping = true;
+  wifiPowerRetryPending = false;
+  apRunning = false;
+  infrastructureRecoveryState = "RADIO_SLEEP";
+  ledDiagUpdateInfraState();
+  recordDiagnosticEvent("WIFI POWER", "radio off until next scan; USB serial remains available");
+}
+
+// Purpose: Services web, serial, survey scheduling and power transitions.
 void loop() {
   serviceLoopGapDiagnostics();
   ledDiagUpdateInfraState();
@@ -9961,7 +10180,8 @@ void loop() {
     return;
   }
 
-  if (webServerStarted) {
+  serviceWifiPower();
+  if (webServerStarted && !wifiRadioSleeping) {
     server.handleClient();
     armUserInteractionDeferAfterWebService();
     ledDiagService();
@@ -9990,6 +10210,7 @@ void loop() {
   serviceAutomaticScan();
   serviceAutomaticBLEScan();
   handleSerialCommand();
+  serviceWifiPower();
   ledDiagService();
 
   delay(5);

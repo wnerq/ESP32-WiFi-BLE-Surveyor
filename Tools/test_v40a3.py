@@ -35,6 +35,8 @@ STUBS = r'''
 #include <type_traits>
 #include <vector>
 using std::min;
+bool wifiRadioSleeping=false;
+uint8_t wifiPowerMode=0;
 // LED instrumentation has its own waveform/integration tests; these no-op
 // sinks keep the recovery regression focused on unchanged radio policy.
 void ledDiagService(){}
@@ -227,6 +229,18 @@ int main(){
   saveInfrastructureRecoverySummary();assert(persistentWrites==1);
   persisted[0]=99;loadInfrastructureRecoverySummary();
   assert(std::string(infrastructurePreviousRecovery.result)=="none");
+  // Scheduled power cycles must not become reconnect attempts or lost-IP evidence.
+  wifiPowerMode=2;wifiRadioSleeping=true;WiFi.ip=false;
+  uint32_t oldAttempts=infrastructureReconnectAttemptCount;
+  uint32_t oldVisible=infrastructureSavedNetworkSeenDisconnectedScanCount;
+  observeInfrastructureEvent(ARDUINO_EVENT_WIFI_STA_DISCONNECTED,{{201}});
+  tick(300000);assert(!infrastructureDisconnectActive);
+  assert(std::string(infrastructureRecoveryState)=="RADIO_SLEEP");
+  wifiRadioSleeping=false;seen();tick(20001);
+  assert(!infrastructureReconnectPending && !infrastructureReconnectAttemptActive);
+  assert(infrastructureReconnectAttemptCount==oldAttempts);
+  assert(infrastructureSavedNetworkSeenDisconnectedScanCount==oldVisible);
+  assert(!infrastructureVisibleDisconnectedActive);
   std::cout << "PASS: terminal ring and recovery grace, visibility, radio guards, timeouts, backoff, attribution, cancellation, rollover, driver errors\n";
 }
 '''

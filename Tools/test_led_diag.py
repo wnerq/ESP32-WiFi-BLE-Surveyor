@@ -31,6 +31,8 @@ uint32_t nowMs=0, microCalls=0;
 uint32_t millis(){return nowMs;}
 uint32_t micros(){return nowMs*1000+(++microCalls);}
 bool statusLedEnabled=true;
+bool wifiRadioSleeping=false;
+uint8_t wifiPowerMode=0;
 const bool STATUS_LED_AVAILABLE=true, STATUS_LED_ACTIVE_HIGH=true;
 const uint8_t STATUS_LED_PIN=2;
 const int HIGH=1,LOW=0,OUTPUT=1,WIFI_MODE_STA=1;
@@ -174,6 +176,12 @@ int main(){
   for(const char* poll:{"/api/wifi/status","/api/wifi/observed","/api/wifi/channel","/api/wifi/plot","/api/ble/status","/api/ble/observed","/api/terminal","/api/ping","/status.json","/api/web/client-diag"}){
     assert(!ledDiagIsHumanRequest(poll,false));assert(!ledDiagIsHumanRequest(poll,true));
   }
+  // Planned radio-off periods do not request the disconnected heartbeat.
+  reset();ledDiagSetInfraConfigured(true);hasIp=false;
+  wifiPowerMode=2;ledDiagUpdateInfraState();edges.clear();advance(3500);
+  assert(onWidths().empty());
+  wifiPowerMode=0;wifiRadioSleeping=true;ledDiagUpdateInfraState();advance(3500);
+  assert(onWidths().empty());wifiRadioSleeping=false;
   // millis wraparound and long service gaps never cause catch-up flash loops.
   reset();nowMs=UINT32_MAX-24;ledDiagEvent(LED_EVENT_SERIAL_RX);advance(150);
   assert((onWidths()==std::vector<uint32_t>{25,25}));
