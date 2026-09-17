@@ -9,6 +9,8 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <WiFi.h>
+#include <SPI.h>
+#include <SD.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <FS.h>
@@ -137,6 +139,8 @@ WebServer server(80);
 
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 const unsigned long WIFI_STARTUP_SETTLE_MS = 300;
+const uint32_t MIN_WIFI_ACCESS_WINDOW_SECONDS = 5;
+const uint32_t MAX_WIFI_ACCESS_WINDOW_SECONDS = 9999;
 const uint32_t INFRA_NATIVE_GRACE_MS = 20000;
 const uint32_t INFRA_RECONNECT_BACKOFF_MS[] = {10000, 30000, 60000, 120000, 300000};
 const uint32_t INFRA_RECONNECT_ATTEMPT_WINDOW_MS = WIFI_TIMEOUT_MS;
@@ -455,6 +459,14 @@ bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
 void serviceLoggedWifiScan();
 void serviceWifiScanRecoveryWatchdog();
 String jsonQuoted(const String& value);
+void initializeSdLogging();
+void sdLogWifiObservation(const ScanRecord& record, const WifiObservation& observation);
+void sdLogBleObservation(const BleScanRecord& record);
+String htmlEscape(const String& input);
+String urlEncode(const String& input);
+void sendThemeBootstrapScript();
+void sendThemeScript();
+void sendSiteNavigation(const String& active);
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
@@ -533,6 +545,20 @@ uint32_t bleCsvExportCount = 0;
 size_t bleCsvLastRows = 0;
 size_t bleCsvLastBytes = 0;
 uint32_t bleCsvLastDurationMs = 0;
+
+// HW124-style SPI adapters normally use the ESP32 VSPI pins. Change this CS
+// value if the adapter is wired to a different ESP32 GPIO.
+#ifndef SURVEY_SD_CS_PIN
+#define SURVEY_SD_CS_PIN 5
+#endif
+const uint8_t SURVEY_SD_CS_PIN_VALUE = SURVEY_SD_CS_PIN;
+bool sdLoggingAvailable = false;
+uint32_t sdLoggingFileNumber = 0;
+String sdWifiLogPath = "";
+String sdBleLogPath = "";
+uint32_t sdWifiRowsLogged = 0;
+uint32_t sdBleRowsLogged = 0;
+uint32_t sdWriteFailures = 0;
 
 uint8_t* wifiStoragePool = nullptr;
 size_t wifiStoragePoolBytes = 0;
@@ -1062,12 +1088,12 @@ void ledDiagInfraReconnected(const char* source) {
 // Exact allowlist: polling endpoints (including terminal data and status.json)
 // never generate a page event. POSTs below are explicit settings/user actions.
 bool ledDiagIsHumanRequest(const char* route, bool post) {
-  const char* const pages[] = {"/", "/scan", "/system", "/diagnostics", "/settings", "/help", "/ble", "/ap", "/terminal"};
+  const char* const pages[] = {"/", "/scan", "/system", "/diagnostics", "/settings", "/help", "/ble", "/sd", "/ap", "/terminal"};
   const char* const actions[] = {
     "/restart-device", "/config/import", "/wifi-save", "/wifi-clear", "/hostname-save",
     "/wifi-power", "/developer-memory", "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
     "/api/wifi/interval", "/api/ble/interval", "/api/diag/event-limit", "/history-prefill",
-    "/session-save", "/session-discard", "/ble-mode", "/ap-save"
+    "/session-save", "/session-discard", "/ble-mode", "/ap-save", "/sd-write"
   };
   const char* const getActions[] = {"/scan-now", "/scan-settings", "/scan-clear", "/scanlog.csv", "/ble-scan", "/ble-settings", "/ble-clear", "/blelog.csv", "/config.json"};
   if (!route) return false;
@@ -1217,7 +1243,7 @@ void loadSurveyModeSettings() {
   wifiPowerMode = preferences.getUChar("wifiPower", 0);
   if (wifiPowerMode > 2) wifiPowerMode = 0;
   wifiAccessWindowSeconds = preferences.getUInt("wifiWindow", 60);
-  if (wifiAccessWindowSeconds < 5 || wifiAccessWindowSeconds > 3600) wifiAccessWindowSeconds = 60;
+  if (wifiAccessWindowSeconds < MIN_WIFI_ACCESS_WINDOW_SECONDS || wifiAccessWindowSeconds > MAX_WIFI_ACCESS_WINDOW_SECONDS) wifiAccessWindowSeconds = 60;
   captureHiddenNetworks = preferences.getBool("captureHidden", true);
   scanIntervalSeconds = preferences.getULong("wifiInterval", scanIntervalSeconds);
   bleScanIntervalSeconds = preferences.getULong("bleInterval", bleScanIntervalSeconds);
@@ -3317,6 +3343,7 @@ int processCompletedWifiScan(int networkCount) {
     observation.scanSlot = scanSlot;
     observation.rssi = (int8_t)rssi;
     appendWifiObservation(observation);
+    sdLogWifiObservation(historyRecord(wifiInventoryMode() ? (size_t)apIndex : historyCount - 1), observation);
     wifiLastScanLogged++;
   }
 
@@ -4145,6 +4172,7 @@ void serviceCompletedBLEScan() {
       observation.scanSlot = scanSlot;
       observation.rssi = captured.rssi;
       appendBleObservation(observation);
+      sdLogBleObservation(bleHistoryRecord(bleHistoryCount - 1));
     }
 
     updateBleUsageHighWaterMarks();
@@ -5455,6 +5483,27 @@ String pageStyles() {
     margin-top: 12px;
   }
 
+  .card form.controls,
+  .card > form:not(.controls):not(.terminal-controls) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 12px;
+    margin-top: 12px;
+  }
+
+  .card form.controls > label,
+  .card > form:not(.controls):not(.terminal-controls) > label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .card form button,
+  .card form .button {
+    margin-top: 0;
+  }
+
   .settings-row {
     display: flex;
     flex-wrap: wrap;
@@ -5782,6 +5831,232 @@ String csvEscape(const String& input) {
   String output = input;
   output.replace("\"", "\"\"");
   return "\"" + output + "\"";
+}
+
+uint32_t sdExistingBootFileNumber() {
+  uint32_t highest = 0;
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return highest;
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      name.toUpperCase();
+      int marker = name.indexOf("WIFI_");
+      if (marker < 0) marker = name.indexOf("BLE_");
+      if (marker >= 0) {
+        size_t start = marker + 5;
+        uint32_t number = 0;
+        bool valid = start < name.length();
+        size_t digits = 0;
+        while (valid && start + digits < name.length() &&
+               name[start + digits] >= '0' && name[start + digits] <= '9') {
+          number = number * 10UL + (uint32_t)(name[start + digits] - '0');
+          digits++;
+        }
+        valid = valid && digits > 0 && start + digits < name.length() &&
+          name[start + digits] == '.';
+        if (valid && number > highest) highest = number;
+      }
+    }
+    entry.close();
+    entry = root.openNextFile();
+  }
+  root.close();
+  return highest;
+}
+
+bool sdAppendText(const String& path, const String& text) {
+  if (!sdLoggingAvailable || path.length() == 0) return false;
+  File file = SD.open(path.c_str(), FILE_APPEND);
+  if (!file) {
+    sdWriteFailures++;
+    return false;
+  }
+  size_t written = file.print(text);
+  file.close();
+  if (written != text.length()) {
+    sdWriteFailures++;
+    return false;
+  }
+  return true;
+}
+
+bool sdSafePath(String name, String& path) {
+  name.trim();
+  if (name.length() == 0 || name.length() > 48 || name == "." || name == "..") return false;
+  for (size_t i = 0; i < name.length(); ++i) {
+    char c = name[i];
+    if (c == '/' || c == '\\' || c == ':' || c == '"' || c < 0x20) return false;
+  }
+  path = "/" + name;
+  return true;
+}
+
+String sdReadText(const String& path, bool& truncated) {
+  truncated = false;
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file) return "";
+  const size_t maxBytes = 8192;
+  size_t length = file.size();
+  if (length > maxBytes) { length = maxBytes; truncated = true; }
+  String content;
+  if (!content.reserve(length + 1)) { file.close(); return ""; }
+  while (content.length() < length && file.available()) content += (char)file.read();
+  file.close();
+  return content;
+}
+
+bool sdReplaceText(const String& path, const String& content) {
+  if (!sdLoggingAvailable || content.length() > 8192) return false;
+  SD.remove(path.c_str());
+  File file = SD.open(path.c_str(), FILE_WRITE);
+  if (!file) { sdWriteFailures++; return false; }
+  size_t written = file.print(content);
+  file.close();
+  if (written != content.length()) { sdWriteFailures++; return false; }
+  return true;
+}
+
+String sdFileListHtml(const String& selected) {
+  String html;
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return "<p>No readable SD directory.</p>";
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      if (name.startsWith("/")) name.remove(0, 1);
+      html += "<option value=\"" + htmlEscape(name) + "\"" +
+        (name == selected ? " selected" : "") + ">" + htmlEscape(name) +
+        " (" + String(entry.size()) + " bytes)</option>";
+    }
+    entry.close();
+    entry = root.openNextFile();
+  }
+  root.close();
+  return html.length() ? html : "<option value=\"\">No files</option>";
+}
+
+void handleSdPage() {
+  beginWebResponseProfile("/sd");
+  markExplicitUserInteraction();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>SD Card</title>");
+  sendThemeBootstrapScript();
+  diagnosticSendContent(pageStyles());
+  diagnosticSendContent("<style>.sd-editor{width:100%;min-height:240px;padding:10px;border:1px solid var(--input-border);border-radius:5px;background:var(--input-bg);color:var(--text);font:13px/1.4 monospace;resize:vertical}.sd-file-list{max-width:100%;}</style></head><body><div class=\"container\">");
+  sendSiteNavigation("sd");
+  diagnosticSendContent("<h1>SD Card</h1>");
+
+  if (!sdLoggingAvailable) {
+    diagnosticSendContent("<div class=\"card\"><h2>Card unavailable</h2><p>The SD card was not detected during boot, or initialization failed. Insert the card and restart the surveyor.</p></div>");
+  } else {
+    String selected = server.hasArg("file") ? server.arg("file") : sdWifiLogPath;
+    String selectedPath;
+    if (!sdSafePath(selected, selectedPath)) { selected = ""; selectedPath = ""; }
+    bool truncated = false;
+    String content = selectedPath.length() ? sdReadText(selectedPath, truncated) : "";
+    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Logged Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button></form></div>");
+    diagnosticSendContent("<div class=\"card\"><h2>Read / Write</h2><form class=\"controls\" action=\"/sd-write\" method=\"post\"><div class=\"control\"><label for=\"sd-write-file\">Filename</label><input id=\"sd-write-file\" name=\"file\" type=\"text\" maxlength=\"48\" value=\"" + htmlEscape(selected) + "\" required></div><button type=\"submit\">Write File</button><span class=\"save-state\">Up to 8 KiB; replaces the file.</span><textarea class=\"sd-editor\" name=\"content\" maxlength=\"8192\" aria-label=\"SD file content\">" + htmlEscape(content) + "</textarea></form>" + (truncated ? "<p class=\"note\">Only the first 8 KiB are shown; writing replaces the file with the editor contents.</p>" : "") + "</div>");
+  }
+
+  diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
+  sendThemeScript();
+  diagnosticSendContent("</div></body></html>");
+  diagnosticSendContent("");
+  endWebResponseProfile();
+}
+
+void handleSdWrite() {
+  markExplicitUserInteraction();
+  if (!sdLoggingAvailable || !server.hasArg("file") || !server.hasArg("content")) {
+    server.send(503, "text/plain", "SD card unavailable or missing file content.");
+    return;
+  }
+  String path;
+  if (!sdSafePath(server.arg("file"), path)) {
+    server.send(400, "text/plain", "Use a simple filename without path separators.");
+    return;
+  }
+  String content = server.arg("content");
+  if (content.length() > 8192 || !sdReplaceText(path, content)) {
+    server.send(500, "text/plain", "Unable to write the SD file.");
+    return;
+  }
+  server.sendHeader("Location", "/sd?file=" + urlEncode(server.arg("file")));
+  server.send(303, "text/plain", "SD file written.");
+}
+
+void initializeSdLogging() {
+  sdLoggingAvailable = false;
+  sdLoggingFileNumber = 0;
+  sdWifiLogPath = "";
+  sdBleLogPath = "";
+  pinMode(SURVEY_SD_CS_PIN_VALUE, OUTPUT);
+  digitalWrite(SURVEY_SD_CS_PIN_VALUE, HIGH);
+  SPI.begin(18, 19, 23, SURVEY_SD_CS_PIN_VALUE);
+
+  if (!SD.begin(SURVEY_SD_CS_PIN_VALUE, SPI, 10000000)) {
+    Serial.println("SD logging: card not detected or initialization failed; continuing without SD logging.");
+    return;
+  }
+
+  sdLoggingFileNumber = sdExistingBootFileNumber() + 1;
+  char wifiPath[32];
+  char blePath[32];
+  snprintf(wifiPath, sizeof(wifiPath), "/WIFI_%05lu.CSV", (unsigned long)sdLoggingFileNumber);
+  snprintf(blePath, sizeof(blePath), "/BLE_%05lu.CSV", (unsigned long)sdLoggingFileNumber);
+  sdWifiLogPath = wifiPath;
+  sdBleLogPath = blePath;
+  sdLoggingAvailable = true;
+
+  String wifiHeader = wifiInventoryMode()
+    ? "last_scan,last_seen_ms,last_seen,ssid,bssid,channel,latest_rssi_dbm,security,connected,hidden,first_seen_ms,sightings,min_rssi_dbm,max_rssi_dbm,avg_rssi_dbm\r\n"
+    : "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n";
+  sdAppendText(sdWifiLogPath, wifiHeader);
+  if (bleSurveyEnabled)
+    sdAppendText(sdBleLogPath, "scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n");
+
+  Serial.print("SD logging enabled: boot file #");
+  Serial.print(sdLoggingFileNumber);
+  Serial.print(" (CS GPIO ");
+  Serial.print(SURVEY_SD_CS_PIN_VALUE);
+  Serial.println(")");
+}
+
+void sdLogWifiObservation(const ScanRecord& record, const WifiObservation& observation) {
+  if (!sdLoggingAvailable) return;
+  int connectedApIndex = WiFi.status() == WL_CONNECTED
+    ? findWifiApByTextBssid(WiFi.BSSIDstr()) : -1;
+  String line;
+  line.reserve(240);
+  line += String(record.scanNumber) + "," + String(record.uptimeMs) + ",";
+  line += csvEscape(formatUptime(record.uptimeMs)) + ",";
+  line += csvEscape(String(record.ssid)) + "," + csvEscape(String(record.bssid)) + ",";
+  line += String(record.channel) + "," + String(record.rssi) + ",";
+  line += csvEscape(securityLabel((wifi_auth_mode_t)record.authMode)) + ",";
+  line += (connectedApIndex >= 0 && observation.apIndex == (uint16_t)connectedApIndex) ? "YES," : "NO,";
+  line += record.hidden ? "YES" : "NO";
+  if (wifiInventoryMode()) {
+    const SignalStats& stats = wifiApTable[observation.apIndex].signal;
+    line += "," + String(stats.firstSeenMs) + "," + String(stats.samples) + "," +
+      String(stats.minRssi) + "," + String(stats.maxRssi) + "," + String(averageSignal(stats), 2);
+  }
+  line += "\r\n";
+  if (sdAppendText(sdWifiLogPath, line)) sdWifiRowsLogged++;
+}
+
+void sdLogBleObservation(const BleScanRecord& record) {
+  if (!sdLoggingAvailable || !bleSurveyEnabled) return;
+  String line = String(record.scanNumber) + "," + String(record.uptimeMs) + "," +
+    csvEscape(formatUptime(record.uptimeMs)) + "," +
+    csvEscape(record.named ? String(record.name) : String("")) + "," +
+    csvEscape(String(record.address)) + "," +
+    csvEscape(bleAddressTypeLabel(record.addressType)) + "," + String(record.rssi) + "\r\n";
+  if (sdAppendText(sdBleLogPath, line)) sdBleRowsLogged++;
 }
 
 // Purpose: Appends CSV text to a streaming buffer and flushes when the buffer reaches its target size.
@@ -6570,6 +6845,7 @@ void sendSiteNavigation(const String& active) {
   nav += "<a href=\"/ble\"" + activeNavClass(active, "ble") + ">Bluetooth</a>";
   nav += "<a href=\"/system\"" + activeNavClass(active, "system") + ">System</a>";
   nav += "<a href=\"/diagnostics\"" + activeNavClass(active, "diagnostics") + ">Diagnostics</a>";
+  nav += "<a href=\"/sd\"" + activeNavClass(active, "sd") + ">SD Card</a>";
   nav += "<a href=\"/terminal\" class=\"developer-only" + String(active == "terminal" ? " active" : "") + "\">Terminal</a>";
   nav += "<a href=\"/settings\"" + activeNavClass(active, "settings") + ">Settings</a>";
   nav += "<a href=\"/help\"" + activeNavClass(active, "help") + ">Help</a>";
@@ -8162,7 +8438,7 @@ PortableConfig readPersistedPortableConfig() {
   c.statusLedEnabled =
       preferences.getBool("ledEnabled", statusLedEnabled);
   c.wifiAccessWindowSeconds = preferences.getUInt("wifiWindow", 60);
-  if (c.wifiAccessWindowSeconds < 5 || c.wifiAccessWindowSeconds > 3600) c.wifiAccessWindowSeconds = 60;
+  if (c.wifiAccessWindowSeconds < MIN_WIFI_ACCESS_WINDOW_SECONDS || c.wifiAccessWindowSeconds > MAX_WIFI_ACCESS_WINDOW_SECONDS) c.wifiAccessWindowSeconds = 60;
   c.terminalBufferBytes = preferences.getUInt("termBytes", DEFAULT_TERMINAL_BUFFER_BYTES);
   if (!validTerminalBufferBytes(c.terminalBufferBytes)) c.terminalBufferBytes = DEFAULT_TERMINAL_BUFFER_BYTES;
   c.plotsEnabled = preferences.getBool("plots", false);
@@ -8347,8 +8623,8 @@ public:
       } else if (key == "wifiAccessWindowSeconds") {
         if (seenWindow) return fail("Duplicate wifiAccessWindowSeconds.");
         seenWindow = true;
-        if (!parseUnsigned(out.wifiAccessWindowSeconds) || out.wifiAccessWindowSeconds < 5 || out.wifiAccessWindowSeconds > 3600)
-          return fail("wifiAccessWindowSeconds must be an integer from 5 to 3600.");
+        if (!parseUnsigned(out.wifiAccessWindowSeconds) || out.wifiAccessWindowSeconds < MIN_WIFI_ACCESS_WINDOW_SECONDS || out.wifiAccessWindowSeconds > MAX_WIFI_ACCESS_WINDOW_SECONDS)
+          return fail("wifiAccessWindowSeconds must be an integer from " + String(MIN_WIFI_ACCESS_WINDOW_SECONDS) + " to " + String(MAX_WIFI_ACCESS_WINDOW_SECONDS) + ".");
       } else if (key == "terminalBufferBytes") {
         if (seenTerminalBuffer) return fail("Duplicate terminalBufferBytes.");
         seenTerminalBuffer = true;
@@ -9282,7 +9558,7 @@ bool parseWifiAccessWindow(const String& value, uint32_t& seconds) {
     if (value[i] < '0' || value[i] > '9') return false;
     parsed = parsed * 10 + (value[i] - '0');
   }
-  if (parsed < 5 || parsed > 3600) return false;
+  if (parsed < MIN_WIFI_ACCESS_WINDOW_SECONDS || parsed > MAX_WIFI_ACCESS_WINDOW_SECONDS) return false;
   seconds = parsed;
   return true;
 }
@@ -9295,7 +9571,7 @@ void handleWifiPowerSetting() {
   }
   uint32_t seconds = wifiAccessWindowSeconds;
   if (server.hasArg("window") && !parseWifiAccessWindow(server.arg("window"), seconds)) {
-    server.send(400, "text/plain", "Access window must be 5 to 3600 seconds.");
+    server.send(400, "text/plain", "Access window must be " + String(MIN_WIFI_ACCESS_WINDOW_SECONDS) + " to " + String(MAX_WIFI_ACCESS_WINDOW_SECONDS) + " seconds.");
     return;
   }
   saveWifiAccessWindow(seconds);
@@ -9352,7 +9628,7 @@ void handleSettingsPage() {
   for (uint8_t mode = 0; mode < 3; ++mode) {
     diagnosticSendContent("<option value=\"" + String(mode) + "\"" + (wifiPowerMode == mode ? " selected" : "") + ">" + powerLabels[mode] + "</option>");
   }
-  diagnosticSendContent("</select><label for=\"wifi-window\">Access window (seconds)</label><input id=\"wifi-window\" name=\"window\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(wifiAccessWindowSeconds) + "\" required><button type=\"submit\">Save Power Settings</button></form><p>Ultra keeps Wi-Fi awake for the configured window after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Non-terminal web activity, including page updates and button clicks, keeps Wi-Fi on for five minutes, then the configured access-window timeout begins. Each interaction restarts the five-minute hold. Terminal viewing and polling do not extend it. Rejoining Wi-Fi takes part of this time. Use <code>wifi on</code> to reopen the window or <code>power normal</code> for continuous access.</p><p>For off time, set the scan interval longer than the access window. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
+  diagnosticSendContent("</select><br><label for=\"wifi-window\">timeout (s)</label><input id=\"wifi-window\" name=\"window\" type=\"number\" min=\"5\" max=\"9999\" value=\"" + String(wifiAccessWindowSeconds) + "\" required><button type=\"submit\">Save Power Settings</button></form><p>Ultra keeps Wi-Fi awake for the configured window after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Non-terminal web activity, including page updates and button clicks, keeps Wi-Fi on for five minutes, then the configured access-window timeout begins. Each interaction restarts the five-minute hold. Terminal viewing and polling do not extend it. Rejoining Wi-Fi takes part of this time. Use <code>wifi on</code> to reopen the window or <code>power normal</code> for continuous access.</p><p>For off time, set the scan interval longer than the access window. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
   String configuredStationSSID = preferences.getString("ssid", "");
   s += "<div class=\"card\"><h2>Infrastructure Wi-Fi</h2><div class=\"row\"><span class=\"label\">Configured Network</span><span class=\"value\">" + htmlEscape(configuredStationSSID.length() ? configuredStationSSID : String("None")) + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) {
@@ -10055,6 +10331,8 @@ void startWebServer() {
   server.on("/scan", []() { runDiagnosticWebHandler("/scan", handleWebScan); });
   server.on("/system", HTTP_GET, []() { runDiagnosticWebHandler("/system", handleSystemStatus); });
   server.on("/diagnostics", HTTP_GET, []() { runDiagnosticWebHandler("/diagnostics", handleDiagnosticsPage); });
+  server.on("/sd", HTTP_GET, []() { runDiagnosticWebHandler("/sd", handleSdPage); });
+  server.on("/sd-write", HTTP_POST, []() { runDiagnosticWebHandler("/sd-write", handleSdWrite); });
   server.on("/terminal", HTTP_GET, handleTerminalPage);
   server.on("/api/terminal", HTTP_GET, handleTerminalData);
   server.on("/api/terminal/command", HTTP_POST, handleTerminalCommand);
@@ -10458,7 +10736,7 @@ void printSettingsSerial() {
   Serial.println("  ble on|off            - Change BLE mode and restart");
   Serial.println("  led on|off|test       - Status LED control/self-test");
   Serial.println("  wifi on               - Wake Wi-Fi / renew access window");
-  Serial.println("  wifi window <5..3600>  - Save access-window seconds");
+  Serial.println("  wifi window <5..9999>  - Save access-window seconds");
   Serial.print("Access window seconds: "); Serial.println(wifiAccessWindowSeconds);
   Serial.println("  power normal|connected|ultra - Wi-Fi power mode (saved)");
   Serial.print("Survey focus: "); Serial.println(surveyFocusName());
@@ -10560,7 +10838,7 @@ void executeTerminalCommand(String command, bool fromWeb) {
   }
   if (command.startsWith("wifi window ")) {
     uint32_t seconds;
-    if (!terminalSeconds(commandArgument(command, "wifi window"), 5, 3600, seconds)) return;
+    if (!terminalSeconds(commandArgument(command, "wifi window"), MIN_WIFI_ACCESS_WINDOW_SECONDS, MAX_WIFI_ACCESS_WINDOW_SECONDS, seconds)) return;
     saveWifiAccessWindow(seconds);
     Serial.print("Wi-Fi access window saved: "); Serial.print(seconds); Serial.println(" seconds.");
     return;
@@ -10826,6 +11104,7 @@ void setup() {
 
   initializeAutoSizedHistories();
   captureBootHeapCheckpoint("Histories allocated");
+  initializeSdLogging();
   initializeSessionStorageAndRestore();
 
   Serial.print("Survey focus: "); Serial.println(surveyFocusName());
