@@ -117,6 +117,27 @@ int main(){
   assert(wifiPowerMode==2 && wifiPowerWindow.remaining(millis())==120000);
   now+=5000;saveWifiAccessWindow(5);now+=4999;serviceWifiPower();assert(!wifiRadioSleeping);
   now++;serviceWifiPower();assert(wifiRadioSleeping);
+  // Web activity holds Ultra for five minutes, then starts the configured timeout.
+  assert(wakeWifiRadio());
+  now=UINT32_MAX-2000;noteWifiPowerWebActivity();
+  assert(wifiPowerWindow.remaining(now)==305000);
+  now+=299999;serviceWifiPower();assert(!wifiRadioSleeping);
+  // A new interaction restarts the entire hold, even across clock wraparound.
+  noteWifiPowerWebActivity();assert(wifiPowerWindow.remaining(now)==305000);
+  now+=1000;noteWifiPowerScanFinished();
+  assert(wifiPowerWindow.remaining(now)==304000);
+  now+=299000;serviceWifiPower();assert(!wifiRadioSleeping);
+  assert(wifiPowerWindow.remaining(now)==5000);
+  now+=4999;serviceWifiPower();assert(!wifiRadioSleeping);
+  now++;serviceWifiPower();assert(wifiRadioSleeping && !wifiPowerWindow.webHoldArmed);
+  // Later scans return to the ordinary timeout, without another web hold.
+  assert(wakeWifiRadio());noteWifiPowerScanFinished();
+  assert(wifiPowerWindow.remaining(now)==5000);
+  now+=5000;serviceWifiPower();assert(wifiRadioSleeping);
+  auto oldWindow=wifiPowerWindow.startedMs;
+  noteWifiPowerWebActivity();assert(wifiRadioSleeping && wifiPowerWindow.startedMs==oldWindow);
+  saveWifiPowerMode(0);serviceWifiPower();oldWindow=wifiPowerWindow.startedMs;
+  now++;noteWifiPowerWebActivity();assert(wifiPowerWindow.startedMs==oldWindow);
   std::cout << "Wi-Fi power policy/driver transition tests passed\n";
 }
 '''

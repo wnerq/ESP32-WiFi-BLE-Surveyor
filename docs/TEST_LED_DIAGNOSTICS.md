@@ -10,6 +10,8 @@ FreeRTOS LED timers, NVS writes, sleeps or loops waiting for flashes.
 | Condition | Pattern |
 | --- | --- |
 | Normal idle | Off |
+| Wi-Fi radio off | Remaining minutes until scheduled scan, rounded up: 50 ms flashes at 25% PWM, 100 ms gaps; burst on entry and every 10 seconds |
+| Reachable Ultra access window | Three-second brightness rise, three-second fall |
 | Wi-Fi scan | Existing 75 ms on / 75 ms off while scanning |
 | BLE scan | Existing 125 ms on / 125 ms off while scanning |
 | Saved infrastructure network disconnected | Two 80 ms flashes, separated by 100 ms, every 3 seconds |
@@ -23,6 +25,11 @@ FreeRTOS LED timers, NVS writes, sleeps or loops waiting for flashes.
 Priority is controlled reboot, reconnect success, reconnect attempt, disconnected
 heartbeat, serial RX, human page, Wi-Fi scan, then BLE scan. The once-only boot
 pattern has startup priority between reboot and normal runtime diagnostics.
+Radio-off countdown and access-window breathing have the lowest priority. The
+countdown snapshots the remaining time per burst, supports up to 60 flashes in
+9 seconds, stops on wake, and respects the Status LED setting. Overdue scans
+show no countdown flashes. Failed-scan retries use their retry deadline. PWM
+attachment failure falls back to full-brightness digital flashes.
 The existing explicit LED self-test is asynchronous, has scan-level priority,
 and still allows a hardware test when the persisted LED setting is disabled.
 

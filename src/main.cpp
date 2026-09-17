@@ -2,6 +2,7 @@
 // Centralized nonblocking diagnostic LEDs alongside infrastructure recovery and the web terminal.
 // Dependency: NimBLE-Arduino 2.5.0 (install with Arduino Library Manager).
 #include <Arduino.h>
+#include <algorithm>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -37,7 +38,16 @@ void requestControlledRestart(uint32_t minimumDelayMs);
 // written directly to UART are outside the mirror. Input still comes from UART.
 class SurveySerialMirror : public Stream {
  public:
-  static constexpr size_t CAPACITY = 8192;
+  // Allocated once at boot, before survey storage is sized. Off costs no buffer RAM.
+  bool configure(size_t requested) {
+    if (configured) return false;
+    configured = true;
+    buffer = requested ? static_cast<uint8_t*>(malloc(requested)) : nullptr;
+    capacity = buffer ? requested : 0;
+    return capacity == requested;
+  }
+  ~SurveySerialMirror() { free(buffer); }
+  size_t bufferCapacity() const { return capacity; }
   void begin(unsigned long baud) { Serial.begin(baud); }
   int available() override { return Serial.available(); }
   int availableForWrite() override { return Serial.availableForWrite(); }
@@ -56,10 +66,10 @@ class SurveySerialMirror : public Stream {
   size_t write(const uint8_t* data, size_t length) override {
     // Capture before UART transmission so terminal evidence does not depend on
     // a serial monitor being attached or on the UART accepting every byte.
-    for (size_t offset = 0; offset < length;) {
+    for (size_t offset = 0; capacity && offset < length;) {
       size_t count = min((size_t)128, length - offset);
       portENTER_CRITICAL(&mux);
-      for (size_t i = 0; i < count; ++i) buffer[next++ % CAPACITY] = data[offset + i];
+      for (size_t i = 0; i < count; ++i) buffer[next++ % capacity] = data[offset + i];
       portEXIT_CRITICAL(&mux);
       offset += count;
     }
@@ -68,17 +78,19 @@ class SurveySerialMirror : public Stream {
   }
   size_t snapshot(uint64_t& cursor, uint8_t* out, size_t limit, bool& dropped, bool& more) {
     portENTER_CRITICAL(&mux);
-    uint64_t oldest = next > CAPACITY ? next - CAPACITY : 0;
+    uint64_t oldest = next > capacity ? next - capacity : 0;
     dropped = cursor < oldest || cursor > next;
     if (dropped) cursor = oldest;
     size_t count = (size_t)min((uint64_t)limit, next - cursor);
-    for (size_t i = 0; i < count; ++i) out[i] = buffer[cursor++ % CAPACITY];
+    for (size_t i = 0; i < count; ++i) out[i] = buffer[cursor++ % capacity];
     more = cursor < next;
     portEXIT_CRITICAL(&mux);
     return count;
   }
  private:
-  uint8_t buffer[CAPACITY] = {};
+  uint8_t* buffer = nullptr;
+  size_t capacity = 0;
+  bool configured = false;
   uint64_t next = 0;
   portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 };
@@ -87,6 +99,13 @@ SurveySerialMirror surveySerial;
 #undef Serial
 #define Serial surveySerial
 uint32_t terminalBootId = 0;
+const uint32_t DEFAULT_TERMINAL_BUFFER_BYTES = 1024;
+uint32_t terminalBufferBytes = DEFAULT_TERMINAL_BUFFER_BYTES;
+bool plotsEnabled = false;
+bool validTerminalBufferBytes(uint32_t value) {
+  return value == 0 || value == 1024 || value == 2048 || value == 8192 || value == 16384 || value == 32768;
+}
+
 
 void recordDiagnosticEvent(const char* category, const String& detail);
 void saveInfrastructureRecoverySummary();
@@ -104,8 +123,8 @@ bool userInteractionDeferActive();
 // ============================================================
 
 const char* FIRMWARE_FILE = "src/main.cpp (PlatformIO)";
-const char* FIRMWARE_VERSION = "41";
-const char* FIRMWARE_CHANGE_SUMMARY = "Add collapsible navigation, Developer terminal navigation and terminal controls below output";
+const char* FIRMWARE_VERSION = "45";
+const char* FIRMWARE_CHANGE_SUMMARY = "Shared Wi-Fi storage pool with Signal History, Balanced Survey and Network Inventory";
 
 
 Preferences preferences;
@@ -173,8 +192,15 @@ const size_t MIN_BLE_HISTORY_RECORDS = 50;
 const size_t MAX_BLE_HISTORY_RECORDS = 12000;
 const size_t BLE_ADDRESS_TABLE_TARGET = 128;
 const size_t BLE_SCAN_METADATA_SLOTS = 256;
-const size_t WIFI_ONLY_AP_TABLE_TARGET = 512;
-const size_t WIFI_ONLY_SCAN_METADATA_SLOTS = 1024;
+// V45 presets govern admission and eviction inside a single Wi-Fi pool.
+// 0: protect history, 1: balance identities/history, 2: summaries only.
+uint8_t surveyFocus = 1;
+bool wifiInventoryMode() { return surveyFocus == 2; }
+const char* surveyFocusName() {
+  return surveyFocus == 0 ? "Signal History" : (surveyFocus == 1 ? "Balanced Survey" : "Network Inventory");
+}
+const size_t WIFI_ONLY_AP_TABLE_TARGET = 16;
+const size_t WIFI_ONLY_SCAN_METADATA_SLOTS = 512;
 const size_t DUAL_RADIO_WIFI_AP_TABLE_TARGET = 64;
 const size_t DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS = 64;
 // Dual-radio history sizing deliberately leaves additional heap unallocated.
@@ -226,18 +252,45 @@ esp_err_t wifiPowerLastError = ESP_OK;
 
 uint32_t wifiAccessWindowSeconds = 60;
 struct WifiPowerWindow {
+  static constexpr uint32_t WEB_HOLD_MS = 5UL * 60UL * 1000UL;
   bool armed = false;
   uint32_t startedMs = 0;
+  bool webHoldArmed = false;
+  uint32_t webActivityMs = 0;
   void arm(uint32_t now) { armed = true; startedMs = now; }
-  uint32_t remaining(uint32_t now) const {
-    uint32_t elapsed = now - startedMs;
-    return armed && elapsed < wifiAccessWindowSeconds * 1000UL ? wifiAccessWindowSeconds * 1000UL - elapsed : 0;
+  void noteWebActivity(uint32_t now) {
+    arm(now);
+    webHoldArmed = true;
+    webActivityMs = now;
   }
-  bool shouldSleep(uint32_t now, uint32_t intervalMs) const {
+  uint32_t remaining(uint32_t now) {
+    const uint32_t timeoutMs = wifiAccessWindowSeconds * 1000UL;
+    const uint32_t elapsed = now - startedMs;
+    uint32_t result = armed && elapsed < timeoutMs ? timeoutMs - elapsed : 0;
+    if (webHoldArmed) {
+      // Five minutes of guaranteed access, then the configured idle timeout.
+      // Scan completion can extend normal access but cannot shorten this hold.
+      const uint32_t webElapsed = now - webActivityMs;
+      const uint32_t webBudget = WEB_HOLD_MS + timeoutMs;
+      if (webElapsed < webBudget) {
+        const uint32_t webRemaining = webBudget - webElapsed;
+        if (webRemaining > result) result = webRemaining;
+      } else {
+        webHoldArmed = false; // Prevent an expired hold returning on millis rollover.
+      }
+    }
+    return result;
+  }
+  bool shouldSleep(uint32_t now, uint32_t intervalMs) {
     return armed && intervalMs > wifiAccessWindowSeconds * 1000UL && remaining(now) == 0;
   }
 };
 WifiPowerWindow wifiPowerWindow;
+// HTTP activity renews the five-minute hold without changing modes or waking the radio.
+// Terminal handlers deliberately do not call this: their polling is unattended.
+void noteWifiPowerWebActivity() {
+  if (wifiPowerMode == 2 && !wifiRadioSleeping) wifiPowerWindow.noteWebActivity(millis());
+}
 bool wakeWifiRadio();
 void serviceWifiPower();
 void noteWifiPowerScanFinished();
@@ -256,6 +309,18 @@ uint32_t webWifiConfigStartedMs = 0;
 const uint8_t STATUS_LED_PIN = 2;
 const bool STATUS_LED_ACTIVE_HIGH = true;
 
+// Normally-open button between this GPIO and GND; -1 disables the input.
+#ifndef SURVEY_BUTTON_PIN
+#define SURVEY_BUTTON_PIN 27
+#endif
+const uint32_t SURVEY_BUTTON_DEBOUNCE_MS = 30;
+const uint32_t SURVEY_BUTTON_HOLD_MS = 1000;
+bool surveyButtonRawPressed = false;
+bool surveyButtonPressed = false;
+bool surveyButtonHoldHandled = false;
+uint32_t surveyButtonChangedMs = 0;
+uint32_t surveyButtonPressedMs = 0;
+
 
 // ScanRecord remains a synthesized view used by the existing UI/CSV code.
 // This expanded record is synthesized for presentation rather than stored in the compact history ring.
@@ -271,13 +336,25 @@ struct ScanRecord {
   bool hidden;
 };
 
-// Stable attributes are stored once per unique BSSID/AP.
+struct SignalStats {
+  uint32_t samples;
+  int16_t latestRssi;
+  int16_t minRssi;
+  int16_t maxRssi;
+  int64_t rssiTotal;
+  uint32_t firstSeenMs;
+  uint32_t lastSeenMs;
+};
+
+// Stable identity and lifetime summary, independent of retained measurements.
 struct WifiApEntry {
   char ssid[33];
   uint8_t bssid[6];
   uint8_t channel;
   uint8_t authMode;
   uint16_t lastSeenScanLow;
+  SignalStats signal;
+  uint32_t lastScan;
 };
 
 // Generic scan metadata shared by Wi-Fi and BLE. Each radio has its own
@@ -327,15 +404,7 @@ struct BleObservation {
 };
 static_assert(sizeof(BleObservation) == 6, "Unexpected BleObservation size");
 
-struct SignalStats {
-  uint32_t samples;
-  int16_t latestRssi;
-  int16_t minRssi;
-  int16_t maxRssi;
-  int32_t rssiTotal;
-  uint32_t firstSeenMs;
-  uint32_t lastSeenMs;
-};
+
 
 struct NetworkSummary {
   char ssid[33];
@@ -372,6 +441,7 @@ void appendBleObservation(const BleObservation& observation);
 void discardBleObservationsForScanSlot(uint16_t scanSlot);
 void updateBleUsageHighWaterMarks();
 int findOrCreateBleAddress(const uint8_t address[6], const String& name, uint8_t addressType);
+int findWifiApByBssid(const uint8_t bssid[6]);
 int findWifiApByTextBssid(const String& bssid);
 int findOrCreateWifiAp(const uint8_t bssid[6], const String& ssid, uint8_t channel, uint8_t authMode, bool* created = nullptr, bool* reclaimed = nullptr);
 float rssiInterferenceWeight(int rssi);
@@ -459,6 +529,12 @@ size_t bleCsvLastRows = 0;
 size_t bleCsvLastBytes = 0;
 uint32_t bleCsvLastDurationMs = 0;
 
+uint8_t* wifiStoragePool = nullptr;
+size_t wifiStoragePoolBytes = 0;
+size_t wifiApPolicyLimit = 0;
+uint32_t wifiPoolGrowthCount = 0;
+bool wifiRestoringCheckpoint = false;
+bool growWifiApTable(size_t requested);
 WifiApEntry* wifiApTable = nullptr;
 size_t wifiApTableCapacity = 0;
 size_t wifiApCount = 0;
@@ -487,7 +563,7 @@ float wifiLatestAdjacentScore[12] = {};
 // Session checkpoint / restore and test-tool diagnostics.
 const char* SESSION_CHECKPOINT_PATH = "/survey_session.bin";
 const uint32_t SESSION_CHECKPOINT_MAGIC = 0x53565233; // "SVR3"
-const uint16_t SESSION_CHECKPOINT_VERSION = 3;
+const uint16_t SESSION_CHECKPOINT_VERSION = 4;
 bool spiffsMounted = false;
 bool sessionRestoredThisBoot = false;
 String sessionCheckpointStatus = "Filesystem not initialized";
@@ -648,6 +724,7 @@ size_t bootBleHistoryCapacity = 0;
 // First-use defaults are selected for the BLE characterization campaign while
 // the master switch remains OFF until explicitly enabled.
 bool diagnosticStreamingEnabled = false;
+bool diagnosticVerbose = false;
 bool diagnosticSurveyEvents = true;
 bool diagnosticBleEvents = true;
 bool diagnosticMemoryEvents = true;
@@ -767,6 +844,13 @@ void captureBootHeapCheckpoint(const char* stage) {
 // all five flashes remain visible even when it preempts an illuminated LED.
 // Final OFF phases keep adjacent
 // indications visually separate. No timers, heap allocation or flash writes.
+// Use the same deadlines as the automatic scheduler, including failed-scan retries.
+uint32_t wifiNextScheduledScanRemainingMs(uint32_t now) {
+  const uint32_t interval = wifiAutoScanRetryPending ? WIFI_AUTOSCAN_RETRY_BACKOFF_MS : scanIntervalSeconds * 1000UL;
+  const uint32_t elapsed = now - (wifiAutoScanRetryPending ? lastWifiAutoScanFailureMs : lastAutoScanMs);
+  return elapsed < interval ? interval - elapsed : 0;
+}
+
 struct LedDiagPattern {
   uint8_t priority;
   uint8_t count;
@@ -853,6 +937,9 @@ class DiagnosticLedManager {
   bool initialized = false, runtimeReady = false, pwmReady = false, breathing = false;
   uint8_t output = 0;
   uint32_t breathStartedMs = 0;
+  bool countdownSleeping = false;
+  uint8_t countdownFlashes = 0;
+  uint32_t countdownStartedMs = 0;
   bool wifiScan = false, bleScan = false, infraDisconnected = false;
   bool heartbeatDue = false, rebootRequested = false, rebootComplete = false;
   bool serviceSeen = false;
@@ -878,6 +965,14 @@ class DiagnosticLedManager {
     bool accessWindow = wifiAccessWindowActive();
     if (accessWindow && !breathing) breathStartedMs = now;
     breathing = accessWindow;
+    // Snapshot the count per burst so minute boundaries cannot truncate it.
+    // Up to 60 flashes fit inside 9 seconds at the maximum 3600s interval.
+    if (wifiRadioSleeping && (!countdownSleeping || (uint32_t)(now - countdownStartedMs) >= 10000)) {
+      countdownStartedMs = now;
+      const uint32_t remaining = wifiNextScheduledScanRemainingMs(now);
+      countdownFlashes = (uint8_t)((remaining + 59999UL) / 60000UL);
+    }
+    countdownSleeping = wifiRadioSleeping;
     if (!STATUS_LED_AVAILABLE || (!statusLedEnabled && active != LED_EVENT_SELF_TEST && !(pending & (1U << LED_EVENT_SELF_TEST)))) {
       if (rebootRequested) rebootComplete = true;
       active = LED_EVENT_NONE; pending = 0; writeOutput(false); return;
@@ -917,7 +1012,13 @@ class DiagnosticLedManager {
       pending &= ~(1U << next);
       if (next == LED_EVENT_INFRA_HEARTBEAT) { heartbeatDue = false; heartbeatStartedMs = now; }
     }
-    if (active == LED_EVENT_NONE && breathing) {
+    if (active == LED_EVENT_NONE && countdownSleeping) {
+      // Lowest-priority radio-off indication: 50ms on, 100ms off, at 25% PWM.
+      // A missed service slot is skipped rather than replayed after a stall.
+      const uint32_t position = now - countdownStartedMs;
+      const bool on = position < countdownFlashes * 150UL && position % 150UL < 50;
+      writeBrightness(on ? (pwmReady ? 64 : 255) : 0);
+    } else if (active == LED_EVENT_NONE && breathing) {
       // Lowest-priority indication: three seconds up, three seconds down.
       uint32_t position = (uint32_t)(now - breathStartedMs) % 6000;
       uint32_t ramp = position <= 3000 ? position : 6000 - position;
@@ -959,7 +1060,7 @@ bool ledDiagIsHumanRequest(const char* route, bool post) {
   const char* const pages[] = {"/", "/scan", "/system", "/diagnostics", "/settings", "/help", "/ble", "/ap", "/terminal"};
   const char* const actions[] = {
     "/restart-device", "/config/import", "/wifi-save", "/wifi-clear", "/hostname-save",
-    "/wifi-power", "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
+    "/wifi-power", "/developer-memory", "/interface-settings", "/wifi-capture-settings", "/led-test", "/api/live-updates",
     "/api/wifi/interval", "/api/ble/interval", "/api/diag/event-limit", "/history-prefill",
     "/session-save", "/session-discard", "/ble-mode", "/ap-save"
   };
@@ -1097,6 +1198,13 @@ String mdnsWebAddress() {
 
 // Purpose: Loads persisted survey-mode, scan-interval, interface, and related runtime settings from NVS.
 void loadSurveyModeSettings() {
+  preferences.begin("survey", true);
+  terminalBufferBytes = preferences.getUInt("termBytes", DEFAULT_TERMINAL_BUFFER_BYTES);
+  if (!validTerminalBufferBytes(terminalBufferBytes)) terminalBufferBytes = DEFAULT_TERMINAL_BUFFER_BYTES;
+  plotsEnabled = preferences.getBool("plots", false);
+  surveyFocus = preferences.getUChar("focus", 1);
+  if (surveyFocus > 2) surveyFocus = 1;
+  preferences.end();
   preferences.begin("survey", true);
   bleSurveyEnabled = preferences.getBool("bleEnabled", false);
   statusLedEnabled = preferences.getBool("ledEnabled", true);
@@ -1379,6 +1487,7 @@ struct SessionCheckpointHeader {
   uint32_t savedUptimeMs;
   uint32_t scanCounter;
   uint32_t lastScanUptimeMs;
+  uint32_t wifiFocus;
   uint32_t wifiObservationCount;
   uint32_t wifiApCount;
   uint32_t wifiMetadataCount;
@@ -1424,7 +1533,8 @@ bool saveSurveySessionCheckpoint(String& detail) {
   h.savedUptimeMs = surveySessionUptimeMs();
   h.scanCounter = scanCounter;
   h.lastScanUptimeMs = lastScanUptimeMs;
-  h.wifiObservationCount = historyCount;
+  h.wifiFocus = surveyFocus;
+  h.wifiObservationCount = wifiInventoryMode() ? 0 : historyCount;
   h.wifiApCount = wifiApCount;
   h.wifiMetadataCount = wifiScanMetadataCapacity;
   h.bleObservationCount = bleSurveyEnabled ? bleHistoryCount : 0;
@@ -1448,7 +1558,7 @@ bool saveSurveySessionCheckpoint(String& detail) {
 
   uint32_t crc = 0;
   bool ok = true;
-  for (size_t i = 0; ok && i < historyCount; i++) {
+  for (size_t i = 0; ok && i < h.wifiObservationCount; i++) {
     const WifiObservation& o = compactHistoryRecord(i);
     ok = checkpointWriteChunk(f, crc, &o, sizeof(o));
   }
@@ -1508,7 +1618,8 @@ bool restoreSurveySessionCheckpoint(String& detail) {
       h.headerBytes != sizeof(SessionCheckpointHeader)) {
     f.close(); detail = "Restart checkpoint header is invalid or incompatible."; sessionCheckpointStatus = detail; return false;
   }
-  if (h.wifiApCount > wifiApTableCapacity || h.wifiMetadataCount > wifiScanMetadataCapacity ||
+  if (h.wifiFocus != surveyFocus || h.wifiApCount > wifiApPolicyLimit || h.wifiMetadataCount != wifiScanMetadataCapacity ||
+      h.wifiObservationCount > MAX_SCAN_HISTORY_RECORDS || (wifiInventoryMode() && h.wifiObservationCount != 0) ||
       (bleSurveyEnabled && (h.bleAddressCount > bleAddressTableCapacity || h.bleMetadataCount > bleScanMetadataCapacity))) {
     f.close(); detail = "Restart checkpoint tables do not fit the current survey mode."; sessionCheckpointStatus = detail; return false;
   }
@@ -1532,17 +1643,25 @@ bool restoreSurveySessionCheckpoint(String& detail) {
   }
   if (crc != h.crc32) { f.close(); detail = "Restart checkpoint CRC check failed."; sessionCheckpointStatus = detail; return false; }
   f.seek(sizeof(h));
-
+  if (!wifiInventoryMode() && h.wifiApCount > wifiApTableCapacity && !growWifiApTable(h.wifiApCount)) {
+    f.close(); detail = "Unable to fit checkpoint APs in shared pool."; return false;
+  }
+  struct RestoreGuard {
+    RestoreGuard() { wifiRestoringCheckpoint = true; }
+    ~RestoreGuard() { wifiRestoringCheckpoint = false; }
+  } restoring;
   clearScanHistory();
   size_t skipWifi = h.wifiObservationCount > scanHistoryRetentionLimit
       ? h.wifiObservationCount - scanHistoryRetentionLimit : 0;
   WifiObservation o = {};
   for (size_t i = 0; i < h.wifiObservationCount; i++) {
     if (f.read((uint8_t*)&o, sizeof(o)) != sizeof(o)) { f.close(); detail = "Wi-Fi observation restore failed."; return false; }
+    if (o.apIndex >= h.wifiApCount || o.scanSlot >= h.wifiMetadataCount) { f.close(); detail = "Invalid checkpoint observation reference."; return false; }
     if (i >= skipWifi) appendWifiObservation(o);
   }
   if (f.read((uint8_t*)wifiApTable, h.wifiApCount * sizeof(WifiApEntry)) != (int)(h.wifiApCount * sizeof(WifiApEntry))) { f.close(); detail = "Wi-Fi AP table restore failed."; return false; }
   wifiApCount = h.wifiApCount;
+  if (wifiInventoryMode()) historyCount = wifiApCount;
   memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
   if (f.read((uint8_t*)wifiScanMetadata, h.wifiMetadataCount * sizeof(WifiScanMetadata)) != (int)(h.wifiMetadataCount * sizeof(WifiScanMetadata))) { f.close(); detail = "Wi-Fi metadata restore failed."; return false; }
   // Preserve saved history timestamps and continue the survey-session clock
@@ -1632,51 +1751,73 @@ bool checkpointBeforeControlledRestart() {
 // Synthetic history test tools
 // ============================================================
 
-// Purpose: Adds deterministic synthetic Wi-Fi observations until the requested percentage of history capacity is filled.
+// Purpose: Fills AP summaries in Inventory, or compact measurements in history modes.
 bool prefillWifiHistoryToPercent(uint8_t percent, String& detail) {
-  if (percent != 50 && percent != 75 && percent != 95) { detail = "Unsupported target."; return false; }
-  if (!scanHistory || !wifiApTable || !wifiScanMetadata || wifiScanInProgress || csvExportInProgress) {
+  if (percent != 50 && percent != 75 && percent != 95 && percent != 99) { detail = "Unsupported target."; return false; }
+  if (!scanHistory || !wifiApTable || !wifiScanMetadata || !scanHistoryRetentionLimit ||
+      !wifiScanMetadataCapacity || wifiScanInProgress || csvExportInProgress) {
     detail = "History storage is unavailable or busy."; return false;
   }
   size_t target = (scanHistoryRetentionLimit * percent) / 100;
   if (historyCount >= target) { detail = "History is already at or above the requested target."; return true; }
 
-  const uint8_t syntheticApCount = 16;
-  uint16_t apIndexes[syntheticApCount];
-  for (uint8_t a = 0; a < syntheticApCount; a++) {
-    uint8_t bssid[6] = {0x02, 0x53, 0x59, 0x4E, 0x00, a};
-    String ssid = "TEST-PREFILL-" + String(a + 1);
-    int idx = findOrCreateWifiAp(bssid, ssid, (uint8_t)(1 + (a % 11)), WIFI_AUTH_OPEN);
-    if (idx < 0) { detail = "AP table has no room for synthetic test identities."; return false; }
-    apIndexes[a] = (uint16_t)idx;
-  }
-
-  while (historyCount < target) {
-    scanCounter++;
-    uint16_t slot = (uint16_t)((scanCounter - 1) % wifiScanMetadataCapacity);
-    if (wifiScanMetadata[slot].scanNumber != 0 && wifiScanMetadata[slot].scanNumber != scanCounter)
-      discardObservationsForScanSlot(slot);
-    wifiScanMetadata[slot].scanNumber = scanCounter;
-    wifiScanMetadata[slot].uptimeMs = surveySessionUptimeMs();
-    lastScanUptimeMs = wifiScanMetadata[slot].uptimeMs;
-    for (uint8_t a = 0; a < syntheticApCount && historyCount < target; a++) {
+  if (wifiInventoryMode()) {
+    // Distinct locally administered BSSIDs, not repeated measurements of 16 APs.
+    ++scanCounter;
+    wifiScanMetadata[0] = {scanCounter, surveySessionUptimeMs()};
+    lastScanUptimeMs = wifiScanMetadata[0].uptimeMs;
+    for (size_t id = 0; id < wifiApTableCapacity && historyCount < target; ++id) {
+      uint8_t bssid[6] = {0x02, 0x53, 0x59, 0x4E, (uint8_t)(id >> 8), (uint8_t)id};
+      if (findWifiApByBssid(bssid) >= 0) continue;
+      int index = findOrCreateWifiAp(bssid, "TEST-PREFILL-" + String(id + 1),
+                                    (uint8_t)(1 + id % 11), WIFI_AUTH_OPEN, nullptr, nullptr);
+      if (index < 0) { detail = "AP table has no room for synthetic test identities."; return false; }
       WifiObservation test = {};
-      test.apIndex = apIndexes[a];
-      test.scanSlot = slot;
-      test.rssi = (int8_t)(-35 - ((scanCounter + a * 7) % 55));
-      test.reserved = 0xA5; // explicit synthetic marker for future diagnostics/export use
+      test.apIndex = (uint16_t)index;
+      test.scanSlot = 0;
+      test.rssi = (int8_t)(-35 - id % 55);
       appendWifiObservation(test);
     }
+  } else {
+    // Size synthetic scan batches to reach the target even with few metadata slots.
+    // These are stress-test records; a batch may repeat its synthetic identities.
+    for (size_t batch = 0; batch <= wifiScanMetadataCapacity && historyCount < target; ++batch) {
+      ++scanCounter;
+      uint16_t slot = (uint16_t)((scanCounter - 1) % wifiScanMetadataCapacity);
+      if (wifiScanMetadata[slot].scanNumber != 0 && wifiScanMetadata[slot].scanNumber != scanCounter)
+        discardObservationsForScanSlot(slot);
+      wifiScanMetadata[slot] = {scanCounter, surveySessionUptimeMs()};
+      lastScanUptimeMs = wifiScanMetadata[slot].uptimeMs;
+      const size_t batchSize = std::max((size_t)16, (target + wifiScanMetadataCapacity - 1) / wifiScanMetadataCapacity);
+      for (size_t a = 0; a < batchSize && historyCount < target; ++a) {
+        uint8_t id = (uint8_t)(a % 16);
+        uint8_t bssid[6] = {0x02, 0x53, 0x59, 0x4E, 0x00, id};
+        int index = findOrCreateWifiAp(bssid, "TEST-PREFILL-" + String(id + 1),
+                                      (uint8_t)(1 + id % 11), WIFI_AUTH_OPEN, nullptr, nullptr);
+        if (index < 0) { detail = "AP table has no room for synthetic test identities; clear history and retry."; return false; }
+        // AP-table growth may relocate the ring and reduce its capacity.
+        target = (scanHistoryRetentionLimit * percent) / 100;
+        if (historyCount >= target) break;
+        WifiObservation test = {};
+        test.apIndex = (uint16_t)index;
+        test.scanSlot = slot;
+        test.rssi = (int8_t)(-35 - ((scanCounter + a * 7) % 55));
+        test.reserved = 0xA5;
+        appendWifiObservation(test);
+      }
+    }
   }
+  if (historyCount < target) { detail = "Unable to reach target with current storage; clear history and retry."; return false; }
   syntheticPrefillRuns++;
   syntheticPrefillLastTarget = target;
-  detail = "Synthetic test data filled history to " + String(percent) + "% (" + String(historyCount) + " observations).";
+  detail = "Synthetic test data filled " + String(percent) + "% (" + String(historyCount) +
+    (wifiInventoryMode() ? " AP summaries)." : " observations).");
   return true;
 }
 
 // Purpose: Adds deterministic synthetic BLE observations until the requested percentage of history capacity is filled.
 bool prefillBleHistoryToPercent(uint8_t percent, String& detail) {
-  if (percent != 50 && percent != 75 && percent != 95) { detail = "Unsupported target."; return false; }
+  if (percent != 50 && percent != 75 && percent != 95 && percent != 99) { detail = "Unsupported target."; return false; }
   if (!bleSurveyEnabled || !bleHistory || !bleAddressTable || !bleScanMetadata ||
       bleHistoryRetentionLimit == 0 || bleScanMetadataCapacity == 0 ||
       bleDiagnosticScanActive || csvExportInProgress) {
@@ -1688,16 +1829,7 @@ bool prefillBleHistoryToPercent(uint8_t percent, String& detail) {
   if (bleHistoryCount >= target) { detail = "Bluetooth history is already at or above the requested target."; return true; }
 
   const uint8_t syntheticAddressCount = 16;
-  uint16_t addressIndexes[syntheticAddressCount];
-  for (uint8_t a = 0; a < syntheticAddressCount; a++) {
-    uint8_t address[6] = {0xC2, 0x42, 0x4C, 0x45, 0x00, a};
-    String name = "TEST-PREFILL-BLE-" + String(a + 1);
-    int idx = findOrCreateBleAddress(address, name, 1);
-    if (idx < 0) { detail = "BLE address table has no room for synthetic test identities."; return false; }
-    addressIndexes[a] = (uint16_t)idx;
-  }
-
-  while (bleHistoryCount < target) {
+  for (size_t batch = 0; batch <= bleScanMetadataCapacity && bleHistoryCount < target; ++batch) {
     bleScanCounter++;
     uint16_t slot = (uint16_t)((bleScanCounter - 1) % bleScanMetadataCapacity);
     if (bleScanMetadata[slot].scanNumber != 0 && bleScanMetadata[slot].scanNumber != bleScanCounter)
@@ -1706,15 +1838,21 @@ bool prefillBleHistoryToPercent(uint8_t percent, String& detail) {
     bleScanMetadata[slot].uptimeMs = surveySessionUptimeMs();
     lastBleScanUptimeMs = bleScanMetadata[slot].uptimeMs;
 
-    for (uint8_t a = 0; a < syntheticAddressCount && bleHistoryCount < target; a++) {
+    const size_t batchSize = std::max((size_t)syntheticAddressCount, (target + bleScanMetadataCapacity - 1) / bleScanMetadataCapacity);
+    for (size_t a = 0; a < batchSize && bleHistoryCount < target; a++) {
+      const uint8_t id = (uint8_t)(a % syntheticAddressCount);
+      uint8_t address[6] = {0xC2, 0x42, 0x4C, 0x45, 0x00, id};
+      int index = findOrCreateBleAddress(address, "TEST-PREFILL-BLE-" + String(id + 1), 1);
+      if (index < 0) { detail = "BLE address table has no room for synthetic test identities; clear history and retry."; return false; }
       BleObservation test = {};
-      test.addressIndex = addressIndexes[a];
+      test.addressIndex = (uint16_t)index;
       test.scanSlot = slot;
       test.rssi = (int8_t)(-38 - ((bleScanCounter + a * 9) % 52));
       appendBleObservation(test);
     }
   }
 
+  if (bleHistoryCount < target) { detail = "Unable to reach Bluetooth target with current storage."; return false; }
   updateBleUsageHighWaterMarks();
   detail = "Synthetic Bluetooth test data filled history to " + String(percent) + "% (" + String(bleHistoryCount) + " observations).";
   return true;
@@ -1724,8 +1862,13 @@ bool prefillBleHistoryToPercent(uint8_t percent, String& detail) {
 void handleHistoryPrefill() {
   markExplicitUserInteraction();
   if (!server.hasArg("percent")) { server.send(400, "text/plain", "Missing target percent."); return; }
-  int percent = server.arg("percent").toInt();
+  const String requestedPercent = server.arg("percent");
+  if (requestedPercent != "50" && requestedPercent != "75" && requestedPercent != "95" && requestedPercent != "99") {
+    server.send(400, "text/plain", "Choose 50, 75, 95 or 99 percent."); return;
+  }
+  int percent = requestedPercent.toInt();
   String radio = server.hasArg("radio") ? server.arg("radio") : "wifi";
+  if (radio != "wifi" && radio != "ble") { server.send(400, "text/plain", "Choose wifi or ble."); return; }
   String detail;
   bool ok = radio == "ble"
     ? prefillBleHistoryToPercent((uint8_t)percent, detail)
@@ -1842,6 +1985,7 @@ void serviceNativeReconnectDiagnostics() {
 void loadDiagnosticStreamingSettings() {
   preferences.begin("diag", true);
   diagnosticStreamingEnabled = preferences.getBool("enabled", false);
+  diagnosticVerbose = preferences.getBool("verbose", false);
   diagnosticSurveyEvents = preferences.getBool("survey", true);
   diagnosticBleEvents = preferences.getBool("ble", true);
   diagnosticMemoryEvents = preferences.getBool("memory", true);
@@ -1858,6 +2002,7 @@ void loadDiagnosticStreamingSettings() {
 void saveDiagnosticStreamingSettings() {
   preferences.begin("diag", false);
   preferences.putBool("enabled", diagnosticStreamingEnabled);
+  preferences.putBool("verbose", diagnosticVerbose);
   preferences.putBool("survey", diagnosticSurveyEvents);
   preferences.putBool("ble", diagnosticBleEvents);
   preferences.putBool("memory", diagnosticMemoryEvents);
@@ -1902,11 +2047,25 @@ void diagnosticPrefix(const char* category) {
   Serial.print("] ");
   Serial.print(category);
   Serial.print(" ");
+  if (wifiPowerMode == 2) {
+    Serial.print("radioLeft=");
+    if (wifiRadioSleeping) Serial.print("off");
+    else if (scanIntervalSeconds <= wifiAccessWindowSeconds) Serial.print("continuous");
+    else if (!wifiPowerWindow.armed) Serial.print("pending");
+    else {
+      // Access-window budget, rounded up; active work may defer radio shutdown.
+      uint32_t remainingMs = wifiPowerWindow.remaining(millis());
+      if (remainingMs == 0) Serial.print("held");
+      else { Serial.print((remainingMs + 999) / 1000); Serial.print("s"); }
+    }
+    Serial.print(" ");
+  }
 }
 
 // Purpose: Prints a compact heap triplet that can be compared at event boundaries.
 void diagnosticPrintHeapTriplet() {
   Serial.print("heap="); Serial.print(ESP.getFreeHeap());
+  if (!diagnosticVerbose) return;
   Serial.print(" min="); Serial.print(ESP.getMinFreeHeap());
   Serial.print(" largest="); Serial.print(diagnosticLargestFreeBlock());
 }
@@ -1914,22 +2073,29 @@ void diagnosticPrintHeapTriplet() {
 // Purpose: Emits one compact state snapshot without requiring the web interface.
 void printDiagnosticSnapshot() {
   diagnosticPrefix("STATUS");
-  Serial.print("up="); Serial.print(millis());
-  Serial.print(" powerMode="); Serial.print(wifiPowerMode);
-  Serial.print(" radio="); Serial.print(wifiRadioSleeping ? "off" : "awake");
-  Serial.print(" wifiScan="); Serial.print(wifiScanInProgress ? 1 : 0);
-  Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
-  Serial.print(" wifiObs="); Serial.print(historyCount);
-  Serial.print("/"); Serial.print(scanHistoryRetentionLimit);
-  Serial.print(" bleObs="); Serial.print(bleHistoryCount);
-  Serial.print("/"); Serial.print(bleHistoryRetentionLimit);
-  Serial.print(" bleScans="); Serial.print(bleScanCounter);
-  Serial.print(" sta="); Serial.print(WiFi.status() == WL_CONNECTED ? 1 : 0);
-  Serial.print(" loopGapLast="); Serial.print(diagnosticLastLoopGapMs);
-  Serial.print(" loopGapMax="); Serial.print(diagnosticMaxLoopGapMs);
-  Serial.print(" ");
-  diagnosticPrintHeapTriplet();
-  Serial.println();
+  if (!diagnosticVerbose) {
+    Serial.print("wifi="); Serial.print(wifiRadioSleeping ? "off" : (wifiScanInProgress ? "scan" : (infrastructureHasIp() ? "connected" : "idle")));
+    Serial.print(" ble="); Serial.print(bleDiagnosticScanActive ? "scan" : "idle");
+    Serial.print(wifiInventoryMode() ? " ap/bleObs=" : " obs="); Serial.print(historyCount); Serial.print("/"); Serial.print(bleHistoryCount);
+    Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+  } else {
+    Serial.print("up="); Serial.print(millis());
+    Serial.print(" powerMode="); Serial.print(wifiPowerMode);
+    Serial.print(" radio="); Serial.print(wifiRadioSleeping ? "off" : "awake");
+    Serial.print(" wifiScan="); Serial.print(wifiScanInProgress ? 1 : 0);
+    Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
+    Serial.print(wifiInventoryMode() ? " wifiAPs=" : " wifiObs="); Serial.print(historyCount);
+    Serial.print("/"); Serial.print(scanHistoryRetentionLimit);
+    Serial.print(" bleObs="); Serial.print(bleHistoryCount);
+    Serial.print("/"); Serial.print(bleHistoryRetentionLimit);
+    Serial.print(" bleScans="); Serial.print(bleScanCounter);
+    Serial.print(" sta="); Serial.print(WiFi.status() == WL_CONNECTED ? 1 : 0);
+    Serial.print(" loopGapLast="); Serial.print(diagnosticLastLoopGapMs);
+    Serial.print(" loopGapMax="); Serial.print(diagnosticMaxLoopGapMs);
+    Serial.print(" ");
+    diagnosticPrintHeapTriplet();
+    Serial.println();
+  }
   if (diagnosticStreamingEnabled) {
     recordDiagnosticEvent("STATUS", "wifiObs=" + String(historyCount) + "/" + String(scanHistoryRetentionLimit) + " bleObs=" + String(bleHistoryCount) + "/" + String(bleHistoryRetentionLimit) + " free=" + String(ESP.getFreeHeap()));
   }
@@ -1947,11 +2113,14 @@ void serviceDiagnosticSnapshot() {
 }
 
 // Purpose: Records long main-loop service gaps, including gaps caused by synchronous BLE scans.
+const uint32_t LAG_CAPTURE_THRESHOLD_MS = 500;
+void captureRuntimeLag(const char* kind, const char* route, const char* phase, uint32_t durationMs);
 void serviceLoopGapDiagnostics() {
   uint32_t now = millis();
   if (diagnosticLastLoopEntryMs != 0) {
     uint32_t gap = (uint32_t)(now - diagnosticLastLoopEntryMs);
     diagnosticLastLoopGapMs = gap;
+    captureRuntimeLag("LOOP", "", "loop-gap", gap);
     if (gap > diagnosticMaxLoopGapMs) diagnosticMaxLoopGapMs = gap;
     if (gap >= 100) {
       diagnosticLoopGapOver100MsCount++;
@@ -1991,13 +2160,14 @@ void setWebOperationPhase(const char* phase) {
 
 // Purpose: Runs a registered HTTP handler while retaining allocation-free current/last operation diagnostics.
 void runDiagnosticWebHandler(const char* route, void (*handler)()) {
+  noteWifiPowerWebActivity();
   if (ledDiagIsHumanRequest(route, server.method() == HTTP_POST)) ledDiagEvent(LED_EVENT_WEBPAGE);
   uint32_t startMs = millis();
   webOperationState.active = true;
   webOperationState.activeSinceMs = startMs;
   snprintf(webOperationState.activeRoute, sizeof(webOperationState.activeRoute), "%s", route ? route : "");
   setWebOperationPhase("handler");
-  if (diagnosticStreamingEnabled && diagnosticWebEvents) {
+  if (diagnosticStreamingEnabled && diagnosticWebEvents && diagnosticVerbose) {
     diagnosticPrefix("HTTP START");
     Serial.print("route="); Serial.print(route);
     Serial.print(" bleScan="); Serial.print(bleDiagnosticScanActive ? 1 : 0);
@@ -2005,6 +2175,7 @@ void runDiagnosticWebHandler(const char* route, void (*handler)()) {
   }
 
   handler();
+  noteWifiPowerWebActivity(); // Leave a full web hold after a slow response.
 
   uint32_t durationMs = (uint32_t)(millis() - startMs);
   snprintf(webOperationState.lastRoute, sizeof(webOperationState.lastRoute), "%s", webOperationState.activeRoute);
@@ -2012,6 +2183,7 @@ void runDiagnosticWebHandler(const char* route, void (*handler)()) {
   webOperationState.lastDurationMs = durationMs;
   webOperationState.lastCompletedMs = millis();
   webOperationState.active = false;
+  captureRuntimeLag("HANDLER", route, webOperationState.lastPhase, durationMs);
   diagnosticWebHandlerCount++;
   diagnosticWebLastDurationMs = durationMs;
   if (durationMs > diagnosticWebMaxDurationMs) diagnosticWebMaxDurationMs = durationMs;
@@ -2115,6 +2287,10 @@ struct WebStallTraceRecord {
   uint32_t freeHeapBytes = 0;
   uint32_t largestFreeBlockBytes = 0;
   bool wifiScanActive = false;
+  bool bleScanActive = false;
+  bool radioSleeping = false;
+  uint8_t powerMode = 0;
+  uint32_t radioWindowRemainingMs = 0;
 };
 
 WebStallTraceRecord webStallTrace[WEB_STALL_TRACE_CAPACITY];
@@ -2141,8 +2317,19 @@ void recordWebStallTrace(const char* kind, const char* route, const char* phase,
   record.freeHeapBytes = ESP.getFreeHeap();
   record.largestFreeBlockBytes = diagnosticLargestFreeBlock();
   record.wifiScanActive = wifiScanInProgress;
+  record.bleScanActive = bleDiagnosticScanActive;
+  record.radioSleeping = wifiRadioSleeping;
+  record.powerMode = wifiPowerMode;
+  record.radioWindowRemainingMs = wifiPowerMode == 2 && !wifiRadioSleeping ? wifiPowerWindow.remaining(millis()) : 0;
   webStallTraceNext = (webStallTraceNext + 1) % WEB_STALL_TRACE_CAPACITY;
   if (webStallTraceCount < WEB_STALL_TRACE_CAPACITY) webStallTraceCount++;
+}
+
+// Always retain abnormal pauses, even with diagnostic streaming disabled.
+// State is sampled after the pause; it describes context, not proven causality.
+void captureRuntimeLag(const char* kind, const char* route, const char* phase, uint32_t durationMs) {
+  if (durationMs < LAG_CAPTURE_THRESHOLD_MS) return;
+  recordWebStallTrace(kind, route, phase, durationMs, 0, 0);
 }
 
 void sampleWebResponseMemory() {
@@ -2293,7 +2480,7 @@ void beginWebResponseProfile(const char* route) {
   webResponseProfile.startMs = millis();
   webResponseProfile.phaseStartMs = webResponseProfile.startMs;
 
-  if (!webResponseProfile.active) return;
+  if (!webResponseProfile.active || !diagnosticVerbose) return;
   diagnosticPrefix("PAGE START");
   Serial.print("route="); Serial.print(route);
   if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
@@ -2328,25 +2515,27 @@ void markWebResponsePhase(const char* phase) {
   uint32_t otherMs = elapsedMs >= sendTimeMs ? elapsedMs - sendTimeMs : 0;
   uint32_t sendCalls = webResponseProfile.sendCalls - webResponseProfile.phaseSendCalls;
   size_t sendBytes = webResponseProfile.sendBytes - webResponseProfile.phaseSendBytes;
-  diagnosticPrefix("PAGE PHASE");
-  Serial.print("route="); Serial.print(webResponseProfile.route);
-  if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
-  Serial.print(" phase="); Serial.print(phase);
-  Serial.print(" elapsed="); Serial.print(elapsedMs); Serial.print("ms");
-  Serial.print(" sendTime="); Serial.print(sendTimeMs); Serial.print("ms");
-  Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
-  Serial.print(" sends="); Serial.print(sendCalls);
-  Serial.print(" bytes="); Serial.print(sendBytes);
-  Serial.print(" maxSend="); Serial.print(webResponseProfile.phaseMaxSendMs); Serial.print("ms");
-  Serial.print(" maxBytes="); Serial.print(webResponseProfile.phaseMaxSendBytes);
-  Serial.print(" slowSends="); Serial.print(webResponseProfile.phaseSlowSendCount);
-  Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
-  for (size_t i = 0; i < webWorkTimingCount; i++) {
-    diagnosticPrefix("PAGE WORK");
+  if (diagnosticVerbose) {
+    diagnosticPrefix("PAGE PHASE");
     Serial.print("route="); Serial.print(webResponseProfile.route);
+    if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
     Serial.print(" phase="); Serial.print(phase);
-    Serial.print(" item="); Serial.print(webWorkTimings[i].label);
-    Serial.print(" elapsed="); Serial.print(webWorkTimings[i].durationMs); Serial.println("ms");
+    Serial.print(" elapsed="); Serial.print(elapsedMs); Serial.print("ms");
+    Serial.print(" sendTime="); Serial.print(sendTimeMs); Serial.print("ms");
+    Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
+    Serial.print(" sends="); Serial.print(sendCalls);
+    Serial.print(" bytes="); Serial.print(sendBytes);
+    Serial.print(" maxSend="); Serial.print(webResponseProfile.phaseMaxSendMs); Serial.print("ms");
+    Serial.print(" maxBytes="); Serial.print(webResponseProfile.phaseMaxSendBytes);
+    Serial.print(" slowSends="); Serial.print(webResponseProfile.phaseSlowSendCount);
+    Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
+    for (size_t i = 0; i < webWorkTimingCount; i++) {
+      diagnosticPrefix("PAGE WORK");
+      Serial.print("route="); Serial.print(webResponseProfile.route);
+      Serial.print(" phase="); Serial.print(phase);
+      Serial.print(" item="); Serial.print(webWorkTimings[i].label);
+      Serial.print(" elapsed="); Serial.print(webWorkTimings[i].durationMs); Serial.println("ms");
+    }
   }
   webWorkTimingCount = 0;
   webResponseProfile.phaseStartMs = millis();
@@ -2397,16 +2586,23 @@ void endWebResponseProfile() {
   Serial.print("route="); Serial.print(webResponseProfile.route);
   if (webResponseProfile.pageId) { Serial.print(" pageId="); Serial.print(webResponseProfile.pageId); }
   Serial.print(" total="); Serial.print(totalMs); Serial.print("ms");
-  Serial.print(" sendTime="); Serial.print(webResponseProfile.sendTimeMs); Serial.print("ms");
-  Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
-  Serial.print(" sends="); Serial.print(webResponseProfile.sendCalls);
-  Serial.print(" bytes="); Serial.print(webResponseProfile.sendBytes);
-  Serial.print(" maxSend="); Serial.print(webResponseProfile.maxSendMs); Serial.print("ms");
-  Serial.print(" maxBytes="); Serial.print(webResponseProfile.maxSendBytes);
-  Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount);
-  Serial.print(" minFree="); Serial.print(webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap);
-  Serial.print(" minLargest="); Serial.print(webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock);
-  Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
+  if (diagnosticVerbose) {
+    Serial.print(" sendTime="); Serial.print(webResponseProfile.sendTimeMs); Serial.print("ms");
+    Serial.print(" other="); Serial.print(otherMs); Serial.print("ms");
+    Serial.print(" sends="); Serial.print(webResponseProfile.sendCalls);
+    Serial.print(" bytes="); Serial.print(webResponseProfile.sendBytes);
+    Serial.print(" maxSend="); Serial.print(webResponseProfile.maxSendMs); Serial.print("ms");
+    Serial.print(" maxBytes="); Serial.print(webResponseProfile.maxSendBytes);
+    Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount);
+    Serial.print(" minFree="); Serial.print(webResponseProfile.minFreeHeap == SIZE_MAX ? 0 : webResponseProfile.minFreeHeap);
+    Serial.print(" minLargest="); Serial.print(webResponseProfile.minLargestBlock == SIZE_MAX ? 0 : webResponseProfile.minLargestBlock);
+    Serial.print(" appendFails="); Serial.print(webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart);
+  } else {
+    Serial.print(" bytes="); Serial.print(webResponseProfile.sendBytes);
+    if (webResponseProfile.slowSendCount) { Serial.print(" slowSends="); Serial.print(webResponseProfile.slowSendCount); }
+    uint32_t failures = webTransportDiagnostics.bufferAppendFailures - webResponseProfile.bufferAppendFailuresAtStart;
+    if (failures) { Serial.print(" appendFails="); Serial.print(failures); }
+  }
   Serial.print(" "); diagnosticPrintHeapTriplet(); Serial.println();
   recordDiagnosticEvent("PAGE SUMMARY", String(webResponseProfile.route) + " total=" + String(totalMs) + "ms send=" + String(webResponseProfile.sendTimeMs) + "ms other=" + String(otherMs) + "ms maxSend=" + String(webResponseProfile.maxSendMs) + "ms");
   if (totalMs >= WEB_STALL_RESPONSE_THRESHOLD_MS) {
@@ -2436,6 +2632,7 @@ void printDeveloperDiagnosticSummary() {
   Serial.println(" Developer Diagnostics");
   Serial.println("============================================================");
   Serial.print("Diagnostic streaming:  "); Serial.println(diagnosticStreamingEnabled ? "ON" : "OFF");
+  Serial.print("Output detail:         "); Serial.println(diagnosticVerbose ? "verbose" : "terse");
   Serial.print("Periodic snapshot:     ");
   if (diagnosticSnapshotIntervalMs == 0) Serial.println("OFF");
   else { Serial.print(diagnosticSnapshotIntervalMs / 1000); Serial.println(" s"); }
@@ -2484,6 +2681,7 @@ void printDeveloperDiagnosticSummary() {
   Serial.println();
   Serial.println("Developer commands:");
   Serial.println("  diag on|off            - Master diagnostic streaming switch");
+  Serial.println("  diag terse|verbose     - Save output detail (default: terse)");
   Serial.println("  diag snapshot          - Print one state/heap snapshot now");
   Serial.println("  diag summary           - Print accumulated timing diagnostics");
   Serial.println("  diag interval <sec>    - Periodic snapshot interval; 0 disables");
@@ -2594,6 +2792,7 @@ void initializeBLEScanner() {
 
 // Purpose: Returns the total RAM reserved for Wi-Fi compact observations, AP identity table, and scan metadata.
 size_t wifiHistoryAllocatedBytes() {
+  if (wifiStoragePool) return wifiStoragePoolBytes;
   return
     scanHistoryCapacity * sizeof(WifiObservation) +
     wifiApTableCapacity * sizeof(WifiApEntry) +
@@ -2602,6 +2801,15 @@ size_t wifiHistoryAllocatedBytes() {
 
 // Purpose: Returns a retained compact Wi-Fi observation by logical ring-buffer index.
 const WifiObservation& compactHistoryRecord(size_t logicalIndex) {
+  if (wifiInventoryMode()) {
+    static WifiObservation view;
+    view = {};
+    if (logicalIndex < wifiApCount) {
+      view.apIndex = (uint16_t)logicalIndex;
+      view.rssi = (int8_t)wifiApTable[logicalIndex].signal.latestRssi;
+    }
+    return view;
+  }
   size_t physicalIndex =
       (historyStart + logicalIndex) % scanHistoryCapacity;
   return scanHistory[physicalIndex];
@@ -2636,8 +2844,8 @@ ScanRecord historyRecord(size_t logicalIndex) {
   const WifiApEntry& ap = wifiApTable[observation.apIndex];
   const WifiScanMetadata& scan = wifiScanMetadata[observation.scanSlot];
 
-  record.scanNumber = scan.scanNumber;
-  record.uptimeMs = scan.uptimeMs;
+  record.scanNumber = wifiInventoryMode() ? ap.lastScan : scan.scanNumber;
+  record.uptimeMs = wifiInventoryMode() ? ap.signal.lastSeenMs : scan.uptimeMs;
   memcpy(record.ssid, ap.ssid, sizeof(record.ssid));
   formatBssid(ap.bssid, record.bssid);
   record.rssi = observation.rssi;
@@ -2648,8 +2856,20 @@ ScanRecord historyRecord(size_t logicalIndex) {
   return record;
 }
 
+uint32_t wifiHistoryBoundaryMs(bool oldest) {
+  if (!historyCount) return 0;
+  if (!wifiInventoryMode()) return historyRecord(oldest ? 0 : historyCount - 1).uptimeMs;
+  uint32_t value = oldest ? UINT32_MAX : 0;
+  for (size_t i = 0; i < wifiApCount; i++) {
+    uint32_t time = oldest ? wifiApTable[i].signal.firstSeenMs : wifiApTable[i].signal.lastSeenMs;
+    value = oldest ? std::min(value, time) : std::max(value, time);
+  }
+  return value;
+}
+
 // Purpose: Counts distinct retained Wi-Fi scan numbers directly from compact scan metadata.
 size_t countRetainedScanGroups() {
+  if (wifiInventoryMode()) return 0;
   static size_t cachedHistoryStart = SIZE_MAX;
   static size_t cachedHistoryCount = SIZE_MAX;
   static uint32_t cachedScanCounter = UINT32_MAX;
@@ -2689,6 +2909,7 @@ size_t countRetainedScanGroups() {
 
 // Purpose: Evicts the oldest Wi-Fi observation from the ring buffer.
 void discardOldestWifiObservation() {
+  if (wifiInventoryMode()) return;
   if (historyCount == 0 || scanHistoryCapacity == 0) return;
   historyStart = (historyStart + 1) % scanHistoryCapacity;
   historyCount--;
@@ -2696,6 +2917,7 @@ void discardOldestWifiObservation() {
 
 // Purpose: Removes every retained Wi-Fi observation that references a metadata slot before that slot is recycled.
 void discardObservationsForScanSlot(uint16_t scanSlot) {
+  if (wifiInventoryMode()) return;
   if (!scanHistory || historyCount == 0) return;
   size_t kept = 0;
   const size_t originalCount = historyCount;
@@ -2711,6 +2933,7 @@ void discardObservationsForScanSlot(uint16_t scanSlot) {
 
 // Purpose: Counts retained Wi-Fi observations whose metadata references violate chronological or slot-mapping invariants.
 size_t wifiHistoryIntegrityAnomalies() {
+  if (wifiInventoryMode()) return historyCount == wifiApCount ? 0 : 1;
   static uint32_t cachedScanCounter = UINT32_MAX;
   static size_t cachedHistoryCount = (size_t)-1;
   static size_t cachedAnomalies = 0;
@@ -2738,6 +2961,7 @@ size_t wifiHistoryIntegrityAnomalies() {
 
 // Purpose: Changes the logical Wi-Fi history-retention limit without reallocating the physical buffers.
 bool setWifiRetentionLimit(size_t requestedLimit) {
+  if (wifiInventoryMode()) { historyResizeMessage = "Inventory retains AP summaries, not a measurement ring."; return false; }
   if (scanHistory == nullptr || scanHistoryCapacity == 0) {
     historyResizeMessage = "Wi-Fi history storage is not allocated.";
     return false;
@@ -2755,8 +2979,8 @@ bool setWifiRetentionLimit(size_t requestedLimit) {
   historyResizeMessage =
     "Retention limit set to " +
     String(scanHistoryRetentionLimit) +
-    " observations. Physical capacity remains " +
-    String(scanHistoryCapacity) + ".";
+    " observations. Current ring capacity is " +
+    String(scanHistoryCapacity) + "; AP growth can reduce it.";
   return true;
 }
 
@@ -2770,19 +2994,25 @@ bool resizeScanHistory(size_t requestedCapacity, bool preserveRecords = true) {
 
 // Purpose: Clears Wi-Fi history and then applies a requested logical retention limit.
 bool clearAndResizeScanHistory(size_t requestedCapacity) {
-  historyStart = 0;
-  historyCount = 0;
-  scanCounter = 0;
-  lastScanUptimeMs = 0;
-  wifiApCount = 0;
-  wifiApTableFullDrops = 0;
-  if (wifiScanMetadata && wifiScanMetadataCapacity)
-    memset(wifiScanMetadata, 0, wifiScanMetadataCapacity * sizeof(WifiScanMetadata));
+  clearScanHistory();
   return setWifiRetentionLimit(requestedCapacity);
 }
 
 // Purpose: Appends one compact Wi-Fi observation, evicting old data as required by the ring-buffer limit.
 void appendWifiObservation(const WifiObservation& observation) {
+  if (!wifiRestoringCheckpoint && observation.apIndex < wifiApCount) {
+    WifiApEntry& ap = wifiApTable[observation.apIndex];
+    SignalStats& st = ap.signal;
+    uint32_t now = wifiScanMetadata[observation.scanSlot].uptimeMs;
+    if (st.samples == 0) { st.firstSeenMs = now; st.minRssi = st.maxRssi = observation.rssi; }
+    if (st.samples != UINT32_MAX) { st.samples++; st.rssiTotal += observation.rssi; }
+    st.latestRssi = observation.rssi;
+    st.minRssi = std::min(st.minRssi, (int16_t)observation.rssi);
+    st.maxRssi = std::max(st.maxRssi, (int16_t)observation.rssi);
+    st.lastSeenMs = now;
+    ap.lastScan = wifiScanMetadata[observation.scanSlot].scanNumber;
+  }
+  if (wifiInventoryMode()) { historyCount = wifiApCount; return; }
   if (
     scanHistory == nullptr ||
     scanHistoryCapacity == 0 ||
@@ -2800,6 +3030,13 @@ void appendWifiObservation(const WifiObservation& observation) {
 
 // Purpose: Clears retained Wi-Fi observations and associated scan-history state.
 void clearScanHistory() {
+  if (wifiStoragePool && !wifiInventoryMode() && !wifiRestoringCheckpoint) {
+    wifiApTableCapacity = std::min((size_t)16, wifiApPolicyLimit);
+    size_t offset = wifiScanMetadataCapacity * sizeof(WifiScanMetadata) + wifiApTableCapacity * sizeof(WifiApEntry);
+    scanHistory = reinterpret_cast<WifiObservation*>(wifiStoragePool + offset);
+    scanHistoryCapacity = std::min(MAX_SCAN_HISTORY_RECORDS, (wifiStoragePoolBytes - offset) / sizeof(WifiObservation));
+    scanHistoryRetentionLimit = scanHistoryCapacity;
+  }
   historyStart = 0;
   historyCount = 0;
   scanCounter = 0;
@@ -2866,18 +3103,33 @@ int findOrCreateWifiAp(
     return -1;
   }
 
+  if (wifiApCount >= wifiApTableCapacity && !wifiInventoryMode())
+    growWifiApTable(std::min(wifiApPolicyLimit, wifiApTableCapacity + 16));
   size_t targetIndex = wifiApCount;
   if (wifiApCount >= wifiApTableCapacity) {
     targetIndex = wifiApTableCapacity;
-    uint16_t oldestAge = 0;
+    uint32_t oldestAge = 0;
     for (size_t i = 0; i < wifiApTableCapacity; i++) {
-      if (!wifiApIndexIsReferenced(i)) {
-        uint16_t age = (uint16_t)((uint16_t)scanCounter - wifiApTable[i].lastSeenScanLow);
+      if (wifiInventoryMode() || !wifiApIndexIsReferenced(i)) {
+        uint32_t age = scanCounter - wifiApTable[i].lastScan;
         if (targetIndex >= wifiApTableCapacity || age > oldestAge) {
           oldestAge = age;
           targetIndex = i;
         }
       }
+    }
+    if (targetIndex >= wifiApTableCapacity && surveyFocus == 1) {
+      // Balanced admits a new identity by evicting the stalest AP and all of
+      // its measurements together. No observation can change identity.
+      targetIndex = 0;
+      for (size_t i = 1; i < wifiApCount; i++)
+        if ((uint32_t)(scanCounter - wifiApTable[i].lastScan) > (uint32_t)(scanCounter - wifiApTable[targetIndex].lastScan)) targetIndex = i;
+      size_t kept = 0;
+      for (size_t i = 0; i < historyCount; i++) {
+        WifiObservation item = compactHistoryRecord(i);
+        if (item.apIndex != targetIndex) scanHistory[(historyStart + kept++) % scanHistoryCapacity] = item;
+      }
+      historyCount = kept;
     }
     if (targetIndex >= wifiApTableCapacity) {
       wifiApTableFullDrops++;
@@ -2901,49 +3153,60 @@ int findOrCreateWifiAp(
 }
 
 // Purpose: Allocates the compact Wi-Fi observation ring, AP table, and scan-metadata table within the chosen RAM budget.
-bool initializeCompactWifiHistory(size_t budgetBytes, size_t apCapacity, size_t scanCapacity) {
-
-  size_t metadataBytes =
-      apCapacity * sizeof(WifiApEntry) +
-      scanCapacity * sizeof(WifiScanMetadata);
-
-  size_t observationCapacity = MIN_SCAN_HISTORY_RECORDS;
-  if (budgetBytes > metadataBytes) {
-    observationCapacity =
-        (budgetBytes - metadataBytes) / sizeof(WifiObservation);
-    if (observationCapacity < MIN_SCAN_HISTORY_RECORDS)
-      observationCapacity = MIN_SCAN_HISTORY_RECORDS;
-  }
-  if (observationCapacity > MAX_SCAN_HISTORY_RECORDS)
-    observationCapacity = MAX_SCAN_HISTORY_RECORDS;
-
-  wifiApTable = (WifiApEntry*)calloc(apCapacity, sizeof(WifiApEntry));
-  wifiScanMetadata =
-      (WifiScanMetadata*)calloc(scanCapacity, sizeof(WifiScanMetadata));
-  scanHistory =
-      (WifiObservation*)malloc(observationCapacity * sizeof(WifiObservation));
-
-  if (!wifiApTable || !wifiScanMetadata || !scanHistory) {
-    if (wifiApTable) free(wifiApTable);
-    if (wifiScanMetadata) free(wifiScanMetadata);
-    if (scanHistory) free(scanHistory);
-    wifiApTable = nullptr;
-    wifiScanMetadata = nullptr;
-    scanHistory = nullptr;
-    wifiApTableCapacity = 0;
-    wifiScanMetadataCapacity = 0;
-    scanHistoryCapacity = 0;
-    scanHistoryRetentionLimit = 0;
-    return false;
-  }
-
-  wifiApTableCapacity = apCapacity;
-  wifiScanMetadataCapacity = scanCapacity;
-  scanHistoryCapacity = observationCapacity;
-  scanHistoryRetentionLimit = observationCapacity;
+// AP growth occurs only when a new identity needs space. The ring is rotated
+// in place and oldest measurements are evicted before moving the retained tail.
+// No malloc/free occurs during capture. AP indices remain stable.
+bool growWifiApTable(size_t requested) {
+  if (!wifiStoragePool || wifiInventoryMode() || requested <= wifiApTableCapacity || requested > wifiApPolicyLimit) return false;
+  size_t metadataBytes = wifiScanMetadataCapacity * sizeof(WifiScanMetadata);
+  size_t offset = metadataBytes + requested * sizeof(WifiApEntry);
+  if (offset + MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation) > wifiStoragePoolBytes) return false;
+  size_t capacity = std::min(MAX_SCAN_HISTORY_RECORDS, (wifiStoragePoolBytes - offset) / sizeof(WifiObservation));
+  bool fullLimit = scanHistoryRetentionLimit == scanHistoryCapacity;
+  while (historyCount > capacity) discardOldestWifiObservation();
+  if (historyStart) std::rotate(scanHistory, scanHistory + historyStart, scanHistory + scanHistoryCapacity);
+  WifiObservation* moved = reinterpret_cast<WifiObservation*>(wifiStoragePool + offset);
+  memmove(moved, scanHistory, historyCount * sizeof(WifiObservation));
+  memset(wifiApTable + wifiApTableCapacity, 0, (requested - wifiApTableCapacity) * sizeof(WifiApEntry));
+  scanHistory = moved;
   historyStart = 0;
-  historyCount = 0;
-  wifiApCount = 0;
+  scanHistoryCapacity = capacity;
+  scanHistoryRetentionLimit = fullLimit ? capacity : std::min(scanHistoryRetentionLimit, capacity);
+  while (historyCount > scanHistoryRetentionLimit) discardOldestWifiObservation();
+  wifiApTableCapacity = requested;
+  wifiPoolGrowthCount++;
+  return true;
+}
+
+bool initializeCompactWifiHistory(size_t budgetBytes, size_t apCapacity, size_t scanCapacity) {
+  // Inventory needs just one transient scan timestamp; every AP owns its dates.
+  scanCapacity = wifiInventoryMode() ? 1 : scanCapacity;
+  const size_t metadataBytes = scanCapacity * sizeof(WifiScanMetadata);
+  const size_t minimum = metadataBytes + 16 * sizeof(WifiApEntry) + MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
+  if (budgetBytes < minimum) budgetBytes = minimum;
+  wifiStoragePool = (uint8_t*)calloc(1, budgetBytes);
+  if (!wifiStoragePool) return false;
+  wifiStoragePoolBytes = budgetBytes;
+  wifiScanMetadata = reinterpret_cast<WifiScanMetadata*>(wifiStoragePool);
+  wifiScanMetadataCapacity = scanCapacity;
+  wifiApTable = reinterpret_cast<WifiApEntry*>(wifiStoragePool + metadataBytes);
+  size_t usable = budgetBytes - metadataBytes;
+  wifiApPolicyLimit = std::min((size_t)1024, (usable * (surveyFocus == 0 ? 25 : 50) / 100) / sizeof(WifiApEntry));
+  if (wifiInventoryMode()) {
+    wifiApPolicyLimit = std::min((size_t)1024, usable / sizeof(WifiApEntry));
+    wifiApTableCapacity = wifiApPolicyLimit;
+    scanHistoryCapacity = wifiApTableCapacity;
+    // Non-null compatibility sentinel; inventory never dereferences the ring.
+    scanHistory = reinterpret_cast<WifiObservation*>(wifiStoragePool);
+  } else {
+    apCapacity = std::min((size_t)16, wifiApPolicyLimit);
+    wifiApTableCapacity = apCapacity;
+    size_t offset = metadataBytes + apCapacity * sizeof(WifiApEntry);
+    scanHistory = reinterpret_cast<WifiObservation*>(wifiStoragePool + offset);
+    scanHistoryCapacity = std::min(MAX_SCAN_HISTORY_RECORDS, (budgetBytes - offset) / sizeof(WifiObservation));
+  }
+  scanHistoryRetentionLimit = scanHistoryCapacity;
+  historyStart = historyCount = wifiApCount = 0;
   return true;
 }
 
@@ -3022,7 +3285,7 @@ int processCompletedWifiScan(int networkCount) {
     // Make the ring slot available before AP allocation. This can release the
     // final reference to an old AP identity, allowing that identity slot to be
     // reclaimed for the incoming BSSID without ever retargeting live history.
-    while (historyCount >= scanHistoryRetentionLimit)
+    while (!wifiInventoryMode() && historyCount >= scanHistoryRetentionLimit)
       discardOldestWifiObservation();
 
     bool created = false;
@@ -3638,9 +3901,8 @@ void initializeAutoSizedHistories() {
   size_t freeHeap = ESP.getFreeHeap();
 
   if (!bleSurveyEnabled) {
-    const size_t wifiMetadata =
-        WIFI_ONLY_AP_TABLE_TARGET * sizeof(WifiApEntry) +
-        WIFI_ONLY_SCAN_METADATA_SLOTS * sizeof(WifiScanMetadata);
+    const size_t wifiMetadata = 16 * sizeof(WifiApEntry) +
+        (wifiInventoryMode() ? 1 : WIFI_ONLY_SCAN_METADATA_SLOTS) * sizeof(WifiScanMetadata);
     const size_t minimumWifiObs =
         MIN_SCAN_HISTORY_RECORDS * sizeof(WifiObservation);
     const size_t minimumCompactBytes = wifiMetadata + minimumWifiObs;
@@ -3658,7 +3920,7 @@ void initializeAutoSizedHistories() {
       ? freeHeap - DUAL_RADIO_HEAP_RESERVE_BYTES : 0;
 
     const size_t wifiMetadata =
-        DUAL_RADIO_WIFI_AP_TABLE_TARGET * sizeof(WifiApEntry) +
+        16 * sizeof(WifiApEntry) +
         DUAL_RADIO_WIFI_SCAN_METADATA_SLOTS * sizeof(WifiScanMetadata);
     const size_t bleMetadata =
         BLE_ADDRESS_TABLE_TARGET * sizeof(BleAddressEntry) +
@@ -4986,26 +5248,47 @@ String pageStyles() {
     overflow-wrap: anywhere;
   }
 
-  .button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+  /* One control size, based on navigation and the View/Theme menus. */
+  button, .button, select, .nav a {
     box-sizing: border-box;
-    min-height: 44px;
-    margin: 20px 6px 0 6px;
-    padding: 12px 20px;
-    border: 0;
-    background: var(--button-bg);
-    color: var(--button-text);
-    text-decoration: none;
+    min-height: 38px;
+    padding: 8px 11px;
+    border: 1px solid var(--border);
     border-radius: 6px;
-    font: inherit;
-    line-height: 1.2;
-    cursor: pointer;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 16px;
+    font-weight: 400;
+    line-height: 20px;
     vertical-align: middle;
   }
 
-  .button:disabled {
+  button, .button, .nav a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  button, .button {
+    background: var(--button-bg);
+    color: var(--button-text);
+    border-color: var(--button-bg);
+  }
+
+  .button {
+    margin: 20px 6px 0 6px;
+  }
+
+  select {
+    max-width: 100%;
+    background: var(--input-bg);
+    color: var(--text);
+    border-color: var(--input-border);
+  }
+
+  button:disabled, .button:disabled, select:disabled {
     opacity: 0.65;
     cursor: default;
   }
@@ -5032,11 +5315,6 @@ String pageStyles() {
 
   .test-tool-actions form {
     margin: 0;
-  }
-
-  .test-tool-actions button {
-    min-height: 44px;
-    padding: 10px 18px;
   }
 
   .survey-control-row {
@@ -5214,15 +5492,6 @@ String pageStyles() {
     color: var(--text);
   }
 
-  button {
-    padding: 10px 16px;
-    border: 0;
-    border-radius: 6px;
-    background: var(--button-bg);
-    color: var(--button-text);
-    cursor: pointer;
-  }
-
   .danger {
     background: #7a2d2d;
   }
@@ -5305,11 +5574,7 @@ String pageStyles() {
   }
 
   .nav a {
-    padding: 8px 11px;
-    border-radius: 6px;
-    text-decoration: none;
     color: var(--text);
-    border: 1px solid var(--border);
     background: var(--card-bg);
   }
 
@@ -5322,6 +5587,26 @@ String pageStyles() {
     position: relative;
     padding-right: 38px;
   }
+
+  .card > h2.movable-heading { padding-left: 48px; padding-right: 38px; }
+  .card-move {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 38px;
+    padding: 8px 0;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+  }
+  .card-move:active { cursor: grabbing; }
+  .card-move:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .layout-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 14px; }
+  .layout-status { color: var(--muted); font-size: 0.9em; }
+  .layout-dragging { opacity: 0.65; }
+  .layout-before { box-shadow: 0 -4px 0 var(--link), 0 2px 8px var(--shadow); }
+  .layout-after { box-shadow: 0 4px 0 var(--link), 0 2px 8px var(--shadow); }
 
   .card-help-link {
     position: absolute;
@@ -5397,10 +5682,7 @@ String pageStyles() {
   }
 
   .capture-diagnostic-control button {
-    min-height: 34px;
-    padding: 7px 11px;
     white-space: nowrap;
-    font-size: 0.9em;
   }
 
   .diagnostic-details {
@@ -5441,11 +5723,6 @@ String pageStyles() {
 
   .theme-control select, .view-control select {
     min-width: 110px;
-    padding: 7px;
-    border: 1px solid var(--input-border);
-    border-radius: 5px;
-    background: var(--input-bg);
-    color: var(--text);
   }
 
   .footer {
@@ -5551,11 +5828,11 @@ void handleWifiScanStatus() {
   String newestLabel = "Never";
   String windowLabel = "-";
   if (historyCount > 0) {
-    const ScanRecord& oldest = historyRecord(0);
-    const ScanRecord& newest = historyRecord(historyCount - 1);
-    oldestLabel = observationAgeLabel(oldest.uptimeMs);
-    newestLabel = observationAgeLabel(newest.uptimeMs);
-    windowLabel = retainedWindowLabel(oldest.uptimeMs, newest.uptimeMs);
+    uint32_t oldestMs = wifiHistoryBoundaryMs(true);
+    uint32_t newestMs = wifiHistoryBoundaryMs(false);
+    oldestLabel = observationAgeLabel(oldestMs);
+    newestLabel = observationAgeLabel(newestMs);
+    windowLabel = retainedWindowLabel(oldestMs, newestMs);
   }
   String json = "{";
   json += "\"scan\":" + String(scanCounter);
@@ -5581,6 +5858,8 @@ void handleWifiScanStatus() {
   json += ",\"autoRetryPending\":" + String(wifiAutoScanRetryPending ? "true" : "false");
   json += ",\"interactionDeferred\":" + String(userInteractionDeferActive() ? "true" : "false");
   json += ",\"csvExportInProgress\":" + String(csvExportInProgress ? "true" : "false");
+  json += ",\"surveyFocus\":" + jsonQuoted(surveyFocusName());
+  json += ",\"inventory\":" + String(wifiInventoryMode() ? "true" : "false");
   json += ",\"csvExports\":" + String(wifiCsvExportCount);
   json += ",\"lastCsv\":" + jsonQuoted(wifiCsvExportCount ? csvExportSummaryLabel(wifiCsvLastRows, wifiCsvLastBytes, wifiCsvLastDurationMs) : String("Never"));
   json += ",\"apCount\":" + String(wifiApCount);
@@ -5709,7 +5988,7 @@ void handleScanCsv() {
   buffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
   appendCsvBuffered(
     buffer,
-    "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n",
+    wifiInventoryMode() ? "last_scan,last_seen_ms,last_seen,ssid,bssid,channel,latest_rssi_dbm,security,connected,hidden,first_seen_ms,sightings,min_rssi_dbm,max_rssi_dbm,avg_rssi_dbm\r\n" : "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n",
     bytesSent
   );
 
@@ -5746,6 +6025,10 @@ void handleScanCsv() {
     line += (connectedApIndex >= 0 && observation.apIndex == (uint16_t)connectedApIndex) ? "YES" : "NO";
     line += ",";
     line += record.hidden ? "YES" : "NO";
+    if (wifiInventoryMode()) {
+      const SignalStats& st = wifiApTable[observation.apIndex].signal;
+      line += "," + String(st.firstSeenMs) + "," + String(st.samples) + "," + String(st.minRssi) + "," + String(st.maxRssi) + "," + String(averageSignal(st), 2);
+    }
     line += "\r\n";
 
     appendCsvBuffered(buffer, line, bytesSent);
@@ -5763,6 +6046,11 @@ void handleScanCsv() {
 
 // Purpose: Generates and streams the SVG RSSI history plot for one selected Wi-Fi BSSID.
 void sendRssiHistoryPlot(const String& selectedBssid) {
+  if (!plotsEnabled) {
+    diagnosticSendContent("<p>Plots are disabled. Enable them in Settings &gt; Developer Memory and restart. Survey measurements and CSV exports remain available.</p>");
+    return;
+  }
+  if (wifiInventoryMode()) { diagnosticSendContent("<p>Network Inventory keeps AP summaries only. Select Signal History or Balanced Survey in Settings to capture RSSI history.</p>"); return; }
   const int SVG_WIDTH = 720;
   const int SVG_HEIGHT = 280;
 
@@ -6019,12 +6307,13 @@ bool buildNetworkSummaryByApIndex(
     return false;
   }
 
-  bool found = false;
+  bool found = wifiInventoryMode();
+  if (wifiInventoryMode()) summary.signal = wifiApTable[apIndex].signal;
 
   // Compact observations already contain the AP-table index. Walking them
   // directly avoids synthesizing ScanRecord/String objects for every history
   // comparison, which was the dominant full-history Wi-Fi page cost.
-  for (size_t i = 0; i < historyCount; i++) {
+  for (size_t i = 0; !wifiInventoryMode() && i < historyCount; i++) {
     const WifiObservation& observation = compactHistoryRecord(i);
     if (observation.apIndex != apIndex) continue;
     if (observation.scanSlot >= wifiScanMetadataCapacity) continue;
@@ -6073,6 +6362,7 @@ bool buildNetworkSummary(
 
 // Purpose: Streams the sortable Observed Networks table with columns progressively exposed by view depth.
 void sendNetworkSummaryTable() {
+  diagnosticSendContent(String("<p><strong>Survey Focus: ") + surveyFocusName() + "</strong>" + (wifiInventoryMode() ? " &mdash; One summary per AP. Counts and RSSI statistics cover sightings since admission; there is no measurement timeline." : " &mdash; Rolling measurements; AP storage grows within the shared budget.") + "</p>");
   if (historyCount == 0) {
     diagnosticSendContent("<p>No networks have been observed yet.</p>");
     return;
@@ -6097,7 +6387,7 @@ void sendNetworkSummaryTable() {
 
   // Walk newest-to-oldest and emit each AP once. The compact observation's
   // AP index is the deduplication key, preserving linear-time summary generation.
-  bool emittedAp[512] = {};
+  bool emittedAp[1024] = {};
   String tableBuffer;
   tableBuffer.reserve(CSV_STREAM_BUFFER_BYTES + 256);
 
@@ -6106,7 +6396,7 @@ void sendNetworkSummaryTable() {
     const WifiObservation& latestObservation = compactHistoryRecord(logicalIndex);
     uint16_t apIndex = latestObservation.apIndex;
 
-    if (apIndex >= wifiApCount || apIndex >= 512) continue;
+    if (apIndex >= wifiApCount || apIndex >= 1024) continue;
     if (emittedAp[apIndex]) continue;
     emittedAp[apIndex] = true;
 
@@ -6123,9 +6413,9 @@ void sendNetworkSummaryTable() {
     String row;
     row.reserve(950);
     row += summary.connected ? "<tr class=\"current\">" : "<tr>";
-    row += "<td class=\"address\"><a href=\"" + plotUrl + "\">" + htmlEscape(displaySSID);
+    row += "<td class=\"address\">" + ((wifiInventoryMode() || !plotsEnabled) ? String("") : "<a href=\"" + plotUrl + "\">") + htmlEscape(displaySSID);
     if (summary.connected) row += " (connected)";
-    row += "</a></td>";
+    row += (wifiInventoryMode() || !plotsEnabled) ? "</td>" : "</a></td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.channel) + "\">" + String(summary.channel) + "</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
@@ -6133,7 +6423,7 @@ void sendNetworkSummaryTable() {
     row += "<td data-sort=\"" + String(lastAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.lastSeenMs)) + "</td>";
     row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.minRssi) + "\">" + String(summary.signal.minRssi) + " dBm</td>";
     row += "<td class=\"signal advanced-only\" data-sort=\"" + String(summary.signal.maxRssi) + "\">" + String(summary.signal.maxRssi) + " dBm</td>";
-    row += "<td class=\"developer-only\"><a href=\"" + plotUrl + "\">" + htmlEscape(String(summary.bssid)) + "</a></td>";
+    row += "<td class=\"developer-only\">" + htmlEscape(String(summary.bssid)) + "</td>";
     row += "<td class=\"developer-only\">" + htmlEscape(securityLabel((wifi_auth_mode_t)summary.authMode)) + "</td>";
     row += "<td class=\"developer-only\" data-sort=\"" + String(firstAgeMs) + "\">" + htmlEscape(observationAgeLabel(summary.signal.firstSeenMs)) + "</td>";
     row += "</tr>";
@@ -6186,6 +6476,13 @@ String contextHelpScript() {
 <script>
 (function(){
   const help={
+    'Observed BLE Devices':['observed-devices','Lists Bluetooth devices represented in retained history.','Enable plots in Developer Memory and restart to inspect retained signal history.'],
+    'Network Inventory':['survey-focus','Keeps one updated summary per access point rather than repeated measurements.','At capacity, the stalest AP is replaced. Use another Survey Focus for an RSSI timeline.'],
+    'Survey Button':["survey-button", "A short press requests a Wi-Fi scan. Hold the survey button to open the Wi-Fi access window. The hardware button does not erase survey history."],
+    'Serial Terminal':["serial-terminal", "View captured firmware output and send serial commands over the web. Capture Off still allows commands, but output is only available over USB. Browser pause does not stop device logging. ROM and library UART logs are not captured. Terminal polling does not extend the Wi-Fi access window."],
+    'Developer Memory':["developer-memory", "Choose Off, 1, 2, 8, 16 or 32 KiB of terminal capture, and enable or disable Wi-Fi and Bluetooth plots. Save, then restart from System. Defaults are 1 KiB and plots off. Smaller capture buffers leave more memory for surveys; disabled plots avoid temporary graph allocations."],
+    'Survey Focus':["survey-focus", "Signal History favors repeated measurements; Balanced Survey trades some history for more APs; Network Inventory keeps one updated summary per BSSID and replaces the stalest AP when full. Changing focus restarts and clears survey history."],
+    'Wi-Fi Power Saving':["wifi-power", "Normal keeps Wi-Fi on; Connected uses modem sleep; Ultra stops Wi-Fi between scans. Non-terminal activity restarts a five-minute hold, followed by the configured timeout. Terminal polling does not renew it."],
     'Survey Status & Controls':['survey-controls','Shows whether surveying is active, when the last scan ran, and the controls that affect scan timing. Use it to confirm the survey is actually collecting data.','Scan state and counters are live scheduler indicators. Interval changes affect future automatic starts; Live Updates only refresh the browser.'],
     'History':['history','Shows how much survey data is retained and how far back it reaches. Older observations roll out as the buffer fills.','Capacity reflects compact observations plus supporting identity and scan metadata; retained time depends on scan interval and observations per scan.'],
     'RSSI History':['rssi-history','Plots retained signal strength for one selected network or device. Hover over a point to see details for that observation.','RSSI is shown in dBm on a fixed scale so plots are comparable. Each point represents one retained scan observation.'],
@@ -6203,7 +6500,7 @@ String contextHelpScript() {
     'Wi-Fi Survey Engine':['wifi-survey-diagnostics','Detailed Wi-Fi scan-engine health, retention outcomes, scheduler counters, and timing live here rather than on the normal survey page.','Use these counters to distinguish RF observations from logger/scheduler failures.'],
     'Bluetooth Survey Engine':['ble-survey-diagnostics','Detailed Bluetooth scan-engine health and retention state.','Developer view adds address-table, metadata, allocation, and implementation details.'],
     'Survey Scheduler':['survey-scheduler-diagnostics','Shows survey cadence and main-loop timing.','Developer view adds retry/backoff and interaction-defer internals.'],
-    'Infrastructure Connectivity':['infrastructure-diagnostics','Shows current station connectivity for troubleshooting.','Later V40 revisions will add bounded disconnect reasons, reconnect attempts, and DHCP outcomes here.'],
+    'Infrastructure Connectivity':['infrastructure-diagnostics','Shows current station connectivity for troubleshooting.','Inspect bounded disconnect reasons, reconnect attempts, and DHCP outcomes here.'],
     'Flash & Storage':['flash-storage-diagnostics','Shows application/flash capacity and restart-checkpoint storage state.','This is also the natural future home for OTA/partition diagnostics.'],
     'Web Interface':['web-diagnostics','Developer instrumentation for page generation, transport, browser reports, and severe-hang detection.','Use with Capture Diagnostics when investigating web responsiveness.'],
     'Export Diagnostics':['export-diagnostics','Shows Wi-Fi and Bluetooth export activity and timing.','Export metrics are separated from the survey-result pages.'],
@@ -6215,7 +6512,7 @@ String contextHelpScript() {
     'Device Actions':['restart-device','Restarts the surveyor without changing saved settings. Current survey history is preserved when the restart checkpoint can hold it.','A failed checkpoint blocks the safe restart path; destructive restart requires explicit confirmation so stale or current history is not silently lost.'],
     'Boot Heap Checkpoints':['boot-heap','Shows memory at major startup stages so you can see where RAM is consumed.','Compare free heap, minimum heap, and largest block across initialization stages to isolate subsystem costs.'],
     'Session':['session','Shows whether survey history was restored through a controlled restart and the current restart-preservation status.','Restart checkpoints are temporary continuity data and are deleted after successful restore.'],
-    'History Test Tools':['history-test-tools','Developer-only controls fill history with synthetic observations for near-capacity UI and rollover testing.','Synthetic data exercises compact history/table behavior but is not a substitute for radio or endurance testing.'],
+    'History Test Tools':['history-test-tools','Fill 50, 75, 95 or 99% with synthetic AP summaries in Network Inventory or measurements in history modes; Bluetooth uses its separate history.','Synthetic data exercises compact history/table behavior but is not a substitute for radio or endurance testing.'],
     'Infrastructure Network':['settings-network','Configures the existing Wi-Fi network the surveyor can join for browser access.','Credentials are stored separately and are intentionally excluded from configuration export.'],
     'Device Identity':['device-identity','Configures the friendly local hostname used to reach the surveyor on networks that support mDNS.','Changing the hostname requires restart because mDNS advertisement is initialized at boot.'],
     'Device AP':['device-ap','Configures the surveyor\'s own Wi-Fi access point, which provides direct browser access when infrastructure Wi-Fi is unavailable.','Changing AP state, SSID, or password requires restart and can affect how you reconnect to the device.'],
@@ -6229,7 +6526,8 @@ String contextHelpScript() {
   function decorate(card){
     if(!card)return;
     const h=card.querySelector(':scope > h2'); if(!h||h.querySelector('.card-help-link'))return;
-    const key=baseTitle(h.textContent); const d=help[key]||['about-cards','This card groups information or controls related to '+key+'. Use it to understand or operate this part of the surveyor.','Developer view exposes additional implementation and diagnostic detail for this card.'];
+    const title=h.cloneNode(true);title.querySelectorAll('.card-move').forEach(n=>n.remove());
+    const key=baseTitle(title.textContent); const d=help[key]||['about-cards','This card groups information or controls related to '+key+'. Use it to understand or operate this part of the surveyor.',''];
     const a=document.createElement('a');a.className='card-help-link';
     if(location.pathname==='/help'){
       a.classList.add('help-return-link');a.href='#';a.textContent='←';a.title='Return to previous page';a.setAttribute('aria-label','Return to previous page');
@@ -6238,8 +6536,16 @@ String contextHelpScript() {
       a.href='/help#'+d[0];a.textContent='?';a.title='Help: '+key;a.setAttribute('aria-label','Help: '+key);
     }
     h.appendChild(a);
-    const std=document.createElement('div');std.className='card-help-standard';std.textContent=d[1];h.insertAdjacentElement('afterend',std);
-    const dev=document.createElement('div');dev.className='card-help-developer developer-only';dev.textContent=d[2];std.insertAdjacentElement('afterend',dev);
+    // Help sections already contain their explanation. Only add new developer detail.
+    const normalize=text=>(text||'').replace(/\s+/g,' ').trim().toLowerCase();
+    const existing=normalize(Array.from(card.querySelectorAll('p')).map(p=>p.textContent).join(' '));
+    let previous=h;
+    if(location.pathname!=='/help'&&d[1]&&!existing.includes(normalize(d[1]))){
+      const std=document.createElement('div');std.className='card-help-standard';std.textContent=d[1];h.insertAdjacentElement('afterend',std);previous=std;
+    }
+    if(d[2]&&normalize(d[2])!==normalize(d[1])&&!existing.includes(normalize(d[2]))){
+      const dev=document.createElement('div');dev.className='card-help-developer developer-only';dev.textContent=d[2];previous.insertAdjacentElement('afterend',dev);
+    }
     card.dataset.helpReady='1';
   }
   function run(root){(root||document).querySelectorAll('.card').forEach(decorate);}
@@ -6314,10 +6620,149 @@ void sendThemeControl() {
   );
 }
 
+// Literal streaming uses the existing response buffer; layout state lives only in the browser.
+void sendCardLayoutScript() {
+  diagnosticSendContent(R"LAYOUT(<script>
+(function(){
+  function start(){
+    const root=document.querySelector('.container');
+    if(!root)return;
+    const page=location.pathname==='/'?'/scan':location.pathname;
+    const storageKey='esp32-card-layout-v1:'+page;
+    const original=[],slots=[],known=new Map();
+    let dragging=null,target=null,after=false,startY=0,moved=false,scrollFrame=0,pointerY=0;
+    let saved=[];
+    try{const value=JSON.parse(localStorage.getItem(storageKey)||'[]');if(Array.isArray(value))saved=value.filter(x=>typeof x==='string');}catch(e){}
+    const status=document.createElement('span');status.className='layout-status';status.setAttribute('role','status');
+    const reset=document.createElement('button');reset.type='button';reset.textContent='Reset Layout';
+    reset.title='Restore the default card order on this page';
+    const controls=document.createElement('div');controls.className='layout-controls';
+    controls.append(reset,status);
+    const cards=()=>Array.from(root.children).filter(n=>known.get(n.dataset.layoutKey)===n);
+    const visible=()=>cards().filter(n=>n.getClientRects().length);
+    function arrange(order){
+      const seen=new Set(),list=[];
+      for(const key of order){if(known.has(key)&&!seen.has(key)){seen.add(key);list.push(known.get(key));}}
+      for(const key of original){if(!seen.has(key)&&known.has(key))list.push(known.get(key));}
+      list.forEach((card,i)=>root.insertBefore(card,slots[i]));
+    }
+    function save(){
+      saved=cards().map(c=>c.dataset.layoutKey);
+      try{localStorage.setItem(storageKey,JSON.stringify(saved));status.textContent='Layout saved in this browser.';}
+      catch(e){status.textContent='Layout changed for this visit; browser storage is unavailable.';}
+      if(page!=='/terminal')fetch('/api/ping',{cache:'no-store',keepalive:true}).catch(()=>{});
+    }
+    function move(card,other,beyond){
+      const list=cards().filter(c=>c!==card),index=list.indexOf(other);
+      if(index<0)return;
+      list.splice(index+(beyond?1:0),0,card);arrange(list.map(c=>c.dataset.layoutKey));
+    }
+    function clearTarget(){if(target)target.classList.remove('layout-before','layout-after');target=null;}
+    function finish(cancel){
+      if(!dragging)return;
+      const card=dragging.card;
+      if(!cancel&&moved&&target){move(card,target,after);save();}
+      card.classList.remove('layout-dragging');dragging.handle.setAttribute('aria-pressed','false');
+      dragging=null;clearTarget();cancelAnimationFrame(scrollFrame);scrollFrame=0;
+    }
+    function locate(y){
+      clearTarget();
+      const others=visible().filter(c=>c!==dragging.card);
+      if(!others.length)return;
+      target=others.find(c=>y<c.getBoundingClientRect().bottom)||others[others.length-1];
+      const box=target.getBoundingClientRect();after=y>box.top+box.height/2;
+      target.classList.add(after?'layout-after':'layout-before');
+    }
+    function autoScroll(){
+      if(!dragging||!moved)return;
+      const delta=pointerY<64?-12:(pointerY>innerHeight-64?12:0);
+      if(delta){window.scrollBy(0,delta);locate(pointerY);}
+      scrollFrame=requestAnimationFrame(autoScroll);
+    }
+    function refresh(){
+      let added=false;
+      for(const card of Array.from(root.children)){
+        if(!card.classList.contains('card'))continue;
+        const heading=card.querySelector(':scope > h2');if(!heading)continue;
+        if(!card.dataset.layoutKey){
+          const copy=heading.cloneNode(true);copy.querySelectorAll('a,button,.card-move').forEach(n=>n.remove());
+          const title=copy.textContent.split('?')[0].trim();
+          const base=card.id||title.toLowerCase().replace(/[^a-z0-9]+/g,'-');
+          let key=base,n=2;while(known.has(key))key=base+'-'+n++;
+          card.dataset.layoutKey=key;card.dataset.layoutTitle=title;
+          known.set(key,card);original.push(key);
+          const slot=document.createComment('card position');root.insertBefore(slot,card);slots.push(slot);added=true;
+        }
+        if(heading.querySelector('.card-move'))continue;
+        heading.classList.add('movable-heading');
+        const handle=document.createElement('button');handle.type='button';handle.className='card-move';
+        handle.textContent='↕';handle.title='Drag to move; use Up/Down arrows, Home or End when focused';
+        handle.setAttribute('aria-label','Move '+card.dataset.layoutTitle);
+        handle.setAttribute('aria-pressed','false');heading.prepend(handle);
+        handle.addEventListener('pointerdown',function(e){
+          if(e.button!==0||dragging||visible().length<2)return;
+          dragging={card,handle,pointer:e.pointerId};startY=pointerY=e.clientY;moved=false;
+          handle.focus({preventScroll:true});handle.setPointerCapture(e.pointerId);
+          handle.setAttribute('aria-pressed','true');card.classList.add('layout-dragging');e.preventDefault();
+        });
+        handle.addEventListener('lostpointercapture',()=>finish(true));
+        handle.addEventListener('keydown',function(e){
+          if(e.key==='Escape'){finish(true);return;}
+          if(dragging)return;
+          const list=visible(),index=list.indexOf(card);let destination=index;
+          if(e.key==='ArrowUp')destination=Math.max(0,index-1);
+          else if(e.key==='ArrowDown')destination=Math.min(list.length-1,index+1);
+          else if(e.key==='Home')destination=0;
+          else if(e.key==='End')destination=list.length-1;
+          else return;
+          e.preventDefault();
+          if(destination!==index){move(card,list[destination],destination>index);save();handle.focus({preventScroll:true});card.scrollIntoView({block:'nearest'});}
+        });
+      }
+      if(added)arrange(saved.length?saved:original);
+      reset.disabled=known.size<2;
+    }
+    document.addEventListener('pointermove',function(e){
+      if(!dragging||e.pointerId!==dragging.pointer)return;
+      pointerY=e.clientY;
+      if(!moved&&Math.abs(pointerY-startY)<6)return;
+      moved=true;e.preventDefault();locate(pointerY);
+      if(!scrollFrame)scrollFrame=requestAnimationFrame(autoScroll);
+    },{passive:false});
+    document.addEventListener('pointerup',e=>{if(dragging&&e.pointerId===dragging.pointer)finish(false);});
+    document.addEventListener('pointercancel',e=>{if(dragging&&e.pointerId===dragging.pointer)finish(true);});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape')finish(true);});
+    window.addEventListener('blur',()=>finish(true));
+    reset.addEventListener('click',()=>{finish(true);arrange(original);saved=[];
+      try{localStorage.removeItem(storageKey);status.textContent='Default layout restored.';}
+      catch(e){status.textContent='Default restored for this visit; browser storage is unavailable.';}
+    });
+    refresh();
+    if(known.size<2)return;
+    root.insertBefore(controls,cards()[0]);
+    new MutationObserver(refresh).observe(root,{childList:true,subtree:true});
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+})();
+</script>)LAYOUT");
+}
+
 // Purpose: Streams browser-side JavaScript for changing and persisting theme/view selections.
 void sendThemeScript() {
+  sendCardLayoutScript();
   diagnosticSendContent(
     "<script>"
+    "if(location.pathname!=='/terminal'){"
+      "let lastWebActivity=-1000;"
+      "const noteWebActivity=function(e){"
+        "if(!e.isTrusted||performance.now()-lastWebActivity<1000)return;"
+        "lastWebActivity=performance.now();"
+        "fetch('/api/ping',{cache:'no-store',keepalive:true}).catch(()=>{});"
+      "};"
+      "document.addEventListener('click',noteWebActivity,true);"
+      "document.addEventListener('input',noteWebActivity,true);"
+      "document.addEventListener('change',noteWebActivity,true);"
+    "}"
     "function applyTheme(v){"
       "const r=document.documentElement;"
       "if(v==='system'){"
@@ -6467,6 +6912,7 @@ ChannelAnalysis analyzeLatestWifiScan() {
     return cached;
   }
 
+  if (wifiInventoryMode()) { cached = a; cachedScanCounter = scanCounter; return cached; }
   const WifiObservation& latestObservation = compactHistoryRecord(historyCount - 1);
   if (latestObservation.scanSlot >= wifiScanMetadataCapacity) {
     cached = a;
@@ -6563,11 +7009,11 @@ void handleWebScan() {
   String newestLabel = "Never";
   String windowLabel = "-";
   if (historyCount > 0) {
-    const ScanRecord& oldest = historyRecord(0);
-    const ScanRecord& newest = historyRecord(historyCount - 1);
-    oldestLabel = observationAgeLabel(oldest.uptimeMs);
-    newestLabel = observationAgeLabel(newest.uptimeMs);
-    windowLabel = retainedWindowLabel(oldest.uptimeMs, newest.uptimeMs);
+    uint32_t oldestMs = wifiHistoryBoundaryMs(true);
+    uint32_t newestMs = wifiHistoryBoundaryMs(false);
+    oldestLabel = observationAgeLabel(oldestMs);
+    newestLabel = observationAgeLabel(newestMs);
+    windowLabel = retainedWindowLabel(oldestMs, newestMs);
   }
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -6601,8 +7047,8 @@ void handleWebScan() {
     "<div id=\"wifi-ap-drop-warning\" class=\"diagnostic-warning\"" + String(wifiApTableFullDrops ? "" : " style=\"display:none\"") + ">" + (wifiApTableFullDrops ? String(wifiApTableFullDrops) + " Wi-Fi observation(s) were not logged because no AP table slot was available." : String("")) + "</div></div>";
 
   card += "<div class=\"card\"><h2>History</h2>"
-    "<div class=\"row\"><span class=\"label\">Stored Observations</span><span id=\"wifi-history-count\" class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + "</span></div>"
-    "<div class=\"row\"><span class=\"label\">Retained Scans</span><span id=\"wifi-retained-scans\" class=\"value\">" + String(countRetainedScanGroups()) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">" + String(wifiInventoryMode() ? "AP Summaries" : "Stored Observations") + "</span><span id=\"wifi-history-count\" class=\"value\">" + String(historyCount) + " / " + String(scanHistoryCapacity) + "</span></div>"
+    "<div class=\"row\"><span class=\"label\">Retained Scans</span><span id=\"wifi-retained-scans\" class=\"value\">" + (wifiInventoryMode() ? String("Not retained") : String(countRetainedScanGroups())) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Oldest Observation</span><span id=\"wifi-oldest-data\" class=\"value\">" + htmlEscape(oldestLabel) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Newest Observation</span><span id=\"wifi-newest-data\" class=\"value\">" + htmlEscape(newestLabel) + "</span></div>"
     "<div class=\"row\"><span class=\"label\">Retained Time Window</span><span id=\"wifi-retained-window\" class=\"value\">" + htmlEscape(windowLabel) + "</span></div>"
@@ -6611,7 +7057,8 @@ void handleWebScan() {
   diagnosticSendContent(card);
   markWebResponsePhase("status-history");
 
-  diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2><p class=\"note\">Loading history after the page becomes interactive…</p></div>");
+  if (plotsEnabled && !wifiInventoryMode()) diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2><p class=\"note\">Loading history after the page becomes interactive…</p></div>");
+  else diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History</h2><p>Plots are disabled or unavailable in Network Inventory. See Settings &gt; Developer Memory and Survey Focus.</p></div>");
   markWebResponsePhase("rssi");
 
   diagnosticSendContent("<div class=\"card\" id=\"wifi-observed-card\"><h2>Observed Networks</h2><p class=\"note\">Loading retained network summary…</p></div>");
@@ -6655,7 +7102,7 @@ void handleWebScan() {
   diagnosticSendContent(";if(window.__WS38J)window.__WS38J.loader=true;if(window.__ws38jReport)window.__ws38jReport('loader','enter');let scan=");
   diagnosticSendContent(String(scanCounter));
   diagnosticSendContent(";const toggle=document.getElementById('live-updates-toggle');const plotBssid='");
-  diagnosticSendContent(jsEscape(selectedBSSID));
+  diagnosticSendContent(plotsEnabled && !wifiInventoryMode() ? jsEscape(selectedBSSID) : String(""));
   diagnosticSendContent("';let pollBusy=false;let requestBusy=false;let lastDetailRefresh=0;const requestQueue=[];const queued={};"
     "const scanButton=document.getElementById('wifi-scan-now');const scanState=document.getElementById('wifi-scan-state');"
     "const intervalInput=document.getElementById('interval');const intervalApply=document.getElementById('wifi-interval-apply');"
@@ -6664,7 +7111,7 @@ void handleWebScan() {
     "function show(id,on,msg){const e=document.getElementById(id);if(!e)return;e.style.display=on?'':'none';e.textContent=on?msg:'';}"
     "function showScanState(active,msg){if(scanState){scanState.textContent=msg||'';scanState.classList.toggle('active',!!active);}if(scanButton)scanButton.disabled=!!active;}"
     "function applyStatus(s){text('wifi-scans-session',s.scan);text('wifi-last-scan',s.lastScan);text('wifi-history-count',s.records+' / '+s.capacity);"
-    "text('wifi-retained-scans',s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-newest-data',s.newestData);text('wifi-retained-window',s.retainedWindow);"
+    "text('wifi-retained-scans',s.inventory?'Not retained':s.retainedScans);text('wifi-oldest-data',s.oldestData);text('wifi-newest-data',s.newestData);text('wifi-retained-window',s.retainedWindow);"
     "text('wifi-last-scan-results',s.lastFound+' found; '+s.lastLogged+' logged; '+s.lastDropped+' dropped');"
     "text('wifi-last-ap-results',s.lastNewAps+' new; '+s.lastSeenAps+' previously seen');"
     "text('wifi-last-filter-results',s.lastHiddenSkipped+' hidden skipped; '+s.lastReclaimedAps+' slots reclaimed');"
@@ -6794,6 +7241,10 @@ void handleWifiPlotFragment() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", "");
 
+  if (wifiInventoryMode()) {
+    diagnosticSendContent("<h2>Network Inventory</h2><p>One summary per AP; individual RSSI measurements are not retained. Use Signal History or Balanced Survey for a timeline.</p>");
+    diagnosticSendContent(""); endWebResponseProfile(); return;
+  }
   if (selectedBSSID.length() > 0) {
     NetworkSummary summary = {};
     if (buildNetworkSummary(selectedBSSID, summary)) {
@@ -6931,6 +7382,10 @@ void handleBLEScanCsv() {
 
 // Purpose: Generates and streams the SVG RSSI history plot for one selected BLE address.
 void sendBleRssiHistoryPlot(const String& selectedAddress) {
+  if (!plotsEnabled) {
+    diagnosticSendContent("<p>Plots are disabled. Enable them in Settings &gt; Developer Memory and restart. Survey measurements and CSV exports remain available.</p>");
+    return;
+  }
   const int SVG_WIDTH = 720, SVG_HEIGHT = 280;
   const int LEFT = 58, RIGHT = 20, TOP = 20, BOTTOM = 45;
   const int plotWidth = SVG_WIDTH - LEFT - RIGHT;
@@ -7046,8 +7501,8 @@ void sendBleSummaryTable() {
     String row;
     row.reserve(900);
     row += "<tr>";
-    row += "<td><a href=\"" + plotUrl + "\">" + htmlEscape(displayName) + "</a></td>";
-    row += "<td class=\"address\"><a href=\"" + plotUrl + "\">" + htmlEscape(address) + "</a></td>";
+    row += "<td>" + (plotsEnabled ? "<a href=\"" + plotUrl + "\">" : String("")) + htmlEscape(displayName) + (plotsEnabled ? "</a></td>" : "</td>");
+    row += "<td class=\"address\">" + (plotsEnabled ? "<a href=\"" + plotUrl + "\">" : String("")) + htmlEscape(address) + (plotsEnabled ? "</a></td>" : "</td>");
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.latestRssi) + "\">" + String(summary.signal.latestRssi) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(avgRssi, 1) + "\">" + String(avgRssi, 1) + " dBm</td>";
     row += "<td class=\"signal\" data-sort=\"" + String(summary.signal.samples) + "\">" + String(summary.signal.samples) + "</td>";
@@ -7164,7 +7619,9 @@ void handleBLESurvey() {
     identity = (selectedName.length() && selectedName != "(unnamed)") ? selectedName : selectedAddress;
   }
   diagnosticSendContent("<div class=\"card\" id=\"rssi-plot\"><h2>RSSI History" + (identity.length() ? String(" &mdash; ") + htmlEscape(identity) : String("")) + "</h2>");
-  if (selectedAddress.length()) {
+  if (!plotsEnabled) {
+    sendBleRssiHistoryPlot(selectedAddress);
+  } else if (selectedAddress.length()) {
     diagnosticSendContent("<div class=\"row developer-only\"><span class=\"label\">BLE Address</span><span class=\"value\">" + htmlEscape(selectedAddress) + "</span></div>");
     sendBleRssiHistoryPlot(selectedAddress);
     diagnosticSendContent("<div class=\"note\">Select a device in Observed Devices to plot that device's retained RSSI history. Hover over a point on the graph to see details for that observation.</div>");
@@ -7193,7 +7650,7 @@ void handleBLESurvey() {
   sendThemeScript();
   {
     String refreshScript =
-      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + jsEscape(selectedAddress) + "';let pollBusy=false;let requestBusy=false;const requestQueue=[];const queued={};const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
+      "<script>(function(){let scan=" + String(bleScanCounter) + ";const toggle=document.getElementById('live-updates-toggle');const address='" + (plotsEnabled ? jsEscape(selectedAddress) : String("")) + "';let pollBusy=false;let requestBusy=false;const requestQueue=[];const queued={};const intervalInput=document.getElementById('ble-interval');const intervalApply=document.getElementById('ble-interval-apply');const intervalState=document.getElementById('ble-interval-save-state');"
       "function text(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
       "function applyStatus(s){text('ble-scans-session',s.scan);text('ble-last-scan',s.lastScan);text('ble-history-count',s.records+' / '+s.capacity);text('ble-retained-scans',s.retainedScans);if(intervalInput&&document.activeElement!==intervalInput)intervalInput.value=s.interval;text('ble-scan-state',s.scanning?'Scanning…':'');text('ble-status-note',s.scanStatus||'');text('ble-dropped-observations',s.addressDrops);text('ble-address-table',s.addressReferenced+' / '+s.addressCapacity+' referenced; peak '+s.addressPeak+'; " + String(bleAddressTableCapacity*sizeof(BleAddressEntry)/1024.0,1) + " KB');text('ble-metadata-table',s.metadataReferenced+' / '+s.metadataCapacity+' referenced; peak '+s.metadataPeak);text('ble-csv-count',s.csvExports);text('ble-csv-last',s.lastCsv);text('ble-free-heap',(s.freeHeap/1024).toFixed(1)+' KB');text('ble-largest-block',(s.largestBlock/1024).toFixed(1)+' KB');text('ble-infra-status',s.connected?'Connected':'Not connected');text('ble-infra-ssid',s.connected?s.stationSSID:'-');text('ble-infra-rssi',s.connected?s.stationRssi+' dBm':'-');text('ble-infra-channel',s.connected?s.stationChannel:'-');text('ble-infra-bssid',s.connected?s.stationBSSID:'-');}"
       "function saveInterval(){if(!intervalInput)return;let v=parseInt(intervalInput.value,10);if(!Number.isFinite(v))return;v=Math.max(5,Math.min(3600,v));intervalInput.value=v;if(intervalState)intervalState.textContent='Saving…';fetch('/api/ble/interval?interval='+encodeURIComponent(v),{method:'POST',cache:'no-store'}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(s=>{intervalInput.value=s.interval;if(intervalState){intervalState.textContent='Saved';setTimeout(()=>{intervalState.textContent='';},1400);}}).catch(()=>{if(intervalState)intervalState.textContent='Save failed';});}"
@@ -7585,7 +8042,7 @@ void handleDiagnosticsPage() {
     "<div class=\"note\">Restart checkpoints preserve current RAM survey history through controlled reboots and are deleted after successful restore.</div></div>");
 
   String historyTestTools = "<div class=\"card developer-only\"><h2>History Test Tools</h2>"
-    "<div class=\"test-tool-group\"><h3>Wi-Fi History</h3><div class=\"test-tool-actions\">"
+    "<div class=\"test-tool-group\"><h3>Wi-Fi Storage</h3><div class=\"test-tool-actions\">"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"50\"><button type=\"submit\">Fill to 50%</button></form>"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"75\"><button type=\"submit\">Fill to 75%</button></form>"
     "<form action=\"/history-prefill\" method=\"post\"><input type=\"hidden\" name=\"radio\" value=\"wifi\"><input type=\"hidden\" name=\"percent\" value=\"95\"><button type=\"submit\">Fill to 95%</button></form>"
@@ -7599,7 +8056,7 @@ void handleDiagnosticsPage() {
   } else {
     historyTestTools += "<div class=\"test-tool-group\"><h3>Bluetooth History</h3><div class=\"note\">Enable Bluetooth Survey to use Bluetooth history prefill.</div></div>";
   }
-  historyTestTools += "<div class=\"note\"><strong>TEST FEATURE:</strong> inserts synthetic TEST-PREFILL observations into the real compact history. Synthetic data is not a substitute for radio/endurance testing.</div></div>";
+  historyTestTools += "<div class=\"note\"><strong>TEST FEATURE:</strong> Works in every Survey Focus: Network Inventory fills distinct TEST-PREFILL AP summaries; Signal History and Balanced Survey fill measurements. Targets are 50, 75, 95 or 99% of current capacity. Adds test data to real survey storage; existing data may age out. Clear History removes both real and test data. Plots and terminal capture are not required. Synthetic data is not a substitute for radio/endurance testing.</div></div>";
   diagnosticSendContent(historyTestTools);
 
   diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
@@ -7658,6 +8115,9 @@ struct PortableConfig {
   bool captureHiddenNetworks;
   bool statusLedEnabled;
   bool liveUpdatesEnabled;
+  unsigned long terminalBufferBytes;
+  bool plotsEnabled;
+  unsigned long surveyFocus;
   unsigned long wifiPowerMode;
   unsigned long wifiAccessWindowSeconds;
   bool diagnosticStreamingEnabled;
@@ -7698,6 +8158,11 @@ PortableConfig readPersistedPortableConfig() {
       preferences.getBool("ledEnabled", statusLedEnabled);
   c.wifiAccessWindowSeconds = preferences.getUInt("wifiWindow", 60);
   if (c.wifiAccessWindowSeconds < 5 || c.wifiAccessWindowSeconds > 3600) c.wifiAccessWindowSeconds = 60;
+  c.terminalBufferBytes = preferences.getUInt("termBytes", DEFAULT_TERMINAL_BUFFER_BYTES);
+  if (!validTerminalBufferBytes(c.terminalBufferBytes)) c.terminalBufferBytes = DEFAULT_TERMINAL_BUFFER_BYTES;
+  c.plotsEnabled = preferences.getBool("plots", false);
+  c.surveyFocus = preferences.getUChar("focus", 1);
+  if (c.surveyFocus > 2) c.surveyFocus = 1;
   c.wifiPowerMode = preferences.getUChar("wifiPower", 0);
   if (c.wifiPowerMode > 2) c.wifiPowerMode = 0;
   c.liveUpdatesEnabled =
@@ -7753,6 +8218,9 @@ String portableConfigJson(const PortableConfig& c) {
   json += "  \"bluetoothSurveyEnabled\":" + String(c.bluetoothSurveyEnabled ? "true" : "false") + ",\n";
   json += "  \"captureHiddenNetworks\":" + String(c.captureHiddenNetworks ? "true" : "false") + ",\n";
   json += "  \"statusLedEnabled\":" + String(c.statusLedEnabled ? "true" : "false") + ",\n";
+  json += "  \"terminalBufferBytes\":" + String(c.terminalBufferBytes) + ",\n";
+  json += "  \"plotsEnabled\":" + String(c.plotsEnabled ? "true" : "false") + ",\n";
+  json += "  \"surveyFocus\":" + String(c.surveyFocus) + ",\n";
   json += "  \"wifiPowerMode\":" + String(c.wifiPowerMode) + ",\n";
   json += "  \"wifiAccessWindowSeconds\":" + String(c.wifiAccessWindowSeconds) + ",\n";
   json += "  \"liveUpdatesEnabled\":" + String(c.liveUpdatesEnabled ? "true" : "false") + ",\n";
@@ -7801,6 +8269,8 @@ public:
     bool seenCaptureHidden = false;
     bool seenLed = false;
     bool seenLive = false;
+    bool seenFocus = false;
+    bool seenTerminalBuffer = false, seenPlots = false;
     bool seenPower = false;
     bool seenWindow = false;
     bool seenDiagEnabled = false;
@@ -7874,6 +8344,20 @@ public:
         seenWindow = true;
         if (!parseUnsigned(out.wifiAccessWindowSeconds) || out.wifiAccessWindowSeconds < 5 || out.wifiAccessWindowSeconds > 3600)
           return fail("wifiAccessWindowSeconds must be an integer from 5 to 3600.");
+      } else if (key == "terminalBufferBytes") {
+        if (seenTerminalBuffer) return fail("Duplicate terminalBufferBytes.");
+        seenTerminalBuffer = true;
+        if (!parseUnsigned(out.terminalBufferBytes) || !validTerminalBufferBytes(out.terminalBufferBytes))
+          return fail("terminalBufferBytes must be 0, 1024, 2048, 8192, 16384 or 32768.");
+      } else if (key == "plotsEnabled") {
+        if (seenPlots) return fail("Duplicate plotsEnabled.");
+        seenPlots = true;
+        if (!parseBool(out.plotsEnabled)) return fail("plotsEnabled must be true or false.");
+      } else if (key == "surveyFocus") {
+        if (seenFocus) return fail("Duplicate surveyFocus.");
+        seenFocus = true;
+        if (!parseUnsigned(out.surveyFocus) || out.surveyFocus > 2)
+          return fail("surveyFocus must be 0 (Signal History), 1 (Balanced Survey), or 2 (Network Inventory).");
       } else if (key == "wifiPowerMode") {
         if (seenPower) return fail("Duplicate wifiPowerMode.");
         seenPower = true;
@@ -8235,10 +8719,29 @@ void handleConfigImport() {
     appliedCount++;
   }
 
+  if (requested.surveyFocus != previous.surveyFocus) {
+    preferences.begin("survey", false);
+    preferences.putUChar("focus", (uint8_t)requested.surveyFocus);
+    preferences.end();
+    appliedCount++;
+    restartRequired = true;
+    restartReason += "Survey Focus (history resets)";
+  }
+  if (requested.terminalBufferBytes != previous.terminalBufferBytes || requested.plotsEnabled != previous.plotsEnabled) {
+    preferences.begin("survey", false);
+    preferences.putUInt("termBytes", requested.terminalBufferBytes);
+    preferences.putBool("plots", requested.plotsEnabled);
+    preferences.end();
+    appliedCount++;
+    restartRequired = true;
+    if (restartReason.length()) restartReason += ", ";
+    restartReason += "Developer memory settings";
+  }
   if (requested.bluetoothSurveyEnabled != previous.bluetoothSurveyEnabled) {
     saveBleSurveyEnabled(requested.bluetoothSurveyEnabled);
     appliedCount++;
     restartRequired = true;
+    if (restartReason.length()) restartReason += ", ";
     restartReason += "Bluetooth survey mode";
   }
 
@@ -8492,15 +8995,25 @@ void handleStatusJsonExport() {
   diagnosticSendContent(",\"observationCapacity\":" + String(scanHistoryCapacity));
   diagnosticSendContent(",\"scanGroupsRetained\":" + String(countRetainedScanGroups()));
   diagnosticSendContent(",\"historyAllocatedBytes\":" + String(wifiHistoryAllocatedBytes()));
-  diagnosticSendContent(",\"observationRecordBytes\":" + String(sizeof(WifiObservation)));
+  diagnosticSendContent(",\"observationRecordBytes\":" + String(wifiInventoryMode() ? 0 : sizeof(WifiObservation)));
+  diagnosticSendContent(",\"apSummaryRecordBytes\":" + String(sizeof(WifiApEntry)));
+  diagnosticSendContent(",\"historicalMeasurements\":" + String(wifiInventoryMode() ? 0 : historyCount));
+  diagnosticSendContent(",\"summaryCount\":" + String(wifiApCount));
+  diagnosticSendContent(",\"surveyFocus\":" + jsonQuoted(surveyFocusName()));
+  diagnosticSendContent(",\"inventory\":" + String(wifiInventoryMode() ? "true" : "false"));
+  diagnosticSendContent(",\"poolBytes\":" + String(wifiStoragePoolBytes));
+  diagnosticSendContent(",\"terminalBufferBytes\":" + String(surveySerial.bufferCapacity()));
+  diagnosticSendContent(",\"plotsEnabled\":" + String(plotsEnabled ? "true" : "false"));
+  diagnosticSendContent(",\"apPolicyLimit\":" + String(wifiApPolicyLimit));
+  diagnosticSendContent(",\"apGrowthCount\":" + String(wifiPoolGrowthCount));
   diagnosticSendContent(",\"scanMetadataSlots\":" + String(wifiScanMetadataCapacity));
   if (historyCount > 0) {
-    const ScanRecord& oldest = historyRecord(0);
-    const ScanRecord& newest = historyRecord(historyCount - 1);
-    diagnosticSendContent(",\"oldestRecordUptimeMs\":" + String(oldest.uptimeMs));
-    diagnosticSendContent(",\"newestRecordUptimeMs\":" + String(newest.uptimeMs));
+    uint32_t oldestMs = wifiHistoryBoundaryMs(true);
+    uint32_t newestMs = wifiHistoryBoundaryMs(false);
+    diagnosticSendContent(",\"oldestRecordUptimeMs\":" + String(oldestMs));
+    diagnosticSendContent(",\"newestRecordUptimeMs\":" + String(newestMs));
     diagnosticSendContent(",\"retainedTimeWindowMs\":" +
-      String((uint32_t)(newest.uptimeMs - oldest.uptimeMs)));
+      String((uint32_t)(newestMs - oldestMs)));
   }
   diagnosticSendContent(",\"apTableUsed\":" + String(wifiApCount));
   diagnosticSendContent(",\"apTableCapacity\":" + String(wifiApTableCapacity));
@@ -8665,6 +9178,7 @@ void handleStatusJsonExport() {
 
   diagnosticSendContent("  \"webStallTrace\":{");
   diagnosticSendContent("\"sendThresholdMs\":" + String(WEB_STALL_SEND_THRESHOLD_MS));
+  diagnosticSendContent(",\"runtimeLagThresholdMs\":" + String(LAG_CAPTURE_THRESHOLD_MS));
   diagnosticSendContent(",\"responseThresholdMs\":" + String(WEB_STALL_RESPONSE_THRESHOLD_MS));
   diagnosticSendContent(",\"arrivalThresholdMs\":" + String(WEB_STALL_ARRIVAL_THRESHOLD_MS));
   diagnosticSendContent(",\"severeHangThresholdMs\":" + String(WEB_SEVERE_HANG_THRESHOLD_MS));
@@ -8688,6 +9202,10 @@ void handleStatusJsonExport() {
     diagnosticSendContent(",\"largestFreeBlockBytes\":" + String(record.largestFreeBlockBytes));
     diagnosticSendContent(",\"wifiScanActive\":");
     diagnosticSendContent(record.wifiScanActive ? "true" : "false");
+    diagnosticSendContent(",\"bleScanActive\":" + String(record.bleScanActive ? "true" : "false"));
+    diagnosticSendContent(",\"radioSleeping\":" + String(record.radioSleeping ? "true" : "false"));
+    diagnosticSendContent(",\"powerMode\":" + String(record.powerMode));
+    diagnosticSendContent(",\"radioWindowRemainingMs\":" + String(record.radioWindowRemainingMs));
     diagnosticSendContent("}");
   }
   diagnosticSendContent("]},\n");
@@ -8721,6 +9239,37 @@ void handleStatusJsonExport() {
 }
 
 // Purpose: Builds the Settings page with ordinary configuration in Standard and maintenance detail in deeper views.
+// Parse signed decimal input without overflow, then clamp only valid numbers.
+bool parseBoundedSeconds(String value, uint32_t minimum, uint32_t maximum, uint32_t& seconds, bool& adjusted) {
+  value.trim();
+  if (value.length() == 0) return false;
+  size_t index = 0;
+  bool negative = value[0] == '-';
+  if (negative || value[0] == '+') index++;
+  if (index == value.length()) return false;
+  uint32_t parsed = 0;
+  for (; index < value.length(); ++index) {
+    if (value[index] < '0' || value[index] > '9') return false;
+    // Saturation keeps even arbitrarily large inputs safe.
+    if (parsed <= maximum) parsed = parsed * 10 + (value[index] - '0');
+  }
+  adjusted = (negative && parsed != 0) || parsed < minimum || parsed > maximum;
+  seconds = negative || parsed < minimum ? minimum : (parsed > maximum ? maximum : parsed);
+  return true;
+}
+
+bool terminalSeconds(const String& value, uint32_t minimum, uint32_t maximum, uint32_t& seconds) {
+  bool adjusted = false;
+  if (!parseBoundedSeconds(value, minimum, maximum, seconds, adjusted)) {
+    Serial.println("Enter a whole number of seconds."); return false;
+  }
+  if (adjusted) {
+    Serial.print("Adjusted to "); Serial.print(seconds); Serial.print("s (allowed: ");
+    Serial.print(minimum); Serial.print(".."); Serial.print(maximum); Serial.println("s).");
+  }
+  return true;
+}
+
 bool parseWifiAccessWindow(const String& value, uint32_t& seconds) {
   if (value.length() == 0 || value.length() > 4) return false;
   uint32_t parsed = 0;
@@ -8750,6 +9299,37 @@ void handleWifiPowerSetting() {
   server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>Wi-Fi power settings saved</h1><p>The setting applies now. Ultra uses the configured access window. Command: wifi on renews the window; power normal restores continuous access.</p><a href='/settings'>Return to Settings</a>");
 }
 
+void sendDeveloperMemorySettings() {
+  const PortableConfig saved = readPersistedPortableConfig();
+  diagnosticSendContent("<div class=\"card developer-only\" id=\"developer-memory\"><h2>Developer Memory</h2><form action=\"/developer-memory\" method=\"post\"><label for=\"terminal-bytes\">Terminal capture buffer</label><select id=\"terminal-bytes\" name=\"terminalBytes\">");
+  const uint32_t sizes[] = {0, 1024, 2048, 8192, 16384, 32768};
+  const char* labels[] = {"Off (0 bytes)", "Minimal (1 KiB)", "Small (2 KiB)", "Troubleshooting (8 KiB)", "Extended (16 KiB)", "Maximum (32 KiB)"};
+  for (size_t i = 0; i < 6; ++i) diagnosticSendContent(String("<option value=\"") + String(sizes[i]) + "\"" + (saved.terminalBufferBytes == sizes[i] ? " selected" : "") + ">" + labels[i] + "</option>");
+  diagnosticSendContent(String("</select><label for=\"plots-enabled\">Signal plots</label><select id=\"plots-enabled\" name=\"plotsEnabled\"><option value=\"0\"") + (!saved.plotsEnabled ? " selected" : "") + ">Disabled</option><option value=\"1\"" + (saved.plotsEnabled ? " selected" : "") + ">Enabled</option></select><button type=\"submit\">Save for Next Restart</button></form>");
+  diagnosticSendContent("<p>Active now: " + String(surveySerial.bufferCapacity()) + " bytes of terminal capture; plots " + String(plotsEnabled ? "enabled" : "disabled") + ". Saved choices apply at the next restart. <a href=\"/system\">Restart from System</a>.</p>");
+  if (saved.terminalBufferBytes != terminalBufferBytes || saved.plotsEnabled != plotsEnabled) diagnosticSendContent("<p><strong>Restart required to apply saved choices.</strong></p>");
+  if (surveySerial.bufferCapacity() != terminalBufferBytes) diagnosticSendContent("<p>Terminal capture allocation failed at startup; capture is off. Choose a smaller buffer and restart.</p>");
+  diagnosticSendContent("<p>Default: 1 KiB capture and plots disabled. Off allocates no terminal buffer; USB serial and web commands still work, but command output is only visible over USB. Larger buffers retain more troubleshooting output and leave less memory for surveys. Disabling plots avoids graph-generation memory peaks; measurement capture and CSV export continue. Download CSV before changing memory allocation and restarting: a smaller survey pool may not restore all checkpoint data.</p></div>");
+}
+
+void handleDeveloperMemorySettings() {
+  markExplicitUserInteraction();
+  const String bytes = server.arg("terminalBytes");
+  const String plots = server.arg("plotsEnabled");
+  const uint32_t requested = (uint32_t)bytes.toInt();
+  if (bytes != String(requested) || !validTerminalBufferBytes(requested) || (plots != "0" && plots != "1")) {
+    server.send(400, "text/plain", "Select a supported terminal buffer size and plot setting.");
+    return;
+  }
+  if (!preferences.begin("survey", false)) { server.send(500, "text/plain", "Unable to open settings."); return; }
+  const bool ok = preferences.putUInt("termBytes", requested) == sizeof(uint32_t) &&
+    preferences.putBool("plots", plots == "1") == sizeof(bool);
+  preferences.end();
+  if (!ok) { server.send(500, "text/plain", "Unable to save all settings. Review saved choices and retry."); return; }
+  server.sendHeader("Location", "/settings#developer-memory");
+  server.send(303, "text/plain", "Saved. Restart from System to apply.");
+}
+
 void handleSettingsPage() {
   beginWebResponseProfile("/settings");
   markExplicitUserInteraction();
@@ -8760,13 +9340,14 @@ void handleSettingsPage() {
   diagnosticSendContent("</head><body><div class=\"container\">"); sendSiteNavigation("settings"); diagnosticSendContent("<h1>Settings</h1>");
   markWebResponsePhase("header");
 
+  sendDeveloperMemorySettings();
   String s; s.reserve(1200);
   diagnosticSendContent("<div class=\"card\"><h2>Wi-Fi Power Saving</h2><form action=\"/wifi-power\" method=\"post\"><label for=\"wifi-power\">Mode</label><select id=\"wifi-power\" name=\"mode\">");
   const char* powerLabels[] = {"Normal - continuous Wi-Fi", "Connected power saving - web stays available", "Ultra - Wi-Fi off between scans"};
   for (uint8_t mode = 0; mode < 3; ++mode) {
     diagnosticSendContent("<option value=\"" + String(mode) + "\"" + (wifiPowerMode == mode ? " selected" : "") + ">" + powerLabels[mode] + "</option>");
   }
-  diagnosticSendContent("</select><label for=\"wifi-window\">Access window (seconds)</label><input id=\"wifi-window\" name=\"window\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(wifiAccessWindowSeconds) + "\" required><button type=\"submit\">Save Power Settings</button></form><p>Ultra keeps Wi-Fi awake for the configured window after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Page polling does not extend the window. Rejoining Wi-Fi takes part of this time. Use <code>wifi on</code> to reopen the window or <code>power normal</code> for continuous access.</p><p>For off time, set the scan interval longer than the access window. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
+  diagnosticSendContent("</select><label for=\"wifi-window\">Access window (seconds)</label><input id=\"wifi-window\" name=\"window\" type=\"number\" min=\"5\" max=\"3600\" value=\"" + String(wifiAccessWindowSeconds) + "\" required><button type=\"submit\">Save Power Settings</button></form><p>Ultra keeps Wi-Fi awake for the configured window after each scan attempt, then turns off both infrastructure Wi-Fi and the Device AP until the next scan. Non-terminal web activity, including page updates and button clicks, keeps Wi-Fi on for five minutes, then the configured access-window timeout begins. Each interaction restarts the five-minute hold. Terminal viewing and polling do not extend it. Rejoining Wi-Fi takes part of this time. Use <code>wifi on</code> to reopen the window or <code>power normal</code> for continuous access.</p><p>For off time, set the scan interval longer than the access window. Connected mode uses modem sleep; traffic and an enabled Device AP limit savings. BLE remains separately controlled, and the CPU stays awake. A response already being sent can delay shutdown.</p></div>");
   String configuredStationSSID = preferences.getString("ssid", "");
   s += "<div class=\"card\"><h2>Infrastructure Wi-Fi</h2><div class=\"row\"><span class=\"label\">Configured Network</span><span class=\"value\">" + htmlEscape(configuredStationSSID.length() ? configuredStationSSID : String("None")) + "</span></div>";
   if (WiFi.status()==WL_CONNECTED) {
@@ -8802,6 +9383,12 @@ void handleSettingsPage() {
     "<div class=\"note developer-only\">The selection is stored in NVS. BLE creates a persistent heap allocation at boot, so survey histories are sized after the selected radio mode is initialized.</div></div>";
   diagnosticSendContent(s); s.remove(0);
   markWebResponsePhase("survey-mode");
+
+  diagnosticSendContent("<div class=\"card\"><h2>Survey Focus</h2><form class=\"controls\" action=\"/survey-focus\" method=\"post\"><label for=\"survey-focus\">Prioritize</label><select id=\"survey-focus\" name=\"focus\">");
+  const char* focusValues[] = {"history", "balanced", "inventory"};
+  const char* focusLabels[] = {"Signal History", "Balanced Survey", "Network Inventory"};
+  for (uint8_t i = 0; i < 3; i++) diagnosticSendContent(String("<option value=\"") + focusValues[i] + "\"" + (surveyFocus == i ? " selected" : "") + ">" + focusLabels[i] + "</option>");
+  diagnosticSendContent("</select><button type=\"submit\">Save &amp; Restart (clear history)</button></form><p><strong>Signal History:</strong> Protect more memory for repeated signal measurements.</p><p><strong>Balanced Survey (default):</strong> Make room for more APs by shortening measurement history.</p><p><strong>Network Inventory:</strong> Keep one updated summary per AP, with first/last seen, RSSI statistics and sighting count. No RSSI timeline; CSV contains one row per AP.</p><p>AP entries and measurements share a fixed memory budget. AP capacity grows as needed; older measurements are removed when space is needed. Inventory replaces the stalest AP when full. Bluetooth retains its separate memory budget.</p><p>Changing focus restarts the device and clears retained survey history and its restart checkpoint. Download CSV first. Saving the current choice makes no changes.</p><div class=\"row\"><span class=\"label\">Current storage</span><span class=\"value\">" + String(wifiStoragePoolBytes / 1024.0, 1) + " KB / " + String(wifiApCount) + " APs / " + String(historyCount) + (wifiInventoryMode() ? " summaries" : " measurements") + "</span></div></div>");
 
   s += "<div class=\"card advanced-only\"><h2>Wi-Fi History Capture</h2><form class=\"controls\" action=\"/wifi-capture-settings\" method=\"post\">"
     "<div class=\"control\"><label><input type=\"checkbox\" name=\"captureHidden\" value=\"1\" " + String(captureHiddenNetworks ? "checked" : "") + "> Include hidden networks in history</label></div>"
@@ -8963,6 +9550,31 @@ void handleBleModeChange() {
     "if(r.ok){location.replace('/ble');return;}setTimeout(retry,1000);"
     "}).catch(function(){setTimeout(retry,1000);});},2500);})();</script></body></html>");
 
+  requestControlledRestart(1000);
+}
+
+void handleSurveyFocusSetting() {
+  markExplicitUserInteraction();
+  String focus = server.arg("focus");
+  if (focus != "history" && focus != "balanced" && focus != "inventory") {
+    server.send(400, "text/plain", "Choose Signal History, Balanced Survey or Network Inventory."); return;
+  }
+  uint8_t requested = focus == "history" ? 0 : (focus == "balanced" ? 1 : 2);
+  if (requested == surveyFocus) {
+    server.sendHeader("Location", "/settings");
+    server.send(303, "text/plain", "Survey focus unchanged."); return;
+  }
+  // The form explicitly warns that changing allocation clears both histories.
+  String detail;
+  if (!discardSurveySessionCheckpoint(detail)) {
+    server.send(500, "text/plain", "Could not clear the restart checkpoint. Focus unchanged."); return;
+  }
+  preferences.begin("survey", false);
+  size_t saved = preferences.putUChar("focus", requested);
+  preferences.end();
+  if (!saved) { server.send(500, "text/plain", "Could not save survey focus."); return; }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>Survey focus saved</h1><p>Restarting with fresh survey history. Reconnect to the device, then return to Settings.</p><a href='/settings'>Return to Settings</a>");
   requestControlledRestart(1000);
 }
 
@@ -9138,10 +9750,24 @@ void handleHelpPage() {
   diagnosticSendContent("</tbody></table></div><p><strong>Example:</strong> <code>STATUS up=34947644 wifiScan=0 bleScan=0 wifiObs=2220/2220 bleObs=0/0 bleScans=0 sta=1 loopGapLast=6 loopGapMax=166 heap=62248 min=48568 largest=47092</code></p></div>");
 
   const char* sections[] = {
-    "about-cards|About cards|Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. On surveyor pages, use the ? button on a card to jump into Help; on Help, use the return arrow to go back.",
+    "survey-button|Survey Button|A short press requests a Wi-Fi scan. Hold the survey button to open the Wi-Fi access window. The hardware button does not erase survey history.",
+    "serial-terminal|Serial Terminal|View captured firmware output and send serial commands over the web. Capture Off still allows commands, but output is only available over USB. Browser pause does not stop device logging. ROM and library UART logs are not captured. Terminal polling does not extend the Wi-Fi access window.",
+    "developer-memory|Developer Memory|Choose Off, 1, 2, 8, 16 or 32 KiB of terminal capture, and enable or disable Wi-Fi and Bluetooth plots. Save, then restart from System. Defaults are 1 KiB and plots off. Smaller capture buffers leave more memory for surveys; disabled plots avoid temporary graph allocations.",
+    "survey-focus|Survey Focus|Signal History favors repeated measurements; Balanced Survey trades some history for more APs; Network Inventory keeps one updated summary per BSSID and replaces the stalest AP when full. Changing focus restarts and clears survey history.",
+    "wifi-power|Wi-Fi Power Saving|Normal keeps Wi-Fi on; Connected uses modem sleep; Ultra stops Wi-Fi between scans. Non-terminal activity restarts a five-minute hold, followed by the configured timeout. Terminal polling does not renew it.",
+    "interface-test-tools|Interface Test Tools|Run the status LED test from Diagnostics. LED enable is configured in Settings; disabling the LED also disables diagnostic flashes.",
+    "session-tools|Session & Checkpoint Tools|Save a temporary checkpoint or discard it explicitly. Successful restart restoration deletes the checkpoint. Storage mode and reduced capacity can prevent restoration.",
+    "export-diagnostics|Export Diagnostics|Shows CSV export count, rows, bytes and duration for each radio. Download survey data before memory changes or destructive restarts.",
+    "web-diagnostics|Web Interface|Page generation and transport timings, browser reports and bounded stall traces help diagnose slow pages. Compare free heap and largest blocks before and after expensive pages.",
+    "flash-storage-diagnostics|Flash & Storage|Shows firmware partition space, checkpoint filesystem usage and restore status. Checkpoints preserve survey continuity for a restart; CSV is the portable survey export.",
+    "infrastructure-diagnostics|Infrastructure Connectivity|Inspect station connection, disconnect reasons, DHCP outcomes and bounded recovery attempts. Intentional Ultra sleep is not counted as a connection failure.",
+    "survey-scheduler-diagnostics|Survey Scheduler|Compare scheduled scans, retries, main-loop gaps and user-interaction deferrals. Live Updates change browser refresh, not radio scan intervals.",
+    "ble-survey-diagnostics|Bluetooth Survey Engine|Shows Bluetooth scan timing, capture and retention counts, address storage and health. Bluetooth uses a separate storage budget.",
+    "wifi-survey-diagnostics|Wi-Fi Survey Engine|Scan completion, failures, dropped observations and history integrity help distinguish radio results from storage and scheduling problems.",
+    "about-cards|About cards|Drag the arrow handle beside a card title to reorder cards on this page. On a keyboard, focus the handle and use Up/Down, Home or End; Escape cancels a drag. Touch dragging works from the handle; scroll normally elsewhere. Reset Layout restores the page default. Order is saved only in this browser, separately for each page; clearing browser storage removes it. Each card groups one feature, status area, or control. Standard view explains the practical meaning; Developer view adds implementation and diagnostic context. On surveyor pages, use the ? button on a card to jump into Help; on Help, use the return arrow to go back.",
     "survey-controls|Survey Status & Controls|Use this card to confirm that scanning is active, see when the last scan completed, change the automatic scan interval, and request a manual scan. Live Updates refresh the browser display; they do not trigger radio scans.",
-    "history|History|History is the rolling RAM record used by the web interface and CSV export. When the buffer fills, older observations age out as new observations arrive. The retained time window therefore depends on scan rate and how many observations each scan produces.",
-    "rssi-history|RSSI History|RSSI is received signal strength in dBm. Values closer to zero are stronger. Select an entry in Observed Networks or Observed Devices to plot its retained observations, then hover over a graph point to see scan and signal details.",
+    "history|History|History is the rolling RAM record used by the web interface and CSV export. Signal History and Balanced Survey retain rolling measurements; Network Inventory instead retains one summary per AP. AP summaries use 88 bytes, measurements use 6 bytes, and scan metadata uses 8 bytes per slot. When the measurement buffer fills, older observations age out. The retained time window therefore depends on scan rate and how many observations each scan produces.",
+    "rssi-history|RSSI History|RSSI is received signal strength in dBm. Values closer to zero are stronger. Enable plots in Developer Memory and restart, then select an entry in Observed Networks or Observed Devices. Hover over a graph point to see scan and signal details. Network Inventory retains summaries rather than a timeline.",
     "observed-networks|Observed Networks|This table summarizes retained Wi-Fi access points. Access points are distinguished by BSSID, so several radios can share one SSID and still appear separately. Select a network to redraw RSSI History.",
     "observed-devices|Observed Devices|This table summarizes retained Bluetooth devices. Bluetooth addresses can change or be private, so an address is not always a permanent device identity. Select a device to redraw RSSI History.",
     "channel-analysis|Observed Channel Interference|This card estimates 2.4 GHz Wi-Fi interference from the access points seen in the latest scan. It considers signal strength and channel overlap; it does not measure actual airtime use, noise floor, or non-Wi-Fi interference.",
@@ -9159,7 +9785,7 @@ void handleHelpPage() {
     "restart-device|Restart Device|A normal System restart first tries to preserve current survey history. If preservation fails, the device does not restart until you explicitly confirm that the current Wi-Fi and Bluetooth history can be erased.",
     "boot-heap|Boot Heap Checkpoints|Developer startup measurements show how free heap, minimum heap, and the largest contiguous block change as major subsystems initialize.",
     "session|Session|Restart checkpoints temporarily preserve the current RAM survey through intentional restarts. A successfully restored checkpoint file is deleted so it is not repeatedly restored on later boots.",
-    "history-test-tools|History Test Tools|Developer prefill creates synthetic history at selected capacity targets for UI, rollover, and performance testing. Synthetic entries are not evidence of radio endurance or RF behavior.",
+    "history-test-tools|History Test Tools|Developer prefill supports 50, 75, 95 and 99% in all Survey Focus modes. Network Inventory adds distinct TEST-PREFILL AP summaries; Signal History and Balanced Survey add compact measurements. Bluetooth fills its separate measurement history when enabled. Terminal capture and plots can be off. Targets use current capacity, which can change as the AP table grows. Existing data may age out; Clear History removes real and synthetic data. Synthetic scan batches may repeat identities to exercise large buffers with limited scan metadata. Synthetic entries are not evidence of radio endurance or RF behavior.",
     "settings-network|Infrastructure Network|Scan for nearby Wi-Fi networks and select one to fill the SSID field, or enter an SSID manually for hidden or currently unseen networks. Credentials are saved only after a successful connection, and passwords are intentionally excluded from configuration backup files.",
     "device-identity|Device Identity|The mDNS hostname provides a friendly local address where supported. The default is surveyor.local; use a unique hostname when multiple surveyors share a LAN. A hostname change requires restart so the new identity can be advertised from startup.",
     "device-ap|Device AP|The surveyor can provide its own Wi-Fi access point for direct browser access. Changing AP state, SSID, or password can require reconnecting to the device after restart.",
@@ -9205,10 +9831,13 @@ void handleTerminalData() {
   size_t count = surveySerial.snapshot(cursor, bytes, sizeof(bytes), dropped, more);
   char next[24]; snprintf(next, sizeof(next), "%llu", (unsigned long long)cursor);
   server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Terminal-Capacity", String(surveySerial.bufferCapacity()));
   server.sendHeader("X-Terminal-Boot", String(terminalBootId));
   server.sendHeader("X-Terminal-Next", next);
   server.sendHeader("X-Terminal-Dropped", dropped ? "1" : "0");
   server.sendHeader("X-Terminal-More", more ? "1" : "0");
+  server.sendHeader("X-Terminal-Power-Mode", String(wifiPowerMode));
+  server.sendHeader("X-Terminal-Diag-Detail", diagnosticVerbose ? "verbose" : "terse");
   String body;
   if (!body.reserve(count + 1)) { server.send(503, "text/plain", "Low memory; retry"); return; }
   body.concat((const char*)bytes, count);
@@ -9300,9 +9929,10 @@ void handleTerminalPage() {
   diagnosticSendContent(pageStyles());
   diagnosticSendContent("<style>#terminal-output{height:55vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;border:1px solid #888;border-radius:6px;font:13px/1.45 monospace}.terminal-controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.terminal-controls input[type=text]{max-width:100%}</style></head><body><div class=\"container\">");
   sendSiteNavigation("terminal");
+  diagnosticSendContent("<p>Active terminal capture: " + String(surveySerial.bufferCapacity()) + " bytes. <a href=\"/settings#developer-memory\">Configure capture</a>.</p>");
   diagnosticSendContent(R"TERMINAL(
 <h1>Serial Terminal</h1><div class="card">
-<p>Recent firmware serial output, including startup and enabled diagnostics. The device retains the latest 8 KB; this browser keeps up to 64 KB. ROM and library UART logs are not captured. Enter help for commands; responses appear below. Commands can change settings or restart the device.</p>
+<p>Recent firmware serial output, including startup and enabled diagnostics. Device capture size is selected in Settings &gt; Developer Memory; this browser keeps up to 64 KB. When capture is off, commands still work but their output is available only over USB. ROM and library UART logs are not captured. Enter help for commands; responses appear below. Commands can change settings or restart the device.</p>
 <div class="terminal-controls"><button id="terminal-pause" type="button">Pause</button>
 <label>Filter <input id="terminal-filter" type="text" placeholder="Text to match"></label>
 <button id="terminal-clear" type="button">Clear view</button>
@@ -9310,6 +9940,7 @@ void handleTerminalPage() {
 <p id="terminal-status" role="status">Connecting…</p><pre id="terminal-output" tabindex="0" aria-label="Serial output"></pre>
 <form id="terminal-command-form" class="terminal-controls" autocomplete="off">
 <label>Command <input id="terminal-command" type="text" maxlength="192" autocomplete="off" spellcheck="false" placeholder="help, wifi on, wifi window 60"></label>
+<label>Diagnostic detail <select id="terminal-detail" disabled><option value="">Waiting for device</option><option value="terse">Terse</option><option value="verbose">Verbose</option></select></label>
 <label><input id="terminal-hide-input" type="checkbox"> Hide input</label>
 <label><input id="terminal-scroll" type="checkbox" checked> Auto-scroll</label>
 <button id="terminal-send" type="submit">Send</button></form>
@@ -9321,6 +9952,7 @@ void handleTerminalPage() {
   const pause=document.getElementById('terminal-pause'),scroll=document.getElementById('terminal-scroll');
   const filter=document.getElementById('terminal-filter'),live=document.getElementById('live-updates-toggle');
   let cursor='0',boot='',captured='',paused=false,decoder=new TextDecoder(),gapSeen=false;
+  let lastPowerMode=null;
   function render(){
     const term=filter.value.toLowerCase();
     output.textContent=term?captured.split('\n').filter(line=>line.toLowerCase().includes(term)).join('\n'):captured;
@@ -9329,21 +9961,29 @@ void handleTerminalPage() {
   function append(text){captured=(captured+text).slice(-65536);render();}
   const commandInput=document.getElementById('terminal-command'),send=document.getElementById('terminal-send');
   const commandStatus=document.getElementById('terminal-command-status');
+  const detail=document.getElementById('terminal-detail');
+  let confirmedDetail='';
   document.getElementById('terminal-hide-input').onchange=function(){commandInput.type=this.checked?'password':'text';};
   document.getElementById('terminal-command-form').onsubmit=async function(event){
-    event.preventDefault();if(send.disabled)return;
-    const command=commandInput.value;
+    event.preventDefault();await sendCommand(commandInput.value,true);
+  };
+  detail.onchange=async function(){
+    const requested=detail.value;detail.value=confirmedDetail;
+    if(requested==='terse'||requested==='verbose')await sendCommand('diag '+requested,false);
+  };
+  async function sendCommand(command,clearInput){
+    if(send.disabled)return;
     if(new TextEncoder().encode(command).length>192){commandStatus.textContent='Maximum command length is 192 bytes.';return;}
-    send.disabled=true;commandInput.value='';
+    send.disabled=true;detail.disabled=true;if(clearInput)commandInput.value='';
     const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
     try{
       const response=await fetch('/api/terminal/command',{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8','X-Terminal-Command':'1'},body:command,signal:controller.signal,cache:'no-store'});
       if(response.status!==202)throw new Error('HTTP '+response.status);
       paused=false;pause.textContent='Pause';live.checked=true;
-      commandStatus.textContent='Queued. Responses appear in the output; a restart or power change may disconnect this page.';
+      commandStatus.textContent=clearInput?'Queued. Responses appear in the output; a restart or power change may disconnect this page.':'Diagnostic detail change queued. The selector updates when the device confirms it. This setting is saved; diagnostic streaming is unchanged.';
     }catch(error){commandStatus.textContent='Command delivery could not be confirmed ('+error.message+'). Check output before sending again.';}
-    finally{clearTimeout(timeout);send.disabled=false;commandInput.focus();}
-  };
+    finally{clearTimeout(timeout);send.disabled=false;detail.disabled=!confirmedDetail;if(clearInput)commandInput.focus();}
+  }
   pause.onclick=()=>{paused=!paused;pause.textContent=paused?'Resume':'Pause';status.textContent=paused?'Paused — device capture continues.':'Resuming…';};
   filter.oninput=render;
   document.getElementById('terminal-clear').onclick=()=>{captured='';gapSeen=false;render();};
@@ -9370,10 +10010,24 @@ void handleTerminalPage() {
         append('\n[Earlier output no longer retained by device]\n');decoder=new TextDecoder();gapSeen=true;
       }
       append(decoder.decode(bytes,{stream:true}));boot=nextBoot;cursor=next;
+      lastPowerMode=response.headers.get('X-Terminal-Power-Mode');
+      const reportedDetail=response.headers.get('X-Terminal-Diag-Detail');
+      if(reportedDetail==='terse'||reportedDetail==='verbose'){
+        confirmedDetail=reportedDetail;detail.value=reportedDetail;detail.disabled=send.disabled;
+      }
       const more=response.headers.get('X-Terminal-More')==='1';
       status.textContent=paused?'Paused — device capture continues.':(more?'Catching up…':'Live')+(gapSeen?' — some earlier output was overwritten.':'');
       delay=more?100:1000;
-    }catch(error){status.textContent='Disconnected — retrying ('+error.message+').';delay=2000;}
+    }catch(error){
+      const transportFailure=error.name==='TypeError'||error.name==='AbortError'||/fetch|network|offline/i.test(error.message);
+      let hint=' Check your Wi-Fi connection and device power.';
+      if(transportFailure&&lastPowerMode==='2'){
+        hint=' Lower power mode (Ultra) is the likely cause: Wi-Fi turns off between scans. Waiting for the next access window. For immediate access, use USB serial: wifi on; use power normal for continuous access.';
+      }else if(transportFailure&&lastPowerMode==null){
+        hint=' If Ultra lower power mode is enabled, Wi-Fi may be asleep between scans. Wait for the next access window or use USB serial: wifi on. Otherwise, check your Wi-Fi connection and device power.';
+      }
+      status.textContent='Disconnected — retrying ('+error.message+').'+hint;delay=2000;
+    }
     finally{clearTimeout(timeout);setTimeout(poll,delay);}
   }
   poll();
@@ -9402,8 +10056,8 @@ void startWebServer() {
   server.on("/settings", HTTP_GET, []() { runDiagnosticWebHandler("/settings", handleSettingsPage); });
   server.on("/wifi-power", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-power", handleWifiPowerSetting); });
   server.on("/help", HTTP_GET, []() { runDiagnosticWebHandler("/help", handleHelpPage); });
-  server.on("/api/ping", HTTP_GET, []() { handleApiPing(); });
-  server.on("/api/web/client-diag", HTTP_POST, []() { handleWebClientDiagnostic(); });
+  server.on("/api/ping", HTTP_GET, []() { noteWifiPowerWebActivity(); handleApiPing(); });
+  server.on("/api/web/client-diag", HTTP_POST, []() { noteWifiPowerWebActivity(); handleWebClientDiagnostic(); });
   server.on("/restart-device", HTTP_POST, []() { runDiagnosticWebHandler("/restart-device", handleSystemRestart); });
   server.on("/status.json", HTTP_GET, []() { runDiagnosticWebHandler("/status.json", handleStatusJsonExport); });
   server.on("/api/diag/event-limit", HTTP_POST, []() { runDiagnosticWebHandler("/api/diag/event-limit", handleDiagnosticEventLimit); });
@@ -9412,8 +10066,10 @@ void startWebServer() {
   server.on("/wifi-save", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-save", handleSaveStationSettings); });
   server.on("/wifi-clear", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-clear", handleClearStationSettings); });
   server.on("/hostname-save", HTTP_POST, []() { runDiagnosticWebHandler("/hostname-save", handleHostnameSave); });
+  server.on("/developer-memory", HTTP_POST, []() { runDiagnosticWebHandler("/developer-memory", handleDeveloperMemorySettings); });
   server.on("/interface-settings", HTTP_POST, []() { runDiagnosticWebHandler("/interface-settings", handleInterfaceSettings); });
   server.on("/wifi-capture-settings", HTTP_POST, []() { runDiagnosticWebHandler("/wifi-capture-settings", handleWifiCaptureSettings); });
+  server.on("/survey-focus", HTTP_POST, []() { runDiagnosticWebHandler("/survey-focus", handleSurveyFocusSetting); });
   server.on("/led-test", HTTP_POST, []() { runDiagnosticWebHandler("/led-test", handleLedSelfTest); });
   server.on("/scan-now", []() { runDiagnosticWebHandler("/scan-now", handleWebScanNow); });
   server.on("/api/wifi/status", HTTP_GET, []() { runDiagnosticWebHandler("/api/wifi/status", handleWifiScanStatus); });
@@ -9556,15 +10212,16 @@ void printWifiSurveySerial() {
   Serial.println(wifiAutoScanLastStartLabel());
   Serial.print("Last auto completion:  ");
   Serial.println(wifiAutoScanLastCompletionLabel());
-  Serial.print("Observations:        ");
+  Serial.print("Survey focus:        "); Serial.println(surveyFocusName());
+  Serial.print(wifiInventoryMode() ? "AP summaries:        " : "Observations:        ");
   Serial.print(historyCount);
   Serial.print(" / ");
   Serial.print(scanHistoryRetentionLimit);
   Serial.print(" retained; ");
   Serial.print(scanHistoryCapacity);
-  Serial.println(" history capacity");
+  Serial.println(wifiInventoryMode() ? " AP capacity" : " history capacity");
   Serial.print("Retained scans:      ");
-  Serial.println(countRetainedScanGroups());
+  Serial.println(wifiInventoryMode() ? String("Not retained") : String(countRetainedScanGroups()));
   Serial.print("Unique AP slots used:");
   Serial.print(" ");
   Serial.print(wifiApCount);
@@ -9573,7 +10230,7 @@ void printWifiSurveySerial() {
   Serial.println();
 
   if (historyCount == 0) {
-    Serial.println("No Wi-Fi observations retained yet.");
+    Serial.println(wifiInventoryMode() ? "No AP summaries retained yet." : "No Wi-Fi observations retained yet.");
   } else {
     Serial.println("SSID                 BSSID              CH  Latest  Min  Max  Avg    N   First Seen    Last Seen");
     Serial.println("-------------------  -----------------  --  ------  ---  ---  -----  ---  ------------  ------------");
@@ -9706,7 +10363,7 @@ void printSystemSerial() {
   }
   Serial.print("STA MAC:              "); Serial.println(WiFi.macAddress());
   Serial.print("AP MAC:               "); Serial.println(WiFi.softAPmacAddress());
-  Serial.print("Wi-Fi history:        "); Serial.print(historyCount); Serial.print(" / "); Serial.print(scanHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(scanHistoryCapacity); Serial.println(" physical");
+  Serial.print(wifiInventoryMode() ? "Wi-Fi AP summaries:   " : "Wi-Fi history:        "); Serial.print(historyCount); Serial.print(" / "); Serial.print(scanHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(scanHistoryCapacity); Serial.println(" physical");
   Serial.print("Wi-Fi history RAM:    "); Serial.print(wifiHistoryAllocatedBytes()/1024.0, 1); Serial.println(" KB");
   Serial.print("BLE history:          ");
   if (bleSurveyEnabled) { Serial.print(bleHistoryCount); Serial.print(" / "); Serial.print(bleHistoryRetentionLimit); Serial.print(" retained; "); Serial.print(bleHistoryCapacity); Serial.println(" physical"); }
@@ -9799,6 +10456,7 @@ void printSettingsSerial() {
   Serial.println("  wifi window <5..3600>  - Save access-window seconds");
   Serial.print("Access window seconds: "); Serial.println(wifiAccessWindowSeconds);
   Serial.println("  power normal|connected|ultra - Wi-Fi power mode (saved)");
+  Serial.print("Survey focus: "); Serial.println(surveyFocusName());
   Serial.print("Wi-Fi power mode: "); Serial.println(wifiPowerModeName());
   Serial.println("  refresh on|off        - Survey web-page live updates");
   Serial.println("  hostname <name>       - Set mDNS hostname and restart");
@@ -9846,6 +10504,12 @@ void executeTerminalCommand(String command, bool fromWeb) {
   if (command == "5" || command.equalsIgnoreCase("developer") || command.equalsIgnoreCase("dev")) { printDeveloperDiagnosticSummary(); return; }
   if (command == "0" || command.equalsIgnoreCase("back") || command.equalsIgnoreCase("h") || command.equalsIgnoreCase("help")) { printSerialMainMenu(); return; }
 
+  if (command.equalsIgnoreCase("diag terse") || command.equalsIgnoreCase("diag verbose")) {
+    diagnosticVerbose = command.equalsIgnoreCase("diag verbose");
+    saveDiagnosticStreamingSettings();
+    Serial.print("Diagnostic detail saved: "); Serial.println(diagnosticVerbose ? "verbose" : "terse");
+    printDiagnosticSnapshot(); return;
+  }
   if (command.equalsIgnoreCase("diag on") || command.equalsIgnoreCase("diag off")) {
     diagnosticStreamingEnabled = command.substring(command.length()-2).equalsIgnoreCase("on");
     saveDiagnosticStreamingSettings();
@@ -9858,9 +10522,9 @@ void executeTerminalCommand(String command, bool fromWeb) {
   if (command.equalsIgnoreCase("diag summary")) { printDeveloperDiagnosticSummary(); return; }
   if (command.equalsIgnoreCase("diag reset")) { resetDeveloperDiagnostics(); Serial.println("Diagnostic timing counters reset."); printDeveloperDiagnosticSummary(); return; }
   if (command.startsWith("diag interval ")) {
-    long seconds = commandArgument(command, "diag interval").toInt();
-    if (seconds < 0 || seconds > 3600) Serial.println("Diagnostic snapshot interval must be 0-3600 seconds.");
-    else { diagnosticSnapshotIntervalMs = (uint32_t)seconds * 1000UL; saveDiagnosticStreamingSettings(); diagnosticLastSnapshotMs = millis(); Serial.println(seconds == 0 ? "Periodic diagnostic snapshots disabled." : "Periodic diagnostic snapshot interval updated."); }
+    uint32_t seconds;
+    if (!terminalSeconds(commandArgument(command, "diag interval"), 0, 3600, seconds)) return;
+    diagnosticSnapshotIntervalMs = seconds * 1000UL; saveDiagnosticStreamingSettings(); diagnosticLastSnapshotMs = millis(); Serial.println(seconds == 0 ? "Periodic diagnostic snapshots disabled." : "Periodic diagnostic snapshot interval updated.");
     printDeveloperDiagnosticSummary(); return;
   }
   if (command.startsWith("diag ")) {
@@ -9891,9 +10555,7 @@ void executeTerminalCommand(String command, bool fromWeb) {
   }
   if (command.startsWith("wifi window ")) {
     uint32_t seconds;
-    if (!parseWifiAccessWindow(commandArgument(command, "wifi window"), seconds)) {
-      Serial.println("Use wifi window <seconds>, from 5 to 3600."); return;
-    }
+    if (!terminalSeconds(commandArgument(command, "wifi window"), 5, 3600, seconds)) return;
     saveWifiAccessWindow(seconds);
     Serial.print("Wi-Fi access window saved: "); Serial.print(seconds); Serial.println(" seconds.");
     return;
@@ -9910,9 +10572,9 @@ void executeTerminalCommand(String command, bool fromWeb) {
   if (command.equalsIgnoreCase("wclear")) { clearScanHistory(); Serial.println("Wi-Fi history cleared."); printWifiSurveySerial(); return; }
 
   if (command.startsWith("interval ")) {
-    long n=commandArgument(command,"interval").toInt();
-    if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid Wi-Fi interval.");
-    else {
+    uint32_t n;
+    if (!terminalSeconds(commandArgument(command,"interval"), MIN_SCAN_INTERVAL_SECONDS, MAX_SCAN_INTERVAL_SECONDS, n)) return;
+    {
       scanIntervalSeconds=(unsigned long)n;
       lastAutoScanMs=millis();
       preferences.begin("survey", false);
@@ -9937,10 +10599,10 @@ void executeTerminalCommand(String command, bool fromWeb) {
   if (command.equalsIgnoreCase("bleclear")) { if (bleSurveyEnabled) clearBleHistory(); Serial.println("BLE history cleared."); printBluetoothSurveySerial(); return; }
 
   if (command.startsWith("bleinterval ")) {
-    long n=commandArgument(command,"bleinterval").toInt();
-    if (!bleSurveyEnabled) Serial.println("Bluetooth Survey is disabled.");
-    else if (n < (long)MIN_SCAN_INTERVAL_SECONDS || n > (long)MAX_SCAN_INTERVAL_SECONDS) Serial.println("Invalid BLE interval.");
-    else { bleScanIntervalSeconds=(unsigned long)n; autoBleScanEnabled=true; lastAutoBleScanMs=millis(); preferences.begin("survey", false); preferences.putULong("bleInterval", bleScanIntervalSeconds); preferences.end(); Serial.println("BLE scan interval updated and saved."); }
+    uint32_t n;
+    if (!bleSurveyEnabled) { Serial.println("Bluetooth Survey is disabled."); return; }
+    if (!terminalSeconds(commandArgument(command,"bleinterval"), MIN_SCAN_INTERVAL_SECONDS, MAX_SCAN_INTERVAL_SECONDS, n)) return;
+    bleScanIntervalSeconds=(unsigned long)n; autoBleScanEnabled=true; lastAutoBleScanMs=millis(); preferences.begin("survey", false); preferences.putULong("bleInterval", bleScanIntervalSeconds); preferences.end(); Serial.println("BLE scan interval updated and saved.");
     printBluetoothSurveySerial(); return;
   }
   if (command.equalsIgnoreCase("bleauto on") || command.equalsIgnoreCase("bleauto off")) {
@@ -10017,6 +10679,59 @@ void executeTerminalCommand(String command, bool fromWeb) {
 // Setup
 // ============================================================
 
+void initializeSurveyButton() {
+  if (SURVEY_BUTTON_PIN < 0) return;
+  pinMode(SURVEY_BUTTON_PIN, INPUT_PULLUP);
+  surveyButtonRawPressed = digitalRead(SURVEY_BUTTON_PIN) == LOW;
+  surveyButtonPressed = surveyButtonRawPressed;
+  // Ignore a button held through boot until it has been released.
+  surveyButtonHoldHandled = surveyButtonRawPressed;
+  surveyButtonChangedMs = surveyButtonPressedMs = millis();
+}
+
+void handleSurveyButtonHold() {
+  surveyButtonHoldHandled = true; // Consume the gesture even if waking fails.
+  if (!wakeWifiRadio()) {
+    Serial.println("[BUTTON] Wi-Fi wake failed; release and hold to retry.");
+    return;
+  }
+  wifiPowerWindow.arm(millis());
+  Serial.println("[BUTTON] Wi-Fi awake; access window refreshed.");
+}
+
+void serviceSurveyButton() {
+  if (SURVEY_BUTTON_PIN < 0) return;
+  const uint32_t now = millis();
+  const bool pressed = digitalRead(SURVEY_BUTTON_PIN) == LOW;
+  if (pressed != surveyButtonRawPressed) {
+    surveyButtonRawPressed = pressed;
+    surveyButtonChangedMs = now;
+  }
+  if ((uint32_t)(now - surveyButtonChangedMs) < SURVEY_BUTTON_DEBOUNCE_MS) return;
+
+  if (surveyButtonPressed != surveyButtonRawPressed) {
+    surveyButtonPressed = surveyButtonRawPressed;
+    if (surveyButtonPressed) {
+      surveyButtonPressedMs = surveyButtonChangedMs;
+      surveyButtonHoldHandled = false;
+    } else if (!surveyButtonHoldHandled) {
+      // Classify using the release edge, excluding release debounce time.
+      // This also catches a hold released between loop iterations.
+      if ((uint32_t)(surveyButtonChangedMs - surveyButtonPressedMs) >= SURVEY_BUTTON_HOLD_MS) {
+        handleSurveyButtonHold();
+      } else {
+        const bool started = beginLoggedWifiScan(false, false);
+        Serial.println(started ? "[BUTTON] Wi-Fi scan started." :
+          (wifiScanInProgress ? "[BUTTON] Scan already in progress." : "[BUTTON] Unable to start scan."));
+      }
+    }
+  }
+  if (surveyButtonPressed && !surveyButtonHoldHandled &&
+      (uint32_t)(now - surveyButtonPressedMs) >= SURVEY_BUTTON_HOLD_MS) {
+    handleSurveyButtonHold();
+  }
+}
+
 // Purpose: Arduino entry point that initializes hardware, settings, radios, histories, checkpoint restore, web services, and initial survey scheduling.
 void setup() {
   terminalBootId = esp_random();
@@ -10025,6 +10740,7 @@ void setup() {
 
   captureBootHeapCheckpoint("Startup");
   loadSurveyModeSettings();
+  if (!surveySerial.configure(terminalBufferBytes)) Serial.println("Terminal buffer allocation failed; capture disabled for this boot.");
   loadDiagnosticStreamingSettings();
   loadWifiRecoveryState();
   loadInfrastructureRecoverySummary();
@@ -10107,9 +10823,10 @@ void setup() {
   captureBootHeapCheckpoint("Histories allocated");
   initializeSessionStorageAndRestore();
 
-  Serial.print("Auto-sized Wi-Fi history: ");
+  Serial.print("Survey focus: "); Serial.println(surveyFocusName());
+  Serial.print("Auto-sized Wi-Fi storage: ");
   Serial.print(scanHistoryCapacity);
-  Serial.println(" compact observation slots");
+  Serial.println(wifiInventoryMode() ? " AP summary slots" : " compact observation slots");
   Serial.print("Auto-sized BLE history:   ");
   if (bleSurveyEnabled) {
     Serial.print(bleHistoryCapacity);
@@ -10165,6 +10882,8 @@ void setup() {
   lastAutoBleScanMs = surveyServicesReadyMs;
   initialWifiScanPending = true;
   initialBleScanPending = bleSurveyEnabled;
+
+  initializeSurveyButton();
 
   printMenu();
   ledDiagUpdateInfraState();
@@ -10398,6 +11117,7 @@ void loop() {
     return;
   }
 
+  serviceSurveyButton();
   serviceWifiPower();
   if (webServerStarted && !wifiRadioSleeping) {
     server.handleClient();

@@ -10,7 +10,7 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const elements = new Map();
 for (const id of ['terminal-output','terminal-status','terminal-pause','terminal-scroll',
   'terminal-filter','live-updates-toggle','terminal-clear','terminal-download',
-  'terminal-command','terminal-send','terminal-command-status','terminal-hide-input','terminal-command-form']) {
+  'terminal-command','terminal-send','terminal-command-status','terminal-hide-input','terminal-command-form','terminal-detail']) {
   elements.set(id, {textContent:'',value:'',checked:true,scrollTop:0,scrollHeight:42,disabled:false,focus(){}});
 }
 const get = id => elements.get(id);
@@ -24,10 +24,12 @@ const context = {
   clearTimeout(id){timers.delete(id);},
   async fetch(url,options){requests.push(url);requestOptions.push(options);const next=responses.shift();if(next instanceof Error)throw next;assert.ok(next,'Unexpected fetch');return next;},
 };
-function response(text, {boot='100',next='10',dropped='0',more='0',status=200}={}) {
+function response(text, {boot='100',next='10',dropped='0',more='0',status=200,power='0',detail='terse'}={}) {
   const bytes=typeof text==='string'?new TextEncoder().encode(text):text;
   return {ok:status===200,status,headers:new Map([
     ['X-Terminal-Boot',boot],['X-Terminal-Next',next],['X-Terminal-Dropped',dropped],['X-Terminal-More',more],
+    ['X-Terminal-Power-Mode',power],
+    ['X-Terminal-Diag-Detail',detail],
   ]),async arrayBuffer(){return bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);}};
 }
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
@@ -53,6 +55,18 @@ responses.push(response('rebooted\n',{boot:'200',next:'9'}));await step();
 assert.match(get('terminal-output').textContent,/Device restarted/);
 responses.push(new Error('network down'));await step();
 assert.match(get('terminal-status').textContent,/Disconnected.*retrying/);
+assert.doesNotMatch(get('terminal-status').textContent,/likely cause/);
+responses.push(response('',{boot:'200',next:'9',power:'2'}));await step();
+responses.push(new TypeError('Failed to fetch'));await step();
+assert.match(get('terminal-status').textContent,/Ultra.*likely cause.*USB serial: wifi on/);
+responses.push(response('',{status:503}));await step();
+assert.doesNotMatch(get('terminal-status').textContent,/likely cause/);
+responses.push(response('',{boot:'200',next:'9',power:'1'}));await step();
+responses.push(new TypeError('Failed to fetch'));await step();
+assert.doesNotMatch(get('terminal-status').textContent,/likely cause/);
+responses.push(response('',{boot:'200',next:'9',power:null}));await step();
+responses.push(new TypeError('Failed to fetch'));await step();
+assert.match(get('terminal-status').textContent,/If Ultra lower power mode is enabled/);
 responses.push(response(new Uint8Array([0xc3]),{boot:'200',next:'10',more:'1'}));await step();
 assert.match(requests.at(-1),/cursor=9&boot=200$/);
 responses.push(response(new Uint8Array([0xa9,10]),{boot:'200',next:'12'}));await step();
@@ -90,3 +104,23 @@ assert.equal(get('terminal-command').value,'');
 assert.ok(!get('terminal-output').textContent.includes('private123'));
 assert.equal(requests.length,beforeLong+1); // no automatic command retry
 console.log('PASS: terminal command POST, byte limit, hidden input, acknowledgment and ambiguous delivery');
+
+assert.equal(get('terminal-detail').value,'terse');
+get('terminal-command').value='unsent draft';
+get('terminal-detail').value='verbose';responses.push(response('',{status:202}));
+await get('terminal-detail').onchange();
+assert.equal(requestOptions.at(-1).body,'diag verbose');
+assert.equal(get('terminal-command').value,'unsent draft');
+assert.equal(get('terminal-detail').value,'terse','Queued is not confirmation');
+responses.push(response('',{detail:'verbose'}));await step();
+assert.equal(get('terminal-detail').value,'verbose');
+const beforeDetailFailure=requests.length;
+get('terminal-detail').value='terse';responses.push(new TypeError('Failed to fetch'));
+await get('terminal-detail').onchange();
+assert.equal(get('terminal-detail').value,'verbose');
+assert.match(get('terminal-command-status').textContent,/could not be confirmed/);
+assert.equal(requests.length,beforeDetailFailure+1);
+assert.equal(get('terminal-detail').disabled,false);
+responses.push(response('',{detail:'terse'}));await step();
+assert.equal(get('terminal-detail').value,'terse','Reflect changes made through USB');
+console.log('PASS: diagnostic selector commands, confirmation, draft preservation, failure and external changes');

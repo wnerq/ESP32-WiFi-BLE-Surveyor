@@ -12,7 +12,12 @@ The existing scan interval is measured from the end of the previous successful
 scan. Scan intervals no longer than the access window leave no off period. Scan failure retry
 backoff is unchanged, and failed/timed-out attempts also open a window. Initial
 scans and automatic Wi-Fi scans in Ultra ignore the interaction defer timer;
-ordinary browser polling cannot hold the radio on. Active scan, BLE scan, CSV
+non-terminal web requests restart a five-minute Wi-Fi hold, including page polling.
+The configured access-window timeout begins after that hold: with the default
+60-second timeout, Wi-Fi stays on for six minutes after the last activity.
+Scan completion cannot shorten the hold.
+Navigation and button/input activity also renew it when live updates are off.
+Terminal viewing and polling do not renew the window. Active scan, BLE scan, CSV
 export and a synchronous HTTP operation may postpone shutdown. A manual USB
 `scan` wakes Wi-Fi and opens another window. `power normal` restores continuous
 access even while Wi-Fi is off. `wifi on` wakes Wi-Fi and renews the current
@@ -73,7 +78,10 @@ physical power consumption, Arduino event timing or browser reconnection.
    duplicate keys must return 400 without changing the saved configuration.
 2. With AP enabled, use Ultra and a 120-second interval. Confirm scan results
    keep advancing, the AP disappears after the window and returns on the next
-   scan, and browsing/terminal polling does not keep Wi-Fi on indefinitely.
+   scan when other web pages are closed. Verify terminal polling alone does not
+   prevent sleep. Then browse other pages, click controls with live updates off,
+   and enable page updates: each activity must restart the five-minute hold. Close those
+   pages and verify shutdown after five minutes plus a complete idle window.
 3. Repeat with AP disabled and a saved network. Verify post-scan association
    and DHCP. Test unavailable credentials and restore access over USB using
    `power normal`. Verify mDNS and HTTP return over several hundred cycles.

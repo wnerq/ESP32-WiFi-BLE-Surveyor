@@ -25,6 +25,7 @@ public:
   using std::string::string;
   String()=default;
   String(const std::string& s):std::string(s){}
+  void trim(){auto first=find_first_not_of(" \t\r\n");if(first==npos){clear();return;}*this=substr(first,find_last_not_of(" \t\r\n")-first+1);}
   void toCharArray(char* dst,size_t n)const{snprintf(dst,n,"%s",c_str());}
 };
 char pendingTerminalCommand[193]={};
@@ -61,6 +62,21 @@ tests = r'''
 void submit(const char* text){server.body=text;server.bodyPresent=true;handleTerminalCommand();}
 int main(){
   uint32_t seconds=42;
+  bool adjusted=false;
+  for(const char* low:{"-1","0","4","-999999999999999999999999"}){
+    assert(parseBoundedSeconds(low,5,3600,seconds,adjusted));assert(seconds==5 && adjusted);
+  }
+  for(const char* high:{"3601","999999999999999999999999"}){
+    assert(parseBoundedSeconds(high,5,3600,seconds,adjusted));assert(seconds==3600 && adjusted);
+  }
+  for(const char* good:{"60"," +60 "}){
+    assert(parseBoundedSeconds(good,5,3600,seconds,adjusted));assert(seconds==60 && !adjusted);
+  }
+  assert(parseBoundedSeconds("-1",0,3600,seconds,adjusted) && seconds==0 && adjusted);
+  seconds=42;
+  for(const char* bad:{""," ","+","--1","60s","60.5","999999999x"}){
+    assert(!parseBoundedSeconds(bad,5,3600,seconds,adjusted));assert(seconds==42);
+  }
   for(const char* bad:{"","0","4","3601","-1","+60","60s","60.0"," 60","999999999"}){
     assert(!parseWifiAccessWindow(bad,seconds));assert(seconds==42);
   }
@@ -99,6 +115,7 @@ with tempfile.TemporaryDirectory(prefix="surveyor-commands-") as tmp:
     cpp, binary = Path(tmp) / "commands.cpp", Path(tmp) / "commands"
     cpp.write_text(stubs + "\n".join(function(s) for s in [
         "bool parseWifiAccessWindow(const String& value, uint32_t& seconds)",
+        "bool parseBoundedSeconds(String value, uint32_t minimum, uint32_t maximum, uint32_t& seconds, bool& adjusted)",
         "void handleTerminalCommand()", "void serviceTerminalCommand()"
     ]) + tests)
     subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(binary)], check=True)

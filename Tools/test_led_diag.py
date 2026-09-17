@@ -13,13 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
 enum = re.search(r"enum LedDiagEvent : uint8_t \{.*?\};", source, re.S)[0]
 mirror = source[source.index("class SurveySerialMirror"):source.index("void recordDiagnosticEvent(const char*")]
-manager = source[source.index("struct LedDiagPattern {"):source.index("// Serial helpers")]
+manager = source[source.index("uint32_t wifiNextScheduledScanRemainingMs("):source.index("// Serial helpers")]
 restart = source[source.index("bool controlledRestartPending ="):source.index("// Purpose: Performs a controlled System-page restart")]
 
 STUBS = r'''
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -32,6 +33,9 @@ uint32_t millis(){return nowMs;}
 uint32_t micros(){return nowMs*1000+(++microCalls);}
 bool statusLedEnabled=true;
 bool wifiRadioSleeping=false;
+bool wifiAutoScanRetryPending=false;
+uint32_t lastWifiAutoScanFailureMs=0, lastAutoScanMs=0, scanIntervalSeconds=300;
+const uint32_t WIFI_AUTOSCAN_RETRY_BACKOFF_MS=2000;
 uint8_t wifiPowerMode=0;
 const bool STATUS_LED_AVAILABLE=true, STATUS_LED_ACTIVE_HIGH=true;
 const uint8_t STATUS_LED_PIN=2;
@@ -86,6 +90,8 @@ void advance(uint32_t duration){
   for(uint32_t i=0;i<duration;i+=5){nowMs+=5;ledDiagService();}
 }
 void reset(bool boot=true){
+  wifiRadioSleeping=false;wifiPowerMode=0;wifiAutoScanRetryPending=false;
+  lastWifiAutoScanFailureMs=lastAutoScanMs=0;scanIntervalSeconds=300;
   accessWindow=false;attachOk=true;lastDuty=0;
   diagnosticLed=DiagnosticLedManager();ledDiagInfraConfigured=false;
   nowMs=0;microCalls=0;statusLedEnabled=true;hasIp=false;WiFi.mode=1;
@@ -188,7 +194,7 @@ int main(){
   wifiPowerMode=2;ledDiagUpdateInfraState();edges.clear();advance(3500);
   assert(onWidths().empty());
   wifiPowerMode=0;wifiRadioSleeping=true;ledDiagUpdateInfraState();advance(3500);
-  assert(onWidths().empty());wifiRadioSleeping=false;
+  assert((onWidths()==std::vector<uint32_t>{50,50,50,50,50}));wifiRadioSleeping=false;
   // millis wraparound and long service gaps never cause catch-up flash loops.
   reset();nowMs=UINT32_MAX-24;ledDiagEvent(LED_EVENT_SERIAL_RX);advance(150);
   assert((onWidths()==std::vector<uint32_t>{25,25}));
@@ -208,7 +214,45 @@ int main(){
   reset();nowMs=UINT32_MAX-1499;accessWindow=true;ledDiagService();advance(3000);assert(lastDuty==255);
   reset(false);attachOk=false;diagnosticLed.begin();ledDiagEvent(LED_EVENT_BOOT_COMPLETE);advance(970);
   assert(!pinOn); // attach failure retains digital diagnostics
-  assert(sizeof(DiagnosticLedManager)<=96);
+  // Radio-off countdown uses the scan deadline, not time since radio shutdown.
+  reset();lastAutoScanMs=nowMs-180000;wifiRadioSleeping=true;ledDiagService();
+  uint32_t countdownBase=nowMs;assert(lastDuty==64);
+  advance(350);assert((onWidths()==std::vector<uint32_t>{50,50}));
+  advance(9645);assert(lastDuty==0);advance(5);assert(lastDuty==64);
+  assert(edges.back().ms-countdownBase==10000);
+  advance(350);assert((onWidths()==std::vector<uint32_t>{50,50,50,50}));
+  // Ceiling boundaries and retries use wrap-safe, saturated remaining time.
+  lastAutoScanMs=nowMs-239999;assert(wifiNextScheduledScanRemainingMs(nowMs)==60001);
+  lastAutoScanMs=nowMs-240000;assert(wifiNextScheduledScanRemainingMs(nowMs)==60000);
+  lastAutoScanMs=nowMs-300001;assert(wifiNextScheduledScanRemainingMs(nowMs)==0);
+  wifiAutoScanRetryPending=true;lastWifiAutoScanFailureMs=nowMs-500;
+  assert(wifiNextScheduledScanRemainingMs(nowMs)==1500);
+  lastWifiAutoScanFailureMs=nowMs-2001;assert(wifiNextScheduledScanRemainingMs(nowMs)==0);
+  reset();lastAutoScanMs=nowMs-239999;wifiRadioSleeping=true;ledDiagService();
+  advance(350);assert((onWidths()==std::vector<uint32_t>{50,50})); // burst count stays fixed
+  reset();lastAutoScanMs=nowMs-240000;wifiRadioSleeping=true;ledDiagService();
+  advance(350);assert((onWidths()==std::vector<uint32_t>{50}));
+  reset();lastAutoScanMs=nowMs-300000;wifiRadioSleeping=true;ledDiagService();
+  advance(10000);assert(edges.empty()); // due scan has no remaining minutes
+  reset();scanIntervalSeconds=3600;lastAutoScanMs=nowMs;wifiRadioSleeping=true;ledDiagService();
+  advance(9000);auto countdownWidths=onWidths();assert(countdownWidths.size()==60);
+  for(auto width:countdownWidths)assert(width==50);
+  advance(995);assert(lastDuty==0);advance(5);assert(lastDuty==64);
+  // Wake and LED-disable immediately suppress countdown; normal events preempt it.
+  wifiRadioSleeping=false;ledDiagService();assert(lastDuty==0);
+  reset();wifiRadioSleeping=true;ledDiagService();statusLedEnabled=false;ledDiagService();
+  assert(lastDuty==0);advance(10000);assert(lastDuty==0);
+  reset();wifiRadioSleeping=true;ledDiagService();ledDiagEvent(LED_EVENT_SERIAL_RX);
+  assert(lastDuty==255);advance(150);assert(lastDuty==64);
+  // Countdown resumes after uint32 rollover without catch-up loops after a stall.
+  reset();nowMs=UINT32_MAX-24;lastAutoScanMs=nowMs-240000;
+  wifiRadioSleeping=true;ledDiagService();advance(50);assert(lastDuty==0);
+  advance(9950);assert(lastDuty==64);
+  nowMs+=25000;ledDiagService();assert(lastDuty==64);
+  advance(50);assert(lastDuty==0);
+  reset(false);attachOk=false;diagnosticLed.begin();ledDiagEvent(LED_EVENT_BOOT_COMPLETE);advance(970);
+  wifiRadioSleeping=true;ledDiagService();assert(pinOn);advance(50);assert(!pinOn);
+  assert(sizeof(DiagnosticLedManager)<=112);
   std::cout<<"PASS: boot, page, Wi-Fi/BLE scan, RX-only, heartbeat/configuration, attempt/success, priority/preemption, reboot, disabled/self-test, route exclusions, rollover and long gaps\n";
 }
 '''
@@ -223,7 +267,7 @@ assert not re.search(r"\bwhile\s*\(", manager + restart)
 assert "ledDiagSerialRx()" in mirror and "if (value >= 0)" in mirror
 assert "ledDiagInfraAttempt(\"SAVED_NETWORK_DISCOVERY\")" in source
 assert "ledDiagInfraReconnected(source)" in source
-assert "DIAGNOSTIC_EVENT_CAPACITY = 32" in source and "CAPACITY = 8192" in source
+assert "DIAGNOSTIC_EVENT_CAPACITY = 32" in source and "DEFAULT_TERMINAL_BUFFER_BYTES = 1024" in source
 
 with tempfile.TemporaryDirectory(prefix="surveyor-led-") as temp:
     cpp, binary = Path(temp) / "led.cpp", Path(temp) / "led"

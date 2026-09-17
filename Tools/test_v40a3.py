@@ -28,6 +28,7 @@ STUBS = r'''
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -147,8 +148,29 @@ for signature in (
 TESTS = r'''
 void seen(){considerInfrastructureReconnectAfterScan(1);lastAutoScanMs=nowMs;}
 void tick(uint32_t ms){nowMs+=ms;serviceInfrastructureReconnect();}
+void testCaptureSizes(){
+  for(size_t capacity: {0u,1024u,2048u,8192u,16384u,32768u}) {
+    SurveySerialMirror ring;
+    assert(ring.configure(capacity) && ring.bufferCapacity()==capacity);
+    assert(!ring.configure(1024)); // Boot-only allocation; no live resizing.
+    std::vector<uint8_t> input(capacity+1500);
+    for(size_t i=0;i<input.size();++i) input[i]=i%251;
+    ring.write(input.data(),input.size());
+    uint64_t cursor=0;uint8_t bytes[333];bool dropped=false,more=false;
+    size_t total=0;
+    do {
+      size_t n=ring.snapshot(cursor,bytes,sizeof(bytes),dropped,more);
+      assert(dropped==(capacity>0 && total==0));
+      assert(std::equal(bytes,bytes+n,input.begin()+1500+total));
+      total+=n;
+    } while(more);
+    assert(total==capacity);
+    assert(ring.snapshot(cursor,bytes,sizeof(bytes),dropped,more)==0 && !more);
+  }
+}
 void testRing(){
   SurveySerialMirror ring;
+  assert(ring.configure(8192));
   std::vector<uint8_t> input(10000);
   for(size_t i=0;i<input.size();++i)input[i]=i%251;
   ring.write(input.data(),input.size());
@@ -163,6 +185,7 @@ void testRing(){
   cursor=999999;ring.snapshot(cursor,bytes,sizeof(bytes),dropped,more);assert(dropped);
 }
 int main(){
+  testCaptureSizes();
   testRing();
   // No credentials / no evidence / native grace must not issue radio calls.
   credentials=false;seen();tick(30000);assert(driverCalls==0);
