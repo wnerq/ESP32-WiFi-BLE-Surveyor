@@ -35,6 +35,7 @@ uint8_t webWifiConfigStage=0;
 String webWifiConfigSsid;
 uint32_t webWifiConfigStartedMs=0,now=0;
 uint32_t millis(){return now;}
+const uint32_t MIN_WIFI_ACCESS_WINDOW_SECONDS=5,MAX_WIFI_ACCESS_WINDOW_SECONDS=9999;
 constexpr int LED_EVENT_WEBPAGE=1;
 void ledDiagEvent(int){}
 struct SerialFake { std::string text; void println(const char* s){text+=s;text+='\n';} } Serial;
@@ -77,10 +78,10 @@ int main(){
   for(const char* bad:{""," ","+","--1","60s","60.5","999999999x"}){
     assert(!parseBoundedSeconds(bad,5,3600,seconds,adjusted));assert(seconds==42);
   }
-  for(const char* bad:{"","0","4","3601","-1","+60","60s","60.0"," 60","999999999"}){
+  for(const char* bad:{"","0","4","10000","-1","+60","60s","60.0"," 60","999999999"}){
     assert(!parseWifiAccessWindow(bad,seconds));assert(seconds==42);
   }
-  for(const char* good:{"5","60","3600"})assert(parseWifiAccessWindow(good,seconds));
+  for(const char* good:{"5","60","9999"})assert(parseWifiAccessWindow(good,seconds));
   server.headerValue="";submit("restart");assert(server.status==403 && !terminalCommandPending);
   server.headerValue="1";submit("wifi on\nrestart");assert(server.status==400);
   server.body=String(193,'x');handleTerminalCommand();assert(server.status==413);

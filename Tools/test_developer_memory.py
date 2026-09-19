@@ -28,6 +28,7 @@ public:
   void trim(){auto a=find_first_not_of(" \r\n\t"); if(a==npos){clear();return;} *this=substr(a,find_last_not_of(" \r\n\t")-a+1);}
 };
 const unsigned long MIN_SCAN_INTERVAL_SECONDS=5,MAX_SCAN_INTERVAL_SECONDS=3600;
+const uint32_t MIN_WIFI_ACCESS_WINDOW_SECONDS=5,MAX_WIFI_ACCESS_WINDOW_SECONDS=9999;
 const size_t DIAGNOSTIC_EVENT_CAPACITY=32;
 String normalizedMdnsHostname(String s){return s;}
 bool isValidMdnsHostname(const String& s){return !s.empty();}

@@ -219,7 +219,7 @@ const size_t DUAL_RADIO_HEAP_RESERVE_BYTES = 88 * 1024;
 // it to Wi-Fi observations. This tests whether the severe browser/document failure
 // correlates causally with the root-page largest-free-block collapse seen in V39c.
 // Expected tradeoff: lower Wi-Fi history capacity, higher runtime heap headroom.
-const size_t HISTORY_HEAP_RESERVE_BYTES = 80 * 1024;
+const size_t HISTORY_HEAP_RESERVE_BYTES = 96 * 1024;
 
 const unsigned long MIN_SCAN_INTERVAL_SECONDS = 5;
 const unsigned long MAX_SCAN_INTERVAL_SECONDS = 3600;
@@ -455,8 +455,8 @@ void serviceLoggedWifiScan();
 void serviceWifiScanRecoveryWatchdog();
 String jsonQuoted(const String& value);
 void initializeSdLogging();
-void sdLogWifiObservation(const ScanRecord& record, const WifiObservation& observation);
-void sdLogBleObservation(const BleScanRecord& record);
+void sdFlushWifiHistoryIfNeeded();
+void sdFlushBleHistoryIfNeeded();
 String htmlEscape(const String& input);
 String urlEncode(const String& input);
 void sendThemeBootstrapScript();
@@ -554,6 +554,9 @@ String sdBleLogPath = "";
 uint32_t sdWifiRowsLogged = 0;
 uint32_t sdBleRowsLogged = 0;
 uint32_t sdWriteFailures = 0;
+uint32_t sdWifiBatchFlushes = 0;
+uint32_t sdBleBatchFlushes = 0;
+const uint8_t SD_BATCH_FLUSH_PERCENT = 1;
 
 uint8_t* wifiStoragePool = nullptr;
 size_t wifiStoragePoolBytes = 0;
@@ -1090,7 +1093,7 @@ bool ledDiagIsHumanRequest(const char* route, bool post) {
     "/api/wifi/interval", "/api/ble/interval", "/api/diag/event-limit", "/history-prefill",
     "/session-save", "/session-discard", "/ble-mode", "/ap-save", "/sd-write"
   };
-  const char* const getActions[] = {"/scan-now", "/scan-settings", "/scan-clear", "/scanlog.csv", "/ble-scan", "/ble-settings", "/ble-clear", "/blelog.csv", "/config.json"};
+  const char* const getActions[] = {"/scan-now", "/scan-settings", "/scan-clear", "/scanlog.csv", "/ble-scan", "/ble-settings", "/ble-clear", "/blelog.csv", "/config.json", "/sd-download"};
   if (!route) return false;
   if (post) {
     for (const char* action : actions) if (strcmp(route, action) == 0) return true;
@@ -2384,22 +2387,30 @@ void recordWebWorkTiming(const char* label, uint32_t startMs) {
   webWorkTimingCount++;
 }
 
-const size_t WEB_RESPONSE_BUFFER_FLUSH_BYTES = 1024;
+const size_t WEB_RESPONSE_BUFFER_FLUSH_BYTES = 2048;
 String webResponseBuffer;
 bool webResponseBuffering = false;
+bool webResponseTransportClosed = false;
 
 // Purpose: Accounts for one actual network write while preserving page-response timing diagnostics.
 void sendProfiledContentNow(const String& content) {
-  if (content.length() == 0) return;
+  if (content.length() == 0 || webResponseTransportClosed) return;
   bool connectedBefore = server.client().connected();
-  if (!connectedBefore) webTransportDiagnostics.clientDisconnectedBeforeSend++;
+  if (!connectedBefore) {
+    webTransportDiagnostics.clientDisconnectedBeforeSend++;
+    webResponseTransportClosed = true;
+    return;
+  }
   sampleWebResponseMemory();
   uint32_t startMs = millis();
   server.sendContent(content);
   yield();
   serviceLoggedWifiScan();
   bool connectedAfter = server.client().connected();
-  if (!connectedAfter) webTransportDiagnostics.clientDisconnectedAfterSend++;
+  if (!connectedAfter) {
+    webTransportDiagnostics.clientDisconnectedAfterSend++;
+    webResponseTransportClosed = true;
+  }
   uint32_t durationMs = (uint32_t)(millis() - startMs);
   sampleWebResponseMemory();
   if (durationMs >= WEB_STALL_SEND_THRESHOLD_MS) {
@@ -2428,13 +2439,14 @@ void sendProfiledContentNow(const String& content) {
 
 // Purpose: Flushes accumulated response text as one moderate synchronous network write.
 void flushDiagnosticWebResponseBuffer() {
-  if (!webResponseBuffering || webResponseBuffer.length() == 0) return;
+  if (!webResponseBuffering || webResponseBuffer.length() == 0 || webResponseTransportClosed) return;
   sendProfiledContentNow(webResponseBuffer);
   webResponseBuffer.remove(0);
 }
 
 // Purpose: Appends bytes while keeping individual network writes near the configured response-chunk size.
 void appendDiagnosticWebResponseBytes(const char* data, size_t length) {
+  if (webResponseTransportClosed) return;
   if (!webResponseBuffering) {
     if (length == 0) return;
     String direct;
@@ -2484,6 +2496,7 @@ void appendDiagnosticWebResponseBytes(const char* data, size_t length) {
 // Purpose: Starts buffered response output and detailed timing for a major browser response.
 void beginWebResponseProfile(const char* route) {
   webResponseProfile = WebResponseProfile();
+  webResponseTransportClosed = false;
   webResponseProfile.active = diagnosticStreamingEnabled && diagnosticWebEvents;
   webResponseProfile.route = route;
   webWorkTimingCount = 0;
@@ -3338,7 +3351,6 @@ int processCompletedWifiScan(int networkCount) {
     observation.scanSlot = scanSlot;
     observation.rssi = (int8_t)rssi;
     appendWifiObservation(observation);
-    sdLogWifiObservation(historyRecord(wifiInventoryMode() ? (size_t)apIndex : historyCount - 1), observation);
     wifiLastScanLogged++;
   }
 
@@ -3525,6 +3537,9 @@ void serviceLoggedWifiScan() {
   }
 
   processCompletedWifiScan(result);
+  // Release the driver's scan list before a deferred SD batch can run.
+  WiFi.scanDelete();
+  sdFlushWifiHistoryIfNeeded();
   noteSuccessfulWifiScan();
   recordWifiScanDuration(scanDurationMs);
   if (wifiCurrentScanAutomatic) {
@@ -3534,7 +3549,6 @@ void serviceLoggedWifiScan() {
   wifiScanStatusMessage = "Scan complete: " + String(result) + " network(s) found.";
   if (scanDurationMs >= 15000 || (diagnosticStreamingEnabled && diagnosticSurveyEvents))
     recordDiagnosticEvent("WIFI SCAN", "seq=" + String(scanCounter) + " dur=" + String(scanDurationMs) + "ms found=" + String(wifiLastScanFound) + " log=" + String(wifiLastScanLogged) + " drop=" + String(wifiLastScanDropped));
-  WiFi.scanDelete();
   lastAutoScanMs = millis();
   wifiAutoScanRetryPending = false;
 
@@ -4167,7 +4181,6 @@ void serviceCompletedBLEScan() {
       observation.scanSlot = scanSlot;
       observation.rssi = captured.rssi;
       appendBleObservation(observation);
-      sdLogBleObservation(bleHistoryRecord(bleHistoryCount - 1));
     }
 
     updateBleUsageHighWaterMarks();
@@ -4215,6 +4228,7 @@ void serviceCompletedBLEScan() {
       Serial.println();
     }
     if (strcmp(bleDiagnosticActiveTrigger, "initial") == 0) captureBootHeapCheckpoint("Initial BLE scan");
+    sdFlushBleHistoryIfNeeded();
   } else {
     bleDiagnosticLastProcessingDurationMs = (uint32_t)(millis() - processingStartMs);
     bleDiagnosticLastTotalDurationMs = (uint32_t)(millis() - bleDiagnosticScanStartMs);
@@ -5954,8 +5968,8 @@ void handleSdPage() {
     if (!sdSafePath(selected, selectedPath)) { selected = ""; selectedPath = ""; }
     bool truncated = false;
     String content = selectedPath.length() ? sdReadText(selectedPath, truncated) : "";
-    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Logged Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button></form></div>");
-    diagnosticSendContent("<div class=\"card\"><h2>Read / Write</h2><form class=\"controls\" action=\"/sd-write\" method=\"post\"><div class=\"control\"><label for=\"sd-write-file\">Filename</label><input id=\"sd-write-file\" name=\"file\" type=\"text\" maxlength=\"48\" value=\"" + htmlEscape(selected) + "\" required></div><button type=\"submit\">Write File</button><span class=\"save-state\">Up to 8 KiB; replaces the file.</span><textarea class=\"sd-editor\" name=\"content\" maxlength=\"8192\" aria-label=\"SD file content\">" + htmlEscape(content) + "</textarea></form>" + (truncated ? "<p class=\"note\">Only the first 8 KiB are shown; writing replaces the file with the editor contents.</p>" : "") + "</div>");
+    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Saved Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><div class=\"row\"><span class=\"label\">Batch flushes (50%)</span><span class=\"value\">" + String(sdWifiBatchFlushes) + " / " + String(sdBleBatchFlushes) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button><button type=\"submit\" formaction=\"/sd-download\">Download File</button></form></div>");
+    diagnosticSendContent("<div class=\"card\"><h2>Read / Write</h2><form class=\"controls\" action=\"/sd-write\" method=\"post\"><div class=\"control\"><label for=\"sd-write-file\">Filename</label><input id=\"sd-write-file\" name=\"file\" type=\"text\" maxlength=\"48\" value=\"" + htmlEscape(selected) + "\" required></div><button type=\"submit\">Write File</button><span class=\"save-state\">Up to 8 KiB; replaces the file.</span><textarea class=\"sd-editor\" name=\"content\" maxlength=\"8192\" aria-label=\"SD file content\">" + htmlEscape(content) + "</textarea></form><p class=\"note\">Read File shows up to 8 KiB. Download File sends the complete file.</p>" + (truncated ? "<p class=\"note\">Only the first 8 KiB are shown; writing replaces the file with the editor contents.</p>" : "") + "</div>");
   }
 
   diagnosticSendContent("<div class=\"footer\">ESP32 Web Interface</div>");
@@ -5983,6 +5997,39 @@ void handleSdWrite() {
   }
   server.sendHeader("Location", "/sd?file=" + urlEncode(server.arg("file")));
   server.send(303, "text/plain", "SD file written.");
+}
+
+// Purpose: Streams one validated SD file as a browser attachment without allocating its contents in heap.
+void handleSdDownload() {
+  markExplicitUserInteraction();
+  if (!sdLoggingAvailable) {
+    server.send(503, "text/plain", "SD card unavailable.");
+    return;
+  }
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Choose an SD file to download.");
+    return;
+  }
+
+  String name = server.arg("file");
+  String path;
+  if (!sdSafePath(name, path)) {
+    server.send(400, "text/plain", "Use a simple filename without path separators.");
+    return;
+  }
+
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "SD file not found.");
+    return;
+  }
+
+  String contentType = name.endsWith(".csv") || name.endsWith(".CSV")
+    ? "text/csv" : "application/octet-stream";
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(file, contentType);
+  file.close();
 }
 
 void initializeSdLogging() {
@@ -6022,36 +6069,87 @@ void initializeSdLogging() {
   Serial.println(")");
 }
 
-void sdLogWifiObservation(const ScanRecord& record, const WifiObservation& observation) {
-  if (!sdLoggingAvailable) return;
-  int connectedApIndex = WiFi.status() == WL_CONNECTED
-    ? findWifiApByTextBssid(WiFi.BSSIDstr()) : -1;
-  String line;
-  line.reserve(240);
-  line += String(record.scanNumber) + "," + String(record.uptimeMs) + ",";
-  line += csvEscape(formatUptime(record.uptimeMs)) + ",";
-  line += csvEscape(String(record.ssid)) + "," + csvEscape(String(record.bssid)) + ",";
-  line += String(record.channel) + "," + String(record.rssi) + ",";
-  line += csvEscape(securityLabel((wifi_auth_mode_t)record.authMode)) + ",";
-  line += (connectedApIndex >= 0 && observation.apIndex == (uint16_t)connectedApIndex) ? "YES," : "NO,";
-  line += record.hidden ? "YES" : "NO";
-  if (wifiInventoryMode()) {
-    const SignalStats& stats = wifiApTable[observation.apIndex].signal;
-    line += "," + String(stats.firstSeenMs) + "," + String(stats.samples) + "," +
-      String(stats.minRssi) + "," + String(stats.maxRssi) + "," + String(averageSignal(stats), 2);
+// Purpose: Appends retained Wi-Fi history in one SD-card session, then releases its RAM only after success.
+bool sdFlushWifiHistory() {
+  if (!sdLoggingAvailable || historyCount == 0 || sdWifiLogPath.length() == 0) return true;
+  File file = SD.open(sdWifiLogPath.c_str(), FILE_APPEND);
+  if (!file) { sdWriteFailures++; return false; }
+  int connectedApIndex = WiFi.status() == WL_CONNECTED ? findWifiApByTextBssid(WiFi.BSSIDstr()) : -1;
+  size_t rows = 0;
+  bool complete = true;
+  for (size_t i = 0; i < historyCount; i++) {
+    const WifiObservation& observation = compactHistoryRecord(i);
+    ScanRecord record = historyRecord(i);
+    String line;
+    line.reserve(240);
+    line += String(record.scanNumber) + "," + String(record.uptimeMs) + "," + csvEscape(formatUptime(record.uptimeMs)) + ",";
+    line += csvEscape(String(record.ssid)) + "," + csvEscape(String(record.bssid)) + "," + String(record.channel) + "," + String(record.rssi) + ",";
+    line += csvEscape(securityLabel((wifi_auth_mode_t)record.authMode)) + ",";
+    line += (connectedApIndex >= 0 && observation.apIndex == (uint16_t)connectedApIndex) ? "YES," : "NO,";
+    line += record.hidden ? "YES" : "NO";
+    if (wifiInventoryMode()) {
+      const SignalStats& stats = wifiApTable[observation.apIndex].signal;
+      line += "," + String(stats.firstSeenMs) + "," + String(stats.samples) + "," + String(stats.minRssi) + "," + String(stats.maxRssi) + "," + String(averageSignal(stats), 2);
+    }
+    line += "\r\n";
+    if (file.print(line) != line.length()) { complete = false; break; }
+    rows++;
+    if ((rows % 16) == 0) delay(0);
   }
-  line += "\r\n";
-  if (sdAppendText(sdWifiLogPath, line)) sdWifiRowsLogged++;
+  file.close();
+  if (!complete) { sdWriteFailures++; return false; }
+  sdWifiRowsLogged += rows;
+  sdWifiBatchFlushes++;
+  uint32_t savedScanCounter = scanCounter;
+  uint32_t savedLastScanUptimeMs = lastScanUptimeMs;
+  clearScanHistory();
+  scanCounter = savedScanCounter;
+  lastScanUptimeMs = savedLastScanUptimeMs;
+  return true;
 }
 
-void sdLogBleObservation(const BleScanRecord& record) {
-  if (!sdLoggingAvailable || !bleSurveyEnabled) return;
-  String line = String(record.scanNumber) + "," + String(record.uptimeMs) + "," +
-    csvEscape(formatUptime(record.uptimeMs)) + "," +
-    csvEscape(record.named ? String(record.name) : String("")) + "," +
-    csvEscape(String(record.address)) + "," +
-    csvEscape(bleAddressTypeLabel(record.addressType)) + "," + String(record.rssi) + "\r\n";
-  if (sdAppendText(sdBleLogPath, line)) sdBleRowsLogged++;
+// Purpose: Flushes Wi-Fi only after a completed scan fills half of its active storage budget.
+void sdFlushWifiHistoryIfNeeded() {
+  if (!sdLoggingAvailable || scanHistoryRetentionLimit == 0) return;
+  size_t threshold = (scanHistoryRetentionLimit * SD_BATCH_FLUSH_PERCENT + 99) / 100;
+  if (historyCount >= threshold && !sdFlushWifiHistory())
+    Serial.println("SD logging: Wi-Fi batch write failed; retained history was kept for retry.");
+}
+
+// Purpose: Appends retained BLE history in one SD-card session, then releases its RAM only after success.
+bool sdFlushBleHistory() {
+  if (!sdLoggingAvailable || !bleSurveyEnabled || bleHistoryCount == 0 || sdBleLogPath.length() == 0) return true;
+  File file = SD.open(sdBleLogPath.c_str(), FILE_APPEND);
+  if (!file) { sdWriteFailures++; return false; }
+  size_t rows = 0;
+  bool complete = true;
+  for (size_t i = 0; i < bleHistoryCount; i++) {
+    BleScanRecord record = bleHistoryRecord(i);
+    String line = String(record.scanNumber) + "," + String(record.uptimeMs) + "," + csvEscape(formatUptime(record.uptimeMs)) + "," +
+      csvEscape(record.named ? String(record.name) : String("")) + "," + csvEscape(String(record.address)) + "," +
+      csvEscape(bleAddressTypeLabel(record.addressType)) + "," + String(record.rssi) + "\r\n";
+    if (file.print(line) != line.length()) { complete = false; break; }
+    rows++;
+    if ((rows % 16) == 0) delay(0);
+  }
+  file.close();
+  if (!complete) { sdWriteFailures++; return false; }
+  sdBleRowsLogged += rows;
+  sdBleBatchFlushes++;
+  uint32_t savedScanCounter = bleScanCounter;
+  uint32_t savedLastScanUptimeMs = lastBleScanUptimeMs;
+  clearBleHistory();
+  bleScanCounter = savedScanCounter;
+  lastBleScanUptimeMs = savedLastScanUptimeMs;
+  return true;
+}
+
+// Purpose: Flushes BLE only after a completed scan fills half of its active storage budget.
+void sdFlushBleHistoryIfNeeded() {
+  if (!sdLoggingAvailable || !bleSurveyEnabled || bleHistoryRetentionLimit == 0) return;
+  size_t threshold = (bleHistoryRetentionLimit * SD_BATCH_FLUSH_PERCENT + 99) / 100;
+  if (bleHistoryCount >= threshold && !sdFlushBleHistory())
+    Serial.println("SD logging: BLE batch write failed; retained history was kept for retry.");
 }
 
 // Purpose: Appends CSV text to a streaming buffer and flushes when the buffer reaches its target size.
@@ -10229,6 +10327,8 @@ void handleTerminalPage() {
   const filter=document.getElementById('terminal-filter'),live=document.getElementById('live-updates-toggle');
   let cursor='0',boot='',captured='',paused=false,decoder=new TextDecoder(),gapSeen=false;
   let lastPowerMode=null;
+  const idlePollMs=3000,catchupPollMs=250,maxRetryMs=15000;
+  let consecutivePollFailures=0;
   function render(){
     const term=filter.value.toLowerCase();
     output.textContent=term?captured.split('\n').filter(line=>line.toLowerCase().includes(term)).join('\n'):captured;
@@ -10269,10 +10369,10 @@ void handleTerminalPage() {
     setTimeout(()=>URL.revokeObjectURL(url),1000);
   };
   async function poll(){
-    let delay=1000;
+    let delay=idlePollMs;
     if(paused||document.hidden||!live.checked){
       if(!paused&&!live.checked)status.textContent='Live updates are off.';
-      setTimeout(poll,1000);return;
+      setTimeout(poll,idlePollMs);return;
     }
     const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
     try{
@@ -10293,7 +10393,8 @@ void handleTerminalPage() {
       }
       const more=response.headers.get('X-Terminal-More')==='1';
       status.textContent=paused?'Paused — device capture continues.':(more?'Catching up…':'Live')+(gapSeen?' — some earlier output was overwritten.':'');
-      delay=more?100:1000;
+      consecutivePollFailures=0;
+      delay=more?catchupPollMs:idlePollMs;
     }catch(error){
       const transportFailure=error.name==='TypeError'||error.name==='AbortError'||/fetch|network|offline/i.test(error.message);
       let hint=' Check your Wi-Fi connection and device power.';
@@ -10328,6 +10429,7 @@ void startWebServer() {
   server.on("/diagnostics", HTTP_GET, []() { runDiagnosticWebHandler("/diagnostics", handleDiagnosticsPage); });
   server.on("/sd", HTTP_GET, []() { runDiagnosticWebHandler("/sd", handleSdPage); });
   server.on("/sd-write", HTTP_POST, []() { runDiagnosticWebHandler("/sd-write", handleSdWrite); });
+  server.on("/sd-download", HTTP_GET, []() { runDiagnosticWebHandler("/sd-download", handleSdDownload); });
   server.on("/terminal", HTTP_GET, handleTerminalPage);
   server.on("/api/terminal", HTTP_GET, handleTerminalData);
   server.on("/api/terminal/command", HTTP_POST, handleTerminalCommand);

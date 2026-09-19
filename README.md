@@ -22,6 +22,7 @@ The current firmware identifies as **V45**. Its navigation is organized by task:
 | Bluetooth | `/ble` | Optional BLE survey, device observations and history |
 | System | `/system` | Device identity, runtime state, memory and health |
 | Diagnostics | `/diagnostics` | Survey, radio, recovery, timing and transport diagnostics |
+| SD Card | `/sd` | SD logging status, file viewer, editor, and downloads |
 | Terminal | `/terminal` | Live firmware output and command entry; navigation link appears in Developer view |
 | Settings | `/settings` | Network, power, survey and interface configuration |
 | Help | `/help` | Feature explanations and operating guidance |
@@ -195,6 +196,18 @@ scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden
 ```
 
 CSV export is streamed so large histories do not require building the entire file in heap at once.
+
+### SD card logging and downloads
+
+When an SD card is present at boot, the surveyor writes Wi-Fi and, when enabled,
+BLE observations to numbered CSV files. To avoid interrupting radio and web work
+with an SD transaction for every observation, it appends a batch after a completed
+scan reaches 50% of the active in-memory history capacity, then clears that batch
+from RAM. A power loss before the next batch flush can lose the current partial
+batch. The **SD Card** page lists those files.
+**Read File** opens up to 8 KiB in the built-in viewer/editor; **Download File**
+streams the complete selected file to the browser as an attachment, without
+loading the log into the ESP32 heap.
 
 ### System health and diagnostics
 
