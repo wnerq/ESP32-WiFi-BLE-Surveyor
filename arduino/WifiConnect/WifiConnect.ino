@@ -5933,6 +5933,66 @@ bool sdReplaceText(const String& path, const String& content) {
   return true;
 }
 
+String sdLatestCsvFileName() {
+  String latestName = "";
+  uint32_t latestNumber = 0;
+  bool found = false;
+
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return "";
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      if (name.startsWith("/")) name.remove(0, 1);
+
+      String upperName = name;
+      upperName.toUpperCase();
+
+      if (upperName.endsWith(".CSV")) {
+        int underscore = upperName.lastIndexOf('_');
+        int dot = upperName.lastIndexOf('.');
+
+        if (underscore >= 0 && dot > underscore + 1) {
+          uint32_t number = 0;
+          bool numeric = true;
+
+          for (int i = underscore + 1; i < dot; ++i) {
+            char c = upperName[i];
+
+            if (c < '0' || c > '9') {
+              numeric = false;
+              break;
+            }
+
+            uint32_t digit = (uint32_t)(c - '0');
+
+            if (number > (UINT32_MAX - digit) / 10UL) {
+              numeric = false;
+              break;
+            }
+
+            number = number * 10UL + digit;
+          }
+
+          if (numeric && (!found || number > latestNumber)) {
+            latestNumber = number;
+            latestName = name;
+            found = true;
+          }
+        }
+      }
+    }
+
+    entry.close();
+    entry = root.openNextFile();
+  }
+
+  root.close();
+  return latestName;
+}
+
 String sdFileListHtml(const String& selected) {
   String html;
   File root = SD.open("/");
@@ -5953,27 +6013,49 @@ String sdFileListHtml(const String& selected) {
   return html.length() ? html : "<option value=\"\">No files</option>";
 }
 
+
+
 void handleSdPage() {
   beginWebResponseProfile("/sd");
   markExplicitUserInteraction();
+
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
+
   diagnosticSendContent("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>SD Card</title>");
   sendThemeBootstrapScript();
   diagnosticSendContent(pageStyles());
   diagnosticSendContent("<style>.sd-editor{width:100%;min-height:240px;padding:10px;border:1px solid var(--input-border);border-radius:5px;background:var(--input-bg);color:var(--text);font:13px/1.4 monospace;resize:vertical}.sd-file-list{max-width:100%;}</style></head><body><div class=\"container\">");
+
   sendSiteNavigation("sd");
   diagnosticSendContent("<h1>SD Card</h1>");
 
   if (!sdLoggingAvailable) {
     diagnosticSendContent("<div class=\"card\"><h2>Card unavailable</h2><p>The SD card was not detected during boot, or initialization failed. Insert the card and restart the surveyor.</p></div>");
   } else {
-    String selected = server.hasArg("file") ? server.arg("file") : sdWifiLogPath;
+    String selected;
+
+    if (server.hasArg("file")) {
+      selected = server.arg("file");
+    } else {
+      selected = sdLatestCsvFileName();
+      if (!selected.length()) {
+        selected = sdWifiLogPath;
+      }
+    }
+
     String selectedPath;
-    if (!sdSafePath(selected, selectedPath)) { selected = ""; selectedPath = ""; }
+
+    if (!sdSafePath(selected, selectedPath)) {
+      selected = "";
+      selectedPath = "";
+    }
+
     bool truncated = false;
     String content = selectedPath.length() ? sdReadText(selectedPath, truncated) : "";
-    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Saved Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><div class=\"row\"><span class=\"label\">Batch flushes (50%)</span><span class=\"value\">" + String(sdWifiBatchFlushes) + " / " + String(sdBleBatchFlushes) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button><button type=\"submit\" formaction=\"/sd-download\">Download File</button></form></div>");
+
+    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Saved Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><div class=\"row\"><span class=\"label\">Batch flushes (50%)</span><span class=\"value\">" + String(sdWifiBatchFlushes) + " / " + String(sdBleBatchFlushes) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button><button type=\"submit\" formaction=\"/sd-download\">Download File</button><button type=\"submit\" formaction=\"/sd-delete\" formmethod=\"post\" onclick=\"return confirm('Delete the selected SD file? This cannot be undone.');\">Delete File</button></form></div>");
+
     diagnosticSendContent("<div class=\"card\"><h2>Read / Write</h2><form class=\"controls\" action=\"/sd-write\" method=\"post\"><div class=\"control\"><label for=\"sd-write-file\">Filename</label><input id=\"sd-write-file\" name=\"file\" type=\"text\" maxlength=\"48\" value=\"" + htmlEscape(selected) + "\" required></div><button type=\"submit\">Write File</button><span class=\"save-state\">Up to 8 KiB; replaces the file.</span><textarea class=\"sd-editor\" name=\"content\" maxlength=\"8192\" aria-label=\"SD file content\">" + htmlEscape(content) + "</textarea></form><p class=\"note\">Read File shows up to 8 KiB. Download File sends the complete file.</p>" + (truncated ? "<p class=\"note\">Only the first 8 KiB are shown; writing replaces the file with the editor contents.</p>" : "") + "</div>");
   }
 
@@ -5981,6 +6063,7 @@ void handleSdPage() {
   sendThemeScript();
   diagnosticSendContent("</div></body></html>");
   diagnosticSendContent("");
+
   endWebResponseProfile();
 }
 
@@ -6035,6 +6118,69 @@ void handleSdDownload() {
   server.sendHeader("Cache-Control", "no-store");
   server.streamFile(file, contentType);
   file.close();
+}
+
+void handleSdDelete() {
+  markExplicitUserInteraction();
+
+  if (!sdLoggingAvailable) {
+    server.send(503, "text/plain", "SD card unavailable.");
+    return;
+  }
+
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Choose an SD file to delete.");
+    return;
+  }
+
+  String name = server.arg("file");
+  String path;
+
+  if (!sdSafePath(name, path)) {
+    server.send(400, "text/plain", "Use a simple filename without path separators.");
+    return;
+  }
+
+  String upperName = name;
+  upperName.toUpperCase();
+
+  if (!upperName.endsWith(".CSV")) {
+    server.send(400, "text/plain", "Only CSV files can be deleted from this page.");
+    return;
+  }
+
+  // Never delete the files currently being used for survey logging.
+  if (sdWifiLogPath.length() && path == sdWifiLogPath) {
+    server.send(409, "text/plain",
+                "The selected Wi-Fi log is currently active and cannot be deleted.");
+    return;
+  }
+
+  if (sdBleLogPath.length() && path == sdBleLogPath) {
+    server.send(409, "text/plain",
+                "The selected BLE log is currently active and cannot be deleted.");
+    return;
+  }
+
+  File file = SD.open(path.c_str(), FILE_READ);
+
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+
+    server.send(404, "text/plain", "SD file not found.");
+    return;
+  }
+
+  file.close();
+
+  if (!SD.remove(path.c_str())) {
+    server.send(500, "text/plain", "Unable to delete the SD file.");
+    return;
+  }
+
+  // Let /sd choose the highest-numbered remaining CSV.
+  server.sendHeader("Location", "/sd");
+  server.send(303, "text/plain", "SD file deleted.");
 }
 
 void initializeSdLogging() {
@@ -10435,6 +10581,7 @@ void startWebServer() {
   server.on("/sd", HTTP_GET, []() { runDiagnosticWebHandler("/sd", handleSdPage); });
   server.on("/sd-write", HTTP_POST, []() { runDiagnosticWebHandler("/sd-write", handleSdWrite); });
   server.on("/sd-download", HTTP_GET, []() { runDiagnosticWebHandler("/sd-download", handleSdDownload); });
+  server.on("/sd-delete", HTTP_POST, []() { runDiagnosticWebHandler("/sd-delete", handleSdDelete); });
   server.on("/terminal", HTTP_GET, handleTerminalPage);
   server.on("/api/terminal", HTTP_GET, handleTerminalData);
   server.on("/api/terminal/command", HTTP_POST, handleTerminalCommand);
