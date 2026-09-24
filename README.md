@@ -37,7 +37,19 @@ The views are cumulative: Standard ⊂ Advanced ⊂ Developer. The navigation, L
 
 ## 3D Printed Enclosure
 [Honeycomb Case](https://www.printables.com/model/1826305-esp32-honeycomb-case-push-together-no-hardwaretool)
+## Hardware Connections
 
+### SD Card (SPI)
+For SD card logging, use an SPI microSD adapter (e.g., HW124) with the following pins:
+
+| Adapter pin | ESP32 GPIO | Silkscreen |
+| --- | --- | --- |
+| CS | GPIO 5 | D5 |
+| SCK | GPIO 18 | D18 |
+| MOSI | GPIO 23 | D23 |
+| MISO | GPIO 19 | D19 |
+| VCC | 3.3V | 3.3V |
+| GND | GND | GND |
 ## Key features
 
 ### Headless surveying
@@ -645,6 +657,11 @@ Potential future work includes:
 - External voltage/current/power monitoring.
 - Boards with more flash and/or PSRAM if the project outgrows the classic 4 MB ESP32.
 - Optional authentication/provisioning improvements.
+- SD card file operations (write now, delete file, format)
+- Auto-select the latest logged file.
+- File format option (CSV/JSON)
+- Log diagnostic files to SD
+- GPS location logging
 
 ## License
 
