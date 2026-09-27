@@ -133,6 +133,86 @@ void discardObservationsForScanSlot(uint16_t slot);
 void markExplicitUserInteraction();
 bool userInteractionDeferActive();
 
+bool SdDataManager::available() const {
+  return sdLoggingAvailable;
+}
+
+uint32_t SdDataManager::loggingFileNumber() const {
+  return sdLoggingFileNumber;
+}
+
+const String& SdDataManager::wifiLogPath() const {
+  return sdWifiLogPath;
+}
+
+const String& SdDataManager::bleLogPath() const {
+  return sdBleLogPath;
+}
+
+uint32_t SdDataManager::wifiRowsLogged() const {
+  return sdWifiRowsLogged;
+}
+
+uint32_t SdDataManager::bleRowsLogged() const {
+  return sdBleRowsLogged;
+}
+
+uint32_t SdDataManager::writeFailures() const {
+  return sdWriteFailures;
+}
+
+uint32_t SdDataManager::wifiBatchFlushes() const {
+  return sdWifiBatchFlushes;
+}
+
+uint32_t SdDataManager::bleBatchFlushes() const {
+  return sdBleBatchFlushes;
+}
+
+void SdDataManager::setAvailable(bool value) {
+  sdLoggingAvailable = value;
+}
+
+void SdDataManager::setLoggingFileNumber(uint32_t value) {
+  sdLoggingFileNumber = value;
+}
+
+void SdDataManager::setWifiLogPath(const String& value) {
+  sdWifiLogPath = value;
+}
+
+void SdDataManager::setBleLogPath(const String& value) {
+  sdBleLogPath = value;
+}
+
+void SdDataManager::incrementWifiRowsLogged(uint32_t amount) {
+  sdWifiRowsLogged += amount;
+}
+
+void SdDataManager::incrementBleRowsLogged(uint32_t amount) {
+  sdBleRowsLogged += amount;
+}
+
+void SdDataManager::incrementWriteFailures(uint32_t amount) {
+  sdWriteFailures += amount;
+}
+
+void SdDataManager::incrementWifiBatchFlushes(uint32_t amount) {
+  sdWifiBatchFlushes += amount;
+}
+
+void SdDataManager::incrementBleBatchFlushes(uint32_t amount) {
+  sdBleBatchFlushes += amount;
+}
+
+void SdDataManager::resetCounters() {
+  sdWifiRowsLogged = 0;
+  sdBleRowsLogged = 0;
+  sdWriteFailures = 0;
+  sdWifiBatchFlushes = 0;
+  sdBleBatchFlushes = 0;
+}
+
 // ============================================================
 // Firmware identity
 // ============================================================
@@ -560,16 +640,23 @@ uint32_t bleCsvLastDurationMs = 0;
 #define SURVEY_SD_CS_PIN 5
 #endif
 const uint8_t SURVEY_SD_CS_PIN_VALUE = SURVEY_SD_CS_PIN;
+
+/*=DELETE THIS LATER
 bool sdLoggingAvailable = false;
 uint32_t sdLoggingFileNumber = 0;
 String sdWifiLogPath = "";
 String sdBleLogPath = "";
-uint32_t sdWifiRowsLogged = 0;
-uint32_t sdBleRowsLogged = 0;
-uint32_t sdWriteFailures = 0;
-uint32_t sdWifiBatchFlushes = 0;
-uint32_t sdBleBatchFlushes = 0;
+
+
+//uint32_t sdWifiRowsLogged = 0;
+//uint32_t sdBleRowsLogged = 0;
+//uint32_t sdWriteFailures = 0;
+//uint32_t sdWifiBatchFlushes = 0;
+//uint32_t sdBleBatchFlushes = 0;
+DELETE THIS LATER */
+
 const uint8_t SD_BATCH_FLUSH_PERCENT = 1;
+
 
 uint8_t* wifiStoragePool = nullptr;
 size_t wifiStoragePoolBytes = 0;
@@ -5867,16 +5954,16 @@ uint32_t sdExistingBootFileNumber() {
 }
 
 bool sdAppendText(const String& path, const String& text) {
-  if (!sdLoggingAvailable || path.length() == 0) return false;
+  if (!sdDataManager.available() || path.length() == 0) return false;
   File file = SD.open(path.c_str(), FILE_APPEND);
   if (!file) {
-    sdWriteFailures++;
+    sdDataManager.incrementWriteFailures();
     return false;
   }
   size_t written = file.print(text);
   file.close();
   if (written != text.length()) {
-    sdWriteFailures++;
+    sdDataManager.incrementWriteFailures();
     return false;
   }
   return true;
@@ -5908,13 +5995,13 @@ String sdReadText(const String& path, bool& truncated) {
 }
 
 bool sdReplaceText(const String& path, const String& content) {
-  if (!sdLoggingAvailable || content.length() > 8192) return false;
+  if (!sdDataManager.available() || content.length() > 8192) return false;
   SD.remove(path.c_str());
   File file = SD.open(path.c_str(), FILE_WRITE);
-  if (!file) { sdWriteFailures++; return false; }
+  if (!file) { sdDataManager.incrementWriteFailures(); return false; }
   size_t written = file.print(content);
   file.close();
-  if (written != content.length()) { sdWriteFailures++; return false; }
+  if (written != content.length()) { sdDataManager.incrementWriteFailures(); return false; }
   return true;
 }
 
@@ -6015,7 +6102,7 @@ void handleSdPage() {
   sendSiteNavigation("sd");
   diagnosticSendContent("<h1>SD Card</h1>");
 
-  if (!sdLoggingAvailable) {
+  if (!sdDataManager.available()) {
     diagnosticSendContent("<div class=\"card\"><h2>Card unavailable</h2><p>The SD card was not detected during boot, or initialization failed. Insert the card and restart the surveyor.</p></div>");
   } else {
     String selected;
@@ -6025,7 +6112,7 @@ void handleSdPage() {
     } else {
       selected = sdLatestCsvFileName();
       if (!selected.length()) {
-        selected = sdWifiLogPath;
+        selected = sdDataManager.wifiLogPath();
       }
     }
 
@@ -6039,7 +6126,7 @@ void handleSdPage() {
     bool truncated = false;
     String content = selectedPath.length() ? sdReadText(selectedPath, truncated) : "";
 
-    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdLoggingFileNumber) + "</span></div><div class=\"row\"><span class=\"label\">Saved Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdWifiRowsLogged) + " / " + String(sdBleRowsLogged) + "</span></div><div class=\"row\"><span class=\"label\">Batch flushes (50%)</span><span class=\"value\">" + String(sdWifiBatchFlushes) + " / " + String(sdBleBatchFlushes) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button><button type=\"submit\" formaction=\"/sd-download\">Download File</button><button type=\"submit\" formaction=\"/sd-delete\" formmethod=\"post\" onclick=\"return confirm('Delete the selected SD file? This cannot be undone.');\">Delete File</button></form></div>");
+    diagnosticSendContent("<div class=\"card\"><h2>Files</h2><div class=\"row\"><span class=\"label\">Boot file number</span><span class=\"value\">" + String(sdDataManager.loggingFileNumber())+ "</span></div><div class=\"row\"><span class=\"label\">Saved Wi-Fi rows / BLE rows</span><span class=\"value\">" + String(sdDataManager.wifiRowsLogged()) + " / " + String(sdDataManager.bleRowsLogged()) + "</span></div><div class=\"row\"><span class=\"label\">Batch flushes (50%)</span><span class=\"value\">" + String(sdDataManager.wifiBatchFlushes()) + " / " + String(sdDataManager.bleBatchFlushes()) + "</span></div><form class=\"controls\" action=\"/sd\" method=\"get\"><div class=\"control\"><label for=\"sd-file\">File</label><select class=\"sd-file-list\" id=\"sd-file\" name=\"file\">" + sdFileListHtml(selected) + "</select></div><button type=\"submit\">Read File</button><button type=\"submit\" formaction=\"/sd-download\">Download File</button><button type=\"submit\" formaction=\"/sd-delete\" formmethod=\"post\" onclick=\"return confirm('Delete the selected SD file? This cannot be undone.');\">Delete File</button></form></div>");
 
     diagnosticSendContent("<div class=\"card\"><h2>Read / Write</h2><form class=\"controls\" action=\"/sd-write\" method=\"post\"><div class=\"control\"><label for=\"sd-write-file\">Filename</label><input id=\"sd-write-file\" name=\"file\" type=\"text\" maxlength=\"48\" value=\"" + htmlEscape(selected) + "\" required></div><button type=\"submit\">Write File</button><span class=\"save-state\">Up to 8 KiB; replaces the file.</span><textarea class=\"sd-editor\" name=\"content\" maxlength=\"8192\" aria-label=\"SD file content\">" + htmlEscape(content) + "</textarea></form><p class=\"note\">Read File shows up to 8 KiB. Download File sends the complete file.</p>" + (truncated ? "<p class=\"note\">Only the first 8 KiB are shown; writing replaces the file with the editor contents.</p>" : "") + "</div>");
   }
@@ -6054,7 +6141,7 @@ void handleSdPage() {
 
 void handleSdWrite() {
   markExplicitUserInteraction();
-  if (!sdLoggingAvailable || !server.hasArg("file") || !server.hasArg("content")) {
+  if (!sdDataManager.available() || !server.hasArg("file") || !server.hasArg("content")) {
     server.send(503, "text/plain", "SD card unavailable or missing file content.");
     return;
   }
@@ -6075,7 +6162,7 @@ void handleSdWrite() {
 // Purpose: Streams one validated SD file as a browser attachment without allocating its contents in heap.
 void handleSdDownload() {
   markExplicitUserInteraction();
-  if (!sdLoggingAvailable) {
+  if (!sdDataManager.available()) {
     server.send(503, "text/plain", "SD card unavailable.");
     return;
   }
@@ -6108,7 +6195,7 @@ void handleSdDownload() {
 void handleSdDelete() {
   markExplicitUserInteraction();
 
-  if (!sdLoggingAvailable) {
+  if (!sdDataManager.available()) {
     server.send(503, "text/plain", "SD card unavailable.");
     return;
   }
@@ -6135,13 +6222,13 @@ void handleSdDelete() {
   }
 
   // Never delete the files currently being used for survey logging.
-  if (sdWifiLogPath.length() && path == sdWifiLogPath) {
+  if (sdDataManager.wifiLogPath().length() && path == sdDataManager.wifiLogPath()) {
     server.send(409, "text/plain",
                 "The selected Wi-Fi log is currently active and cannot be deleted.");
     return;
   }
 
-  if (sdBleLogPath.length() && path == sdBleLogPath) {
+  if (sdDataManager.bleLogPath().length() && path == sdDataManager.bleLogPath()) {
     server.send(409, "text/plain",
                 "The selected BLE log is currently active and cannot be deleted.");
     return;
@@ -6169,10 +6256,15 @@ void handleSdDelete() {
 }
 
 void initializeSdLogging() {
-  sdLoggingAvailable = false;
-  sdLoggingFileNumber = 0;
-  sdWifiLogPath = "";
-  sdBleLogPath = "";
+ 
+  sdDataManager.setAvailable(false);
+
+  sdDataManager.setLoggingFileNumber(0);
+
+  sdDataManager.setWifiLogPath("");
+
+  sdDataManager.setBleLogPath("");
+
   pinMode(SURVEY_SD_CS_PIN_VALUE, OUTPUT);
   digitalWrite(SURVEY_SD_CS_PIN_VALUE, HIGH);
   SPI.begin(18, 19, 23, SURVEY_SD_CS_PIN_VALUE);
@@ -6182,24 +6274,27 @@ void initializeSdLogging() {
     return;
   }
 
-  sdLoggingFileNumber = sdExistingBootFileNumber() + 1;
+  sdDataManager.setLoggingFileNumber(sdExistingBootFileNumber() + 1);
   char wifiPath[32];
   char blePath[32];
-  snprintf(wifiPath, sizeof(wifiPath), "/WIFI_%05lu.CSV", (unsigned long)sdLoggingFileNumber);
-  snprintf(blePath, sizeof(blePath), "/BLE_%05lu.CSV", (unsigned long)sdLoggingFileNumber);
-  sdWifiLogPath = wifiPath;
-  sdBleLogPath = blePath;
-  sdLoggingAvailable = true;
+  snprintf(wifiPath,sizeof(wifiPath),"/WIFI_%05lu.CSV",(unsigned long)sdDataManager.loggingFileNumber());
+  snprintf(blePath, sizeof(blePath), "/BLE_%05lu.CSV", (unsigned long)sdDataManager.loggingFileNumber());
+  sdDataManager.setWifiLogPath(wifiPath);
+  sdDataManager.setBleLogPath(blePath);
+  sdDataManager.setAvailable(true);
 
   String wifiHeader = wifiInventoryMode()
     ? "last_scan,last_seen_ms,last_seen,ssid,bssid,channel,latest_rssi_dbm,security,connected,hidden,first_seen_ms,sightings,min_rssi_dbm,max_rssi_dbm,avg_rssi_dbm\r\n"
     : "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n";
-  sdAppendText(sdWifiLogPath, wifiHeader);
+  sdAppendText(sdDataManager.wifiLogPath(), wifiHeader);
   if (bleSurveyEnabled)
-    sdAppendText(sdBleLogPath, "scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n");
+    sdAppendText(
+  sdDataManager.bleLogPath(),
+  "scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n"
+);
 
   Serial.print("SD logging enabled: boot file #");
-  Serial.print(sdLoggingFileNumber);
+  Serial.print(sdDataManager.loggingFileNumber());
   Serial.print(" (CS GPIO ");
   Serial.print(SURVEY_SD_CS_PIN_VALUE);
   Serial.println(")");
@@ -6207,9 +6302,17 @@ void initializeSdLogging() {
 
 // Purpose: Appends retained Wi-Fi history in one SD-card session, then releases its RAM only after success.
 bool sdFlushWifiHistory() {
-  if (!sdLoggingAvailable || historyCount == 0 || sdWifiLogPath.length() == 0) return true;
-  File file = SD.open(sdWifiLogPath.c_str(), FILE_APPEND);
-  if (!file) { sdWriteFailures++; return false; }
+if (!sdDataManager.available() ||
+    historyCount == 0 ||
+    sdDataManager.wifiLogPath().length() == 0) {
+  return true;
+}
+
+File file = SD.open(
+  sdDataManager.wifiLogPath().c_str(),
+  FILE_APPEND
+);
+  if (!file) { sdDataManager.incrementWriteFailures(); return false; }
   int connectedApIndex = WiFi.status() == WL_CONNECTED ? findWifiApByTextBssid(WiFi.BSSIDstr()) : -1;
   size_t rows = 0;
   bool complete = true;
@@ -6233,9 +6336,9 @@ bool sdFlushWifiHistory() {
     if ((rows % 16) == 0) delay(0);
   }
   file.close();
-  if (!complete) { sdWriteFailures++; return false; }
-  sdWifiRowsLogged += rows;
-  sdWifiBatchFlushes++;
+  if (!complete) { sdDataManager.incrementWriteFailures(); return false; }
+  sdDataManager.incrementWifiRowsLogged(rows);
+  sdDataManager.incrementWifiBatchFlushes();
   uint32_t savedScanCounter = scanCounter;
   uint32_t savedLastScanUptimeMs = lastScanUptimeMs;
   clearScanHistory();
@@ -6246,7 +6349,7 @@ bool sdFlushWifiHistory() {
 
 // Purpose: Flushes Wi-Fi only after a completed scan fills half of its active storage budget.
 void sdFlushWifiHistoryIfNeeded() {
-  if (!sdLoggingAvailable || scanHistoryRetentionLimit == 0) return;
+  if (!sdDataManager.available() || scanHistoryRetentionLimit == 0) return;
   size_t threshold = (scanHistoryRetentionLimit * SD_BATCH_FLUSH_PERCENT + 99) / 100;
   if (historyCount >= threshold && !sdFlushWifiHistory())
     Serial.println("SD logging: Wi-Fi batch write failed; retained history was kept for retry.");
@@ -6254,9 +6357,14 @@ void sdFlushWifiHistoryIfNeeded() {
 
 // Purpose: Appends retained BLE history in one SD-card session, then releases its RAM only after success.
 bool sdFlushBleHistory() {
-  if (!sdLoggingAvailable || !bleSurveyEnabled || bleHistoryCount == 0 || sdBleLogPath.length() == 0) return true;
-  File file = SD.open(sdBleLogPath.c_str(), FILE_APPEND);
-  if (!file) { sdWriteFailures++; return false; }
+  if (!sdDataManager.available() ||
+    !bleSurveyEnabled ||
+    bleHistoryCount == 0 ||
+    sdDataManager.bleLogPath().length() == 0) {
+  return true;
+}
+  File file = SD.open(sdDataManager.bleLogPath().c_str(), FILE_APPEND);
+  if (!file) { sdDataManager.incrementWriteFailures(); return false; }
   size_t rows = 0;
   bool complete = true;
   for (size_t i = 0; i < bleHistoryCount; i++) {
@@ -6269,9 +6377,9 @@ bool sdFlushBleHistory() {
     if ((rows % 16) == 0) delay(0);
   }
   file.close();
-  if (!complete) { sdWriteFailures++; return false; }
-  sdBleRowsLogged += rows;
-  sdBleBatchFlushes++;
+  if (!complete) { sdDataManager.incrementWriteFailures(); return false; }
+  sdDataManager.incrementBleRowsLogged();
+  sdDataManager.incrementBleBatchFlushes();
   uint32_t savedScanCounter = bleScanCounter;
   uint32_t savedLastScanUptimeMs = lastBleScanUptimeMs;
   clearBleHistory();
@@ -6282,7 +6390,7 @@ bool sdFlushBleHistory() {
 
 // Purpose: Flushes BLE only after a completed scan fills half of its active storage budget.
 void sdFlushBleHistoryIfNeeded() {
-  if (!sdLoggingAvailable || !bleSurveyEnabled || bleHistoryRetentionLimit == 0) return;
+  if (!sdDataManager.available() || !bleSurveyEnabled || bleHistoryRetentionLimit == 0) return;
   size_t threshold = (bleHistoryRetentionLimit * SD_BATCH_FLUSH_PERCENT + 99) / 100;
   if (bleHistoryCount >= threshold && !sdFlushBleHistory())
     Serial.println("SD logging: BLE batch write failed; retained history was kept for retry.");
