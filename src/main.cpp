@@ -6286,7 +6286,10 @@ File file = SD.open(
   sdDataManager.wifiLogPath().c_str(),
   FILE_APPEND
 );
-  if (!file) { sdDataManager.incrementWriteFailures(); return false; }
+
+if (!sdDataManager.beginAppend(sdDataManager.wifiLogPath())) {
+  return false;
+}
   int connectedApIndex = WiFi.status() == WL_CONNECTED ? findWifiApByTextBssid(WiFi.BSSIDstr()) : -1;
   size_t rows = 0;
   bool complete = true;
@@ -6305,12 +6308,19 @@ File file = SD.open(
       line += "," + String(stats.firstSeenMs) + "," + String(stats.samples) + "," + String(stats.minRssi) + "," + String(stats.maxRssi) + "," + String(averageSignal(stats), 2);
     }
     line += "\r\n";
-    if (file.print(line) != line.length()) { complete = false; break; }
+    if (!sdDataManager.writeText(line)) {
+  complete = false;
+  break;
+}
     rows++;
     if ((rows % 16) == 0) delay(0);
   }
-  file.close();
-  if (!complete) { sdDataManager.incrementWriteFailures(); return false; }
+  sdDataManager.endAppend();
+
+if (!complete) {
+  sdDataManager.incrementWriteFailures();
+  return false;
+}
   sdDataManager.incrementWifiRowsLogged(rows);
   sdDataManager.incrementWifiBatchFlushes();
   uint32_t savedScanCounter = scanCounter;
@@ -6338,7 +6348,9 @@ bool sdFlushBleHistory() {
   return true;
 }
   File file = SD.open(sdDataManager.bleLogPath().c_str(), FILE_APPEND);
-  if (!file) { sdDataManager.incrementWriteFailures(); return false; }
+  if (!sdDataManager.beginAppend(sdDataManager.bleLogPath())) {
+  return false;
+}
   size_t rows = 0;
   bool complete = true;
   for (size_t i = 0; i < bleHistoryCount; i++) {
@@ -6346,13 +6358,20 @@ bool sdFlushBleHistory() {
     String line = String(record.scanNumber) + "," + String(record.uptimeMs) + "," + csvEscape(formatUptime(record.uptimeMs)) + "," +
       csvEscape(record.named ? String(record.name) : String("")) + "," + csvEscape(String(record.address)) + "," +
       csvEscape(bleAddressTypeLabel(record.addressType)) + "," + String(record.rssi) + "\r\n";
-    if (file.print(line) != line.length()) { complete = false; break; }
+   if (!sdDataManager.writeText(line)) {
+  complete = false;
+  break;
+}
     rows++;
     if ((rows % 16) == 0) delay(0);
   }
-  file.close();
-  if (!complete) { sdDataManager.incrementWriteFailures(); return false; }
-  sdDataManager.incrementBleRowsLogged();
+  sdDataManager.endAppend();
+
+if (!complete) {
+  sdDataManager.incrementWriteFailures();
+  return false;
+}
+  sdDataManager.incrementBleRowsLogged(rows);
   sdDataManager.incrementBleBatchFlushes();
   uint32_t savedScanCounter = bleScanCounter;
   uint32_t savedLastScanUptimeMs = lastBleScanUptimeMs;

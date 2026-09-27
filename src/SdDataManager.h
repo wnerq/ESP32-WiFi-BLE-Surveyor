@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <SD.h>
 
 #ifndef SURVEY_SD_CS_PIN
 #define SURVEY_SD_CS_PIN 5
@@ -26,6 +27,10 @@ public:
   bool initialize();
   bool appendText(const String& path, const String& text);
 
+
+  bool beginAppend(const String& path);
+  bool writeText(const String& text);
+  void endAppend();
 
   // Existing future SD settings
   SdDataFormat format() const;
@@ -82,6 +87,9 @@ private:
   uint32_t sdWriteFailures = 0;
   uint32_t sdWifiBatchFlushes = 0;
   uint32_t sdBleBatchFlushes = 0;
+
+  File activeAppendFile;
+  bool activeAppendOpen = false;
 };
 
 extern SdDataManager sdDataManager;

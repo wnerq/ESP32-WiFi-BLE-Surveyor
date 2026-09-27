@@ -7,7 +7,6 @@
 namespace {
 
 constexpr const char* SD_SETTINGS_NAMESPACE = "sddata";
-
 constexpr const char* SD_FORMAT_KEY = "format";
 constexpr const char* SD_WRITE_MODE_KEY = "writeMode";
 
@@ -172,4 +171,47 @@ bool SdDataManager::appendText(const String& path, const String& text) {
   }
 
   return true;
+}
+
+bool SdDataManager::beginAppend(const String& path) {
+  if (!available() || path.length() == 0) {
+    return false;
+  }
+
+  if (activeAppendOpen) {
+    return false;
+  }
+
+  activeAppendFile = SD.open(path.c_str(), FILE_APPEND);
+
+  if (!activeAppendFile) {
+    incrementWriteFailures();
+    return false;
+  }
+
+  activeAppendOpen = true;
+  return true;
+}
+
+bool SdDataManager::writeText(const String& text) {
+  if (!activeAppendOpen) {
+    return false;
+  }
+
+  size_t written = activeAppendFile.print(text);
+
+  if (written != text.length()) {
+    return false;
+  }
+
+  return true;
+}
+
+void SdDataManager::endAppend() {
+  if (!activeAppendOpen) {
+    return;
+  }
+
+  activeAppendFile.close();
+  activeAppendOpen = false;
 }
