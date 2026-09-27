@@ -21,6 +21,8 @@
 #include <esp_arduino_version.h>
 #include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
+#include "DiagnosticManager.h"
+#include "SdDataManager.h"
 
 enum LedDiagEvent : uint8_t {
   LED_EVENT_NONE, LED_EVENT_WIFI_SCAN, LED_EVENT_BLE_SCAN,
@@ -109,7 +111,13 @@ bool validTerminalBufferBytes(uint32_t value) {
 }
 
 
-void recordDiagnosticEvent(const char* category, const String& detail);
+void recordDiagnosticEvent(
+  const char* category,
+  const String& detail
+) {
+  diagnosticManager.record(category, detail);
+}
+
 void saveInfrastructureRecoverySummary();
 void serviceInfrastructureReconnect();
 void serviceNativeReconnectDiagnostics();
@@ -762,18 +770,8 @@ bool diagnosticSchedulerEvents = false;
 bool diagnosticCheckpointEvents = false;
 uint32_t diagnosticSnapshotIntervalMs = 10000;
 uint32_t diagnosticLastSnapshotMs = 0;
-
-struct DiagnosticEventRecord {
-  uint32_t uptimeMs = 0;
-  char category[16] = "";
-  char detail[80] = "";
-};
-
-const size_t DIAGNOSTIC_EVENT_CAPACITY = 32;
-DiagnosticEventRecord diagnosticEvents[DIAGNOSTIC_EVENT_CAPACITY] = {};
-size_t diagnosticEventStart = 0;
-size_t diagnosticEventCount = 0;
 size_t diagnosticExportEventLimit = 16;
+
 
 // BLE timing separates scan-start API time from scan duration and the time
 // spent normalizing captured advertisements into retained history.
@@ -2023,7 +2021,7 @@ void loadDiagnosticStreamingSettings() {
   diagnosticCheckpointEvents = preferences.getBool("checkpoint", false);
   diagnosticSnapshotIntervalMs = preferences.getULong("snapshotMs", 10000);
   diagnosticExportEventLimit = preferences.getUInt("eventLimit", 16);
-  if (diagnosticExportEventLimit > DIAGNOSTIC_EVENT_CAPACITY) diagnosticExportEventLimit = DIAGNOSTIC_EVENT_CAPACITY;
+  if (diagnosticExportEventLimit > diagnosticManager.capacity()) diagnosticExportEventLimit = diagnosticManager.capacity();
   preferences.end();
 }
 
@@ -2048,25 +2046,13 @@ uint32_t diagnosticLargestFreeBlock() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
-// Purpose: Retains one compact diagnostic event in a bounded RAM ring for later export.
-void recordDiagnosticEvent(const char* category, const String& detail) {
-  size_t index;
-  if (diagnosticEventCount < DIAGNOSTIC_EVENT_CAPACITY) {
-    index = (diagnosticEventStart + diagnosticEventCount) % DIAGNOSTIC_EVENT_CAPACITY;
-    diagnosticEventCount++;
-  } else {
-    index = diagnosticEventStart;
-    diagnosticEventStart = (diagnosticEventStart + 1) % DIAGNOSTIC_EVENT_CAPACITY;
-  }
-  DiagnosticEventRecord& event = diagnosticEvents[index];
-  event.uptimeMs = millis();
-  snprintf(event.category, sizeof(event.category), "%s", category ? category : "EVENT");
-  snprintf(event.detail, sizeof(event.detail), "%s", detail.c_str());
-}
+
 
 // Purpose: Returns one retained diagnostic event by chronological index.
-const DiagnosticEventRecord& diagnosticEventAt(size_t logicalIndex) {
-  return diagnosticEvents[(diagnosticEventStart + logicalIndex) % DIAGNOSTIC_EVENT_CAPACITY];
+const DiagnosticEventRecord& diagnosticEventAt(
+  size_t logicalIndex
+) {
+  return diagnosticManager.at(logicalIndex);
 }
 
 // Purpose: Prints the common timestamp/category prefix used by streamed diagnostic events.
@@ -2675,7 +2661,7 @@ void printDeveloperDiagnosticSummary() {
   Serial.print("Periodic snapshot:     ");
   if (diagnosticSnapshotIntervalMs == 0) Serial.println("OFF");
   else { Serial.print(diagnosticSnapshotIntervalMs / 1000); Serial.println(" s"); }
-  Serial.print("Recent events retained:"); Serial.print(" "); Serial.print(diagnosticEventCount); Serial.print(" / "); Serial.println(DIAGNOSTIC_EVENT_CAPACITY);
+  Serial.print("Recent events retained:"); Serial.print(" "); Serial.print(diagnosticManager.count()); Serial.print(" / "); Serial.println(diagnosticManager.capacity());
   Serial.print("Events in export:      "); Serial.println(diagnosticExportEventLimit);
   Serial.print("Last serial RX:         "); Serial.println(lastSerialCommand);
   Serial.print("Categories:             Survey="); Serial.print(diagnosticSurveyEvents ? "ON" : "OFF");
@@ -2761,8 +2747,7 @@ void resetDeveloperDiagnostics() {
   diagnosticWebSlowHandlerCount = 0;
   diagnosticWebLastDurationMs = 0;
   diagnosticWebMaxDurationMs = 0;
-  diagnosticEventStart = 0;
-  diagnosticEventCount = 0;
+  diagnosticManager.clear();
 }
 
 // Purpose: Logs BLE scheduler state only when the blocking/defer reason changes, avoiding per-loop serial spam.
@@ -8548,10 +8533,10 @@ void handleDiagnosticsPage() {
 
   diagnosticSendContent("<div class=\"card advanced-only\"><h2>Diagnostic Events &amp; Capture</h2>"
     "<div class=\"buttons\"><a class=\"button\" href=\"/status.json\">Download Diagnostics</a><button class=\"button developer-only\" type=\"button\" onclick=\"captureDiagnostics()\">Capture Diagnostics</button></div>"
-    "<div class=\"row developer-only\"><span class=\"label\">Events Retained</span><span class=\"value\">" + String(diagnosticEventCount) + " / " + String(DIAGNOSTIC_EVENT_CAPACITY) + "</span></div>"
-    "<div class=\"developer-only\"><div class=\"survey-control-row\"><div class=\"control\"><label for=\"diag-event-limit\">Recent diagnostic events in export</label><input id=\"diag-event-limit\" type=\"number\" min=\"0\" max=\"" + String(DIAGNOSTIC_EVENT_CAPACITY) + "\" value=\"" + String(diagnosticExportEventLimit) + "\"></div><span id=\"diag-event-limit-state\" class=\"save-state\"></span></div></div>"
+    "<div class=\"row developer-only\"><span class=\"label\">Events Retained</span><span class=\"value\">" + String(diagnosticManager.count()) + " / " + String(diagnosticManager.capacity()) + "</span></div>"
+    "<div class=\"developer-only\"><div class=\"survey-control-row\"><div class=\"control\"><label for=\"diag-event-limit\">Recent diagnostic events in export</label><input id=\"diag-event-limit\" type=\"number\" min=\"0\" max=\"" + String(diagnosticManager.capacity()) + "\" value=\"" + String(diagnosticExportEventLimit) + "\"></div><span id=\"diag-event-limit-state\" class=\"save-state\"></span></div></div>"
     "<div class=\"note\">The download contains current device, survey, memory, web, and bounded recent-event diagnostics. Survey observations remain in their CSV exports.</div></div>"
-    "<script>(function(){const i=document.getElementById('diag-event-limit');const st=document.getElementById('diag-event-limit-state');if(!i)return;async function save(){let v=parseInt(i.value,10);if(!Number.isFinite(v))return;v=Math.max(0,Math.min(" + String(DIAGNOSTIC_EVENT_CAPACITY) + ",v));i.value=v;if(st)st.textContent='Saving…';try{const r=await fetch('/api/diag/event-limit?events='+encodeURIComponent(v),{method:'POST',cache:'no-store'});if(!r.ok)throw new Error();const j=await r.json();i.value=j.events;if(st){st.textContent='Saved';setTimeout(()=>{st.textContent='';},1400);}}catch(e){if(st)st.textContent='Save failed';}}i.addEventListener('change',save);i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();save();i.blur();}});})();</script>");
+    "<script>(function(){const i=document.getElementById('diag-event-limit');const st=document.getElementById('diag-event-limit-state');if(!i)return;async function save(){let v=parseInt(i.value,10);if(!Number.isFinite(v))return;v=Math.max(0,Math.min(" + String(diagnosticManager.capacity()) + ",v));i.value=v;if(st)st.textContent='Saving…';try{const r=await fetch('/api/diag/event-limit?events='+encodeURIComponent(v),{method:'POST',cache:'no-store'});if(!r.ok)throw new Error();const j=await r.json();i.value=j.events;if(st){st.textContent='Saved';setTimeout(()=>{st.textContent='';},1400);}}catch(e){if(st)st.textContent='Save failed';}}i.addEventListener('change',save);i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();save();i.blur();}});})();</script>");
 
   diagnosticSendContent("<div class=\"card developer-only\"><h2>Interface Test Tools</h2><div class=\"test-tool-actions\"><form action=\"/led-test\" method=\"post\"><button type=\"submit\">Test Status LED</button></form></div><div class=\"row\"><span class=\"label\">Status LED GPIO</span><span class=\"value\">" + String(STATUS_LED_PIN) + "</span></div></div>");
 
@@ -8987,7 +8972,7 @@ public:
       return fail("bluetoothScanIntervalSeconds is outside the supported range.");
     if (out.diagnosticSnapshotIntervalMs > 3600000UL)
       return fail("diagnosticSnapshotIntervalMs must be 3600000 or less.");
-    if (out.diagnosticExportEventLimit > DIAGNOSTIC_EVENT_CAPACITY)
+    if (out.diagnosticExportEventLimit > diagnosticManager.capacity())
       return fail("diagnosticExportEventLimit exceeds the retained event capacity.");
 
     if (!out.mdnsHostnameAutomatic &&
@@ -9332,7 +9317,7 @@ void handleDiagnosticEventLimit() {
   }
   long requested = server.arg("events").toInt();
   if (requested < 0) requested = 0;
-  if (requested > (long)DIAGNOSTIC_EVENT_CAPACITY) requested = DIAGNOSTIC_EVENT_CAPACITY;
+  if (requested > (long)diagnosticManager.capacity()) requested = diagnosticManager.capacity();
   diagnosticExportEventLimit = (size_t)requested;
   saveDiagnosticStreamingSettings();
   server.sendHeader("Cache-Control", "no-store");
@@ -9731,14 +9716,14 @@ void handleStatusJsonExport() {
   diagnosticSendContent("]},\n");
   markWebResponsePhase("web-stall-trace");
 
-  size_t eventsToInclude = diagnosticExportEventLimit < diagnosticEventCount ? diagnosticExportEventLimit : diagnosticEventCount;
-  size_t firstEvent = diagnosticEventCount - eventsToInclude;
+  size_t eventsToInclude = diagnosticExportEventLimit < diagnosticManager.count() ? diagnosticExportEventLimit : diagnosticManager.count();
+  size_t firstEvent = diagnosticManager.count() - eventsToInclude;
   diagnosticSendContent("  \"recentDiagnosticEvents\":{");
-  diagnosticSendContent("\"available\":" + String(diagnosticEventCount));
+  diagnosticSendContent("\"available\":" + String(diagnosticManager.count()));
   diagnosticSendContent(",\"included\":" + String(eventsToInclude));
-  diagnosticSendContent(",\"capacity\":" + String(DIAGNOSTIC_EVENT_CAPACITY));
+  diagnosticSendContent(",\"capacity\":" + String(diagnosticManager.capacity()));
   diagnosticSendContent(",\"events\":[");
-  for (size_t i = firstEvent; i < diagnosticEventCount; i++) {
+  for (size_t i = firstEvent; i < diagnosticManager.count(); i++) {
     if (i > firstEvent) diagnosticSendContent(",");
     const DiagnosticEventRecord& event = diagnosticEventAt(i);
     diagnosticSendContent("{\"uptimeMs\":" + String(event.uptimeMs));
@@ -9826,7 +9811,7 @@ void sendDeveloperMemorySettings() {
   const char* labels[] = {"Off (0 bytes)", "Minimal (1 KiB)", "Small (2 KiB)", "Troubleshooting (8 KiB)", "Extended (16 KiB)", "Maximum (32 KiB)"};
   for (size_t i = 0; i < 6; ++i) diagnosticSendContent(String("<option value=\"") + String(sizes[i]) + "\"" + (saved.terminalBufferBytes == sizes[i] ? " selected" : "") + ">" + labels[i] + "</option>");
   diagnosticSendContent(String("</select><label for=\"plots-enabled\">Signal plots</label><select id=\"plots-enabled\" name=\"plotsEnabled\"><option value=\"0\"") + (!saved.plotsEnabled ? " selected" : "") + ">Disabled</option><option value=\"1\"" + (saved.plotsEnabled ? " selected" : "") + ">Enabled</option></select><button type=\"submit\">Save for Next Restart</button></form>");
-  diagnosticSendContent("<p>Active now: " + String(surveySerial.bufferCapacity()) + " bytes of terminal capture; plots " + String(plotsEnabled ? "enabled" : "disabled") + ". Saved choices apply at the next restart. <a href=\"/system\">Restart from System</a>.</p>");
+  diagnosticSendContent("<p>Active now: " + String(surveySerial.bufferCapacity()) + " bytes of terminal capture; plots " + String(plotsEnabled ? "enabled" : "disabled") + ". Saved choices apply at the next restart. <a href=\"/system#:~:text=Restart%20Device\">Restart from System</a>.</p>");
   if (saved.terminalBufferBytes != terminalBufferBytes || saved.plotsEnabled != plotsEnabled) diagnosticSendContent("<p><strong>Restart required to apply saved choices.</strong></p>");
   if (surveySerial.bufferCapacity() != terminalBufferBytes) diagnosticSendContent("<p>Terminal capture allocation failed at startup; capture is off. Choose a smaller buffer and restart.</p>");
   diagnosticSendContent("<p>Default: 1 KiB capture and plots disabled. Off allocates no terminal buffer; USB serial and web commands still work, but command output is only visible over USB. Larger buffers retain more troubleshooting output and leave less memory for surveys. Disabling plots avoids graph-generation memory peaks; measurement capture and CSV export continue. Download CSV before changing memory allocation and restarting: a smaller survey pool may not restore all checkpoint data.</p></div>");
@@ -11261,6 +11246,8 @@ void serviceSurveyButton() {
 
 // Purpose: Arduino entry point that initializes hardware, settings, radios, histories, checkpoint restore, web services, and initial survey scheduling.
 void setup() {
+  diagnosticManager.begin();
+  sdDataManager.begin();
   terminalBootId = esp_random();
   Serial.begin(115200);
   delay(1500);
