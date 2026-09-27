@@ -2,6 +2,12 @@
 
 #include <Arduino.h>
 
+#ifndef SURVEY_SD_CS_PIN
+#define SURVEY_SD_CS_PIN 5
+#endif
+
+static constexpr uint8_t SURVEY_SD_CS_PIN_VALUE = SURVEY_SD_CS_PIN;
+
 enum class SdDataFormat : uint8_t {
   CSV = 0,
   JSON = 1
@@ -16,9 +22,16 @@ class SdDataManager {
 public:
   void begin();
 
+  // SD initialization and basic file operations
+  bool initialize();
+  bool appendText(const String& path, const String& text);
+
+
   // Existing future SD settings
   SdDataFormat format() const;
   SdWriteMode writeMode() const;
+
+  
 
   void setFormat(SdDataFormat format, bool persist = true);
   void setWriteMode(SdWriteMode mode, bool persist = true);

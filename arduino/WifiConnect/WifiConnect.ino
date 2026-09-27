@@ -636,24 +636,10 @@ uint32_t bleCsvLastDurationMs = 0;
 
 // HW124-style SPI adapters normally use the ESP32 VSPI pins. Change this CS
 // value if the adapter is wired to a different ESP32 GPIO.
-#ifndef SURVEY_SD_CS_PIN
-#define SURVEY_SD_CS_PIN 5
-#endif
-const uint8_t SURVEY_SD_CS_PIN_VALUE = SURVEY_SD_CS_PIN;
-
-/*=DELETE THIS LATER
-bool sdLoggingAvailable = false;
-uint32_t sdLoggingFileNumber = 0;
-String sdWifiLogPath = "";
-String sdBleLogPath = "";
-
-
-//uint32_t sdWifiRowsLogged = 0;
-//uint32_t sdBleRowsLogged = 0;
-//uint32_t sdWriteFailures = 0;
-//uint32_t sdWifiBatchFlushes = 0;
-//uint32_t sdBleBatchFlushes = 0;
-DELETE THIS LATER */
+//#ifndef SURVEY_SD_CS_PIN
+//#define SURVEY_SD_CS_PIN 5
+//#endif
+//const uint8_t SURVEY_SD_CS_PIN_VALUE = SURVEY_SD_CS_PIN;
 
 const uint8_t SD_BATCH_FLUSH_PERCENT = 1;
 
@@ -5953,21 +5939,7 @@ uint32_t sdExistingBootFileNumber() {
   return highest;
 }
 
-bool sdAppendText(const String& path, const String& text) {
-  if (!sdDataManager.available() || path.length() == 0) return false;
-  File file = SD.open(path.c_str(), FILE_APPEND);
-  if (!file) {
-    sdDataManager.incrementWriteFailures();
-    return false;
-  }
-  size_t written = file.print(text);
-  file.close();
-  if (written != text.length()) {
-    sdDataManager.incrementWriteFailures();
-    return false;
-  }
-  return true;
-}
+
 
 bool sdSafePath(String name, String& path) {
   name.trim();
@@ -6257,13 +6229,19 @@ void handleSdDelete() {
 
 void initializeSdLogging() {
  
+
+
+  if (!sdDataManager.initialize()) {
+  return;
+}
+
+  /*
+
   sdDataManager.setAvailable(false);
-
   sdDataManager.setLoggingFileNumber(0);
-
   sdDataManager.setWifiLogPath("");
-
   sdDataManager.setBleLogPath("");
+
 
   pinMode(SURVEY_SD_CS_PIN_VALUE, OUTPUT);
   digitalWrite(SURVEY_SD_CS_PIN_VALUE, HIGH);
@@ -6273,6 +6251,7 @@ void initializeSdLogging() {
     Serial.println("SD logging: card not detected or initialization failed; continuing without SD logging.");
     return;
   }
+    */
 
   sdDataManager.setLoggingFileNumber(sdExistingBootFileNumber() + 1);
   char wifiPath[32];
@@ -6286,9 +6265,9 @@ void initializeSdLogging() {
   String wifiHeader = wifiInventoryMode()
     ? "last_scan,last_seen_ms,last_seen,ssid,bssid,channel,latest_rssi_dbm,security,connected,hidden,first_seen_ms,sightings,min_rssi_dbm,max_rssi_dbm,avg_rssi_dbm\r\n"
     : "scan,uptime_ms,uptime,ssid,bssid,channel,rssi_dbm,security,connected,hidden\r\n";
-  sdAppendText(sdDataManager.wifiLogPath(), wifiHeader);
+  sdDataManager.appendText(sdDataManager.wifiLogPath(), wifiHeader);
   if (bleSurveyEnabled)
-    sdAppendText(
+    sdDataManager.appendText(
   sdDataManager.bleLogPath(),
   "scan,uptime_ms,uptime,name,address,address_type,rssi_dbm\r\n"
 );

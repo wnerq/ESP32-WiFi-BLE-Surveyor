@@ -1,6 +1,8 @@
 #include "SdDataManager.h"
-
 #include <Preferences.h>
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
 
 namespace {
 
@@ -123,4 +125,51 @@ const char* SdDataManager::writeModeName() const {
 
 bool SdDataManager::automaticWritesEnabled() const {
   return dataWriteMode == SdWriteMode::AUTOMATIC;
+}
+
+bool SdDataManager::initialize() {
+  setAvailable(false);
+
+  setLoggingFileNumber(0);
+  setWifiLogPath("");
+  setBleLogPath("");
+
+  pinMode(SURVEY_SD_CS_PIN_VALUE, OUTPUT);
+  digitalWrite(SURVEY_SD_CS_PIN_VALUE, HIGH);
+
+  SPI.begin(18, 19, 23, SURVEY_SD_CS_PIN_VALUE);
+
+  if (!SD.begin(SURVEY_SD_CS_PIN_VALUE, SPI, 10000000)) {
+    Serial.println(
+      "SD logging: card not detected or initialization failed; "
+      "continuing without SD logging."
+    );
+
+    return false;
+  }
+
+  setAvailable(true);
+
+  return true;
+}
+
+bool SdDataManager::appendText(const String& path, const String& text) {
+  if (!available() || path.length() == 0) return false;
+
+  File file = SD.open(path.c_str(), FILE_APPEND);
+
+  if (!file) {
+    incrementWriteFailures();
+    return false;
+  }
+
+  size_t written = file.print(text);
+  file.close();
+
+  if (written != text.length()) {
+    incrementWriteFailures();
+    return false;
+  }
+
+  return true;
 }
