@@ -523,8 +523,12 @@ struct BootHeapCheckpoint {
   uint32_t largestFreeBlock;
 };
 
+// Forward declaration for a type defined later in the file.
+struct InfrastructureRecoverySummary;
+
 // Explicit prototypes for custom types avoid Arduino 1.8.x auto-prototype ordering issues.
 const WifiObservation& compactHistoryRecord(size_t logicalIndex);
+
 ScanRecord historyRecord(size_t logicalIndex);
 void appendWifiObservation(const WifiObservation& observation);
 const BleObservation& compactBleHistoryRecord(size_t logicalIndex);
@@ -538,7 +542,25 @@ int findWifiApByTextBssid(const String& bssid);
 int findOrCreateWifiAp(const uint8_t bssid[6], const String& ssid, uint8_t channel, uint8_t authMode, bool* created = nullptr, bool* reclaimed = nullptr);
 float rssiInterferenceWeight(int rssi);
 float channelOverlapFactor(int distance);
+void resetSignalStats(SignalStats& stats);
+void addSignalObservation(
+  SignalStats& stats,
+  int16_t rssi,
+  uint32_t uptimeMs
+);
+float averageSignal(const SignalStats& stats);
+bool buildBleDeviceSummary(
+  const String& address,
+  BLEDeviceSummary& summary
+);
+String infrastructureSummaryJson(
+  const InfrastructureRecoverySummary& summary
+);
 bool buildNetworkSummaryByApIndex(uint16_t apIndex, NetworkSummary& summary);
+bool buildNetworkSummary(
+  const String& bssid,
+  NetworkSummary& summary
+);
 void serviceLoggedWifiScan();
 void serviceWifiScanRecoveryWatchdog();
 String jsonQuoted(const String& value);
@@ -550,6 +572,23 @@ String urlEncode(const String& input);
 void sendThemeBootstrapScript();
 void sendThemeScript();
 void sendSiteNavigation(const String& active);
+void resetSignalStats(SignalStats& stats);
+void addSignalObservation(
+  SignalStats& stats,
+  int16_t rssi,
+  uint32_t uptimeMs
+);
+float averageSignal(const SignalStats& stats);
+bool buildBleDeviceSummary(
+  const String& address,
+  BLEDeviceSummary& summary
+);
+String infrastructureSummaryJson(
+  const InfrastructureRecoverySummary& summary
+);
+bool buildNetworkSummary(
+  NetworkSummary& summary
+);
 
 const size_t MAX_BOOT_HEAP_CHECKPOINTS = 12;
 BootHeapCheckpoint bootHeapCheckpoints[MAX_BOOT_HEAP_CHECKPOINTS] = {};
